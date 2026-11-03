@@ -34,7 +34,8 @@ def api_create_question():
     before = {q["id"] for q in db.open_questions(pid)}
     qid = db.add_question(pid, text, data.get("options") or [], recommend=data.get("recommend", ""),
                           evidence=data.get("evidence", ""), unblocks=data.get("unblocks", ""),
-                          asked_by=data.get("asked_by", "assistant"))
+                          asked_by=data.get("asked_by", "assistant"),
+                          inbound_id=data.get("inbound_id", "") or "", sender=data.get("sender", "") or "")
     if qid in before:
         return jsonify({"question_id": qid, "duplicate": True})
     return jsonify({"question_id": qid, "project_id": pid}), 201

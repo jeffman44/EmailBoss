@@ -75,6 +75,10 @@ class FakeStore:
         return self.projects[pid]
 
     # indexes
+    def add_contact(self, pid, contact):
+        self.projects[pid].setdefault("contacts", []).append(dict(contact))
+        self.calls.append(("add_contact", pid, contact.get("email")))
+
     def contact_index(self):
         return dict(self.contacts)
 
@@ -160,11 +164,12 @@ class FakeStore:
         self.projects[pid].setdefault("notes", []).append({"text": text, "source": source})
         self.calls.append(("add_note", pid, text))
 
-    def add_question(self, pid, question, options, recommend="", evidence="", unblocks="", asked_by="assistant"):
+    def add_question(self, pid, question, options, recommend="", evidence="", unblocks="", asked_by="assistant",
+                     inbound_id="", sender=""):
         qid = "q_" + uuid.uuid4().hex[:6]
         self.questions.append({"id": qid, "pid": pid, "question": question, "options": options,
                                "recommend": recommend, "evidence": evidence, "unblocks": unblocks,
-                               "asked_by": asked_by, "status": "open"})
+                               "asked_by": asked_by, "status": "open", "inbound_id": inbound_id, "sender": sender})
         self.calls.append(("add_question", pid, question))
         return qid
 

@@ -263,3 +263,21 @@ def test_scheduler_run_once_and_status(tmp_path):
     assert summary and ext["assistant_status"]["last_run"] == summary["finished"]
     assert ext["assistant_status"]["running"] is False
     sched.stop()
+
+
+# ── license gate fails closed when wired but no client resolves ─────────────
+
+def test_license_gate_fail_closed_and_builder(monkeypatch):
+    from plannerboard.triage import license_gate as g
+    try:
+        g.set_license_provider(lambda: None, lambda: None)
+        assert g.is_read_only() is True
+        g.set_license_provider(lambda: None, lambda: {"read_only": False})
+        assert g.is_read_only() is False          # runtime builder supplied a client
+        g.set_license_provider(lambda: None, lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        assert g.is_read_only() is True
+        g.set_license_provider(lambda: {"status": "dev", "read_only": False})
+        assert g.is_read_only() is False
+    finally:
+        g.set_license_provider(None)
+    assert g.is_read_only() is False              # unwired process: not blocked

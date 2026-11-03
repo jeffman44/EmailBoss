@@ -159,3 +159,13 @@ def drop_fixture(mail_cache, name, folder="inbox", with_attachments=True):
                     data = b""
                 (adir / att["name"]).write_bytes(data)
     return dest
+
+
+@pytest.fixture(autouse=True)
+def _reset_license_gate():
+    """The license gate keeps a process-global provider that create_app()
+    installs; never let one test's app decide another test's gate."""
+    from plannerboard.triage import license_gate
+    license_gate.set_license_provider(None)
+    yield
+    license_gate.set_license_provider(None)

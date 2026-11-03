@@ -369,7 +369,9 @@ CREATE TABLE IF NOT EXISTS questions (
     asked_by    TEXT DEFAULT 'assistant',
     created     TEXT NOT NULL,
     answered_at TEXT,
-    consumed_at TEXT                      -- set once the assistant has acted on the answer
+    consumed_at TEXT,                     -- set once the assistant has acted on the answer
+    inbound_id  TEXT DEFAULT '',          -- the one message this question is about
+    sender      TEXT DEFAULT ''           -- that message's sender address
 );
 CREATE INDEX IF NOT EXISTS idx_questions_status  ON questions(status);
 CREATE INDEX IF NOT EXISTS idx_questions_project ON questions(project_id, status);

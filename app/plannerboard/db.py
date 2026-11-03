@@ -289,7 +289,7 @@ class Store:
                          ("internet_message_id", "TEXT DEFAULT ''"), ("auto_reason", "TEXT DEFAULT ''"),
                          ("doc_links", "TEXT DEFAULT '[]'"),
                          ("is_quote_request", "INTEGER DEFAULT 0"), ("leave_reason", "TEXT DEFAULT ''")],
-        "questions": [("consumed_at", "TEXT")],
+        "questions": [("consumed_at", "TEXT"), ("inbound_id", "TEXT DEFAULT ''"), ("sender", "TEXT DEFAULT ''")],
         "processed_messages": [("project_id", "TEXT")],
         "project_correspondence": [("cc_list", "TEXT DEFAULT ''")],
         "hp_history": [("damage_events", "TEXT DEFAULT '[]'")],
@@ -1789,7 +1789,8 @@ class Store:
 
     MAX_OPEN_QUESTIONS = 5
 
-    def add_question(self, pid, question, options, recommend="", evidence="", unblocks="", asked_by="assistant"):
+    def add_question(self, pid, question, options, recommend="", evidence="", unblocks="", asked_by="assistant",
+                     inbound_id="", sender=""):
         """Several questions may be open on one project (up to MAX_OPEN_QUESTIONS).
         Idempotent on (project, text) while open. Returns the question id; when
         the cap is reached the oldest open question's id is returned instead of
@@ -1808,9 +1809,10 @@ class Store:
         qid = "q_" + os.urandom(4).hex()
         self._conn.execute(
             "INSERT INTO questions (id, project_id, question, options, recommend, evidence, unblocks, status, "
-            "answer, asked_by, created) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?)",
+            "answer, asked_by, created, inbound_id, sender) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?, ?, ?)",
             (qid, pid, text, json.dumps(options or []), recommend or "", evidence or "", unblocks or "",
-             asked_by or "assistant", self.hours.now_local_naive().isoformat(timespec="seconds")))
+             asked_by or "assistant", self.hours.now_local_naive().isoformat(timespec="seconds"),
+             inbound_id or "", (sender or "").strip().lower()))
         self._conn.commit()
         return qid
 

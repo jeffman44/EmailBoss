@@ -20,6 +20,7 @@ a generic port of the reference install's assistant-mode skill rules:
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import json
 import os
@@ -38,6 +39,9 @@ from .guards import (clean_body, ground_text, residual_content,
 OUTCOME_ACTED = "acted"
 OUTCOME_DRAFTED = "drafted"
 OUTCOME_QUESTION = "question_posted"
+# Options for a message from someone who is not one of the project's contacts.
+_STRANGER_OPTIONS = ({"id": "add_contact", "label": "Add them as a contact, then reply"},
+                     {"id": "ignore", "label": "Ignore this message"})
 OUTCOME_SUBTASK = "subtask_added"
 OUTCOME_DEFERRED = "deferred"
 OUTCOMES = (OUTCOME_ACTED, OUTCOME_DRAFTED, OUTCOME_QUESTION, OUTCOME_SUBTASK, OUTCOME_DEFERRED)
@@ -581,12 +585,53 @@ class AssistantPass:
         except Exception:
             return False
 
+    @staticmethod
+    def _answer_option(a: dict) -> str:
+        """The option id an answer chose: the answer text equals an option's id
+        or its label. '' for a free-text answer."""
+        ans = (a.get("answer") or "").strip().lower()
+        if not ans:
+            return ""
+        for o in a.get("options") or []:
+            if isinstance(o, dict) and ans in (str(o.get("id") or "").lower(), str(o.get("label") or "").strip().lower()):
+                return str(o.get("id") or "")
+        return ""
+
     def _work_answers(self, p: dict, pending: list[dict], answers: list[dict], health: dict | None) -> bool:
-        """Act on answers the user gave to this project's questions: the answer
-        is the `direction_note` of a draft written now. Never changes status."""
+        """Act on answers the user gave to this project's questions. An answer
+        about a specific message acts on that message only. Option `ignore`
+        consumes the question with no draft; `add_contact` adds the sender to
+        the project, then drafts; any other answer is the `direction_note` of a
+        draft. Never changes status."""
+        pid = p.get("id", "")
+        legacy: list[dict] = []
+        for a in answers:
+            opt = self._answer_option(a)
+            if opt == "ignore":
+                self.store.add_note(pid, f"Ignored on your say: {(a.get('question') or '')[:100]}", source="assistant")
+                self._record(pid, a.get("unblocks") or "", "task", OUTCOME_ACTED, result="message ignored; no draft",
+                             evidence=(a.get("answer") or "")[:160], health=health)
+                self._consume(a)
+                continue
+            if a.get("inbound_id"):
+                self._act_on_answers(p, pending, [a], health, opt)
+            else:
+                legacy.append(a)
+        if legacy:
+            self._act_on_answers(p, pending, legacy, health, "")
+        return True
+
+    def _consume(self, a: dict) -> None:
+        try:
+            self.store.mark_question_consumed(a["id"])
+        except Exception:
+            pass
+
+    def _act_on_answers(self, p: dict, pending: list[dict], answers: list[dict], health: dict | None, opt: str) -> None:
         pid = p.get("id", "")
         note = "; ".join(f"{(a.get('question') or '')[:120]} -> {(a.get('answer') or '')[:300]}" for a in answers)
         first = answers[0]
+        inbound_id = first.get("inbound_id") or ""
         task = next((t for t in pending if (t.get("text") or "") == (first.get("unblocks") or "")), None)
         if task is None:
             task = next((t for t in pending if _RESPOND_RE.search(t.get("text") or "")), None) \
@@ -596,7 +641,8 @@ class AssistantPass:
         if _FOLLOWUP_RE.search(text):
             ref = self._draft_followup(p, task, health)
         elif _RESPOND_RE.search(text) or not pending:
-            ref = self._work_respond(p, task, health, direction_note=note)
+            ref = self._work_respond(p, task, health, direction_note=note, inbound_id=inbound_id,
+                                     add_contact=(opt == "add_contact"))
         else:
             self.store.add_note(pid, f"Direction from you on '{text[:50]}': {note[:300]}", source="assistant")
             self._record(pid, text, "task", OUTCOME_ACTED, result="answer noted on the project",
@@ -606,11 +652,7 @@ class AssistantPass:
         if ref or self.llm is not None:
             # Consumed once acted on. With no model the answer waits for one.
             for a in answers:
-                try:
-                    self.store.mark_question_consumed(a["id"])
-                except Exception:
-                    pass
-        return True
+                self._consume(a)
 
     def respond_for_project(self, pid: str) -> dict:
         """Synchronous, one project: act on its unread answers now. Used by
@@ -667,10 +709,27 @@ class AssistantPass:
                          evidence=f"{(due - today).days} days out")
 
     # -- respond-type tasks ------------------------------------------------
-    def _work_respond(self, p: dict, task: dict, health: dict | None, direction_note: str = "") -> str:
-        """Returns the draft ref when a draft was written, else ''."""
+    def _work_respond(self, p: dict, task: dict, health: dict | None, direction_note: str = "",
+                      inbound_id: str = "", add_contact: bool = False) -> str:
+        """Returns the draft ref when a draft was written, else ''. With an
+        inbound_id the answer acts on that message only."""
         pid = p.get("id", "")
-        inbound = self._find_inbound(p, task)
+        inbound = self._find_inbound(p, task, inbound_id=inbound_id)
+        if inbound is not None and direction_note and not self._sender_known(p, inbound):
+            # An answer never turns a stranger into a recipient, except the
+            # explicit "add them as a contact" choice.
+            addr = (inbound.get("from_email") or "").strip()
+            adder = getattr(self.store, "add_contact", None)
+            if add_contact and addr and callable(adder):
+                adder(pid, {"name": inbound.get("from_name") or "", "email": addr, "role": ""})
+                p.setdefault("contacts", []).append({"name": inbound.get("from_name") or "", "email": addr})
+                self.store.add_note(pid, f"Added {addr} as a contact on your say.", source="assistant")
+            else:
+                self.store.add_note(pid, f"No draft to {addr or 'an unknown sender'}: not a contact. Choose 'Add them as a contact' to reply.", source="assistant")
+                self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
+                             result="answer did not add the sender as a contact; no draft", reason="sender_unknown",
+                             subtask_id=task.get("id"), health=health)
+                return ""
         if not inbound:
             self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
                          result="no inbound text on the project to classify", reason="no_inbound_text",
@@ -695,7 +754,7 @@ class AssistantPass:
             decision = {"decision": "ask", "reason": "sender is not one of this project's contacts",
                         "question_for_user": f"{inbound.get('from_email') or 'An unknown sender'} is not a contact on this "
                                              f"project. How should '{(inbound.get('subject') or '')[:60]}' be handled?",
-                        "directions": ["Reply to them", "Add them as a contact, then reply", "Ignore this message"]}
+                        "directions": list(_STRANGER_OPTIONS)}
         if decision["decision"] == "draft":
             if not direction_note and self._draft_exists(pid, inbound):
                 self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
@@ -834,12 +893,16 @@ class AssistantPass:
         dirs = [d for d in (decision.get("directions") or decision.get("options") or []) if d][:4]
         if not dirs:
             dirs = ["Acknowledge and say more will follow", "Answer from the project facts", "No reply needed"]
-        options = [{"id": f"opt{i + 1}", "label": d} for i, d in enumerate(dirs)]
+        options = [d if isinstance(d, dict) else {"id": f"opt{i + 1}", "label": d} for i, d in enumerate(dirs)]
+        if inbound and not self._sender_known(p, inbound):
+            options = list(_STRANGER_OPTIONS)
         evidence = f"{task.get('text', '')} open {_age_text(task.get('sla_created') or task.get('created'))}"
         if inbound:
             evidence += f"; inbound from {inbound.get('from_email', '')} {_age_text(inbound.get('received_at'))} ago"
         qid = self.store.add_question(pid, q, options, recommend=decision.get("recommend", ""),
-                                      evidence=evidence, unblocks=task.get("text", ""), asked_by="assistant")
+                                      evidence=evidence, unblocks=task.get("text", ""), asked_by="assistant",
+                                      inbound_id=(inbound or {}).get("key", ""),
+                                      sender=((inbound or {}).get("from_email") or "").strip().lower())
         self._record(pid, task.get("text", ""), "respond", OUTCOME_QUESTION, result=f"question {qid}: {q[:80]}",
                      evidence=decision.get("reason", ""), subtask_id=task.get("id"), health=health)
 
@@ -1012,7 +1075,7 @@ class AssistantPass:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    def _find_inbound(self, p: dict, task: dict, after: datetime | None = None) -> dict | None:
+    def _find_inbound(self, p: dict, task: dict, after: datetime | None = None, inbound_id: str = "") -> dict | None:
         """Latest inbound message on the project, from whatever the project
         dict carries: task metadata, a correspondence list, or key_details."""
         cands: list[dict] = []
@@ -1051,7 +1114,11 @@ class AssistantPass:
                 continue
             norm.append({"subject": c.get("subject") or "", "body": body, "from_email": c.get("from_email") or c.get("from") or "",
                          "from_name": c.get("from_name") or "", "received_at": when, "corr_id": c.get("id") or c.get("corr_id"),
-                         "message": c.get("message")})
+                         "message": c.get("message"),
+                         "key": str(c.get("id") or c.get("corr_id") or c.get("message_id") or c.get("internet_message_id") or
+                                    "h_" + hashlib.sha1(f"{c.get('from_email') or c.get('from') or ''}|{c.get('subject') or ''}|{when}".encode()).hexdigest()[:16])})
+        if inbound_id:
+            norm = [c for c in norm if c["key"] == str(inbound_id)]
         if not norm:
             return None
         norm.sort(key=lambda c: str(c["received_at"]))

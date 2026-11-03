@@ -577,3 +577,71 @@ def test_answer_endpoint_on_the_real_app(client, store):
     assert body["status"] == "answered" and body["drafted"] is False and body["draft_id"] is None
     assert store.get_project(pid)["status"] == before
     assert client.get("/api/questions").get_json()["count"] == 1
+
+
+# ── answers act on their own message; ignore / add_contact are actions ──────
+
+_STRANGER_R = {"Task: project.health": {"health": "warm", "recommendation": "x", "priority": 3},
+               "Task: reply.no_reply_classifier": {"decision": "draft", "reason": "ack"},
+               "Task: reply.draft": {"body": "Here are the project details you asked for."}}
+
+
+def _stranger_setup(tmp_path):
+    p = _projects()[0]
+    p["correspondence"][0]["from_email"] = "stranger@elsewhere.test"
+    store = FakeStore(projects=[p])
+    cfg = _cfg(tmp_path)
+    llm, _ = _llm(store, cfg, _STRANGER_R)
+    AssistantPass(store, cfg, PROFESSION, llm).run(5)
+    q = store.open_questions("proj_a")[0]
+    return store, cfg, llm, q
+
+
+def test_question_records_inbound_and_sender(tmp_path):
+    store, _, _, q = _stranger_setup(tmp_path)
+    assert q["inbound_id"] and q["sender"] == "stranger@elsewhere.test"
+    assert [o["id"] for o in q["options"]] == ["add_contact", "ignore"]
+
+
+def test_ignore_answer_consumes_without_draft(tmp_path):
+    store, cfg, llm, q = _stranger_setup(tmp_path)
+    store.answer(q["id"], "Ignore this message")
+    r = AssistantPass(store, cfg, PROFESSION, llm).respond_for_project("proj_a")
+    assert not r["drafted"] and store.drafts == []
+    assert store.unconsumed_answers("proj_a") == []
+
+
+def test_free_text_answer_never_drafts_to_stranger(tmp_path):
+    store, cfg, llm, q = _stranger_setup(tmp_path)
+    store.answer(q["id"], "Sure, send them the details")
+    r = AssistantPass(store, cfg, PROFESSION, llm).respond_for_project("proj_a")
+    assert not r["drafted"] and store.drafts == []
+    assert not any(c[0] == "add_contact" for c in store.calls)
+    assert store.unconsumed_answers("proj_a") == []
+
+
+def test_add_contact_answer_adds_sender_then_drafts(tmp_path):
+    store, cfg, llm, q = _stranger_setup(tmp_path)
+    store.answer(q["id"], "add_contact")
+    r = AssistantPass(store, cfg, PROFESSION, llm).respond_for_project("proj_a")
+    assert r["drafted"] and store.drafts[0]["to"] == ["stranger@elsewhere.test"]
+    assert ("add_contact", "proj_a", "stranger@elsewhere.test") in store.calls
+
+
+def test_answer_acts_on_its_own_message_not_the_latest(tmp_path):
+    p = _projects()[0]
+    first = dict(p["correspondence"][0])
+    first.update(id="m_old", from_email="stranger@elsewhere.test", subject="Old ask", received_at=AGO(48))
+    later = dict(first)
+    later.update(id="m_new", from_email="other@elsewhere.test", subject="Newer ask", received_at=AGO(1))
+    p["correspondence"] = [first, later]
+    store = FakeStore(projects=[p])
+    cfg = _cfg(tmp_path)
+    llm, _ = _llm(store, cfg, _STRANGER_R)
+    qid = store.add_question("proj_a", "Handle?", [{"id": "add_contact", "label": "Add"}, {"id": "ignore", "label": "Ignore"}],
+                             unblocks="", inbound_id="m_old", sender="stranger@elsewhere.test")
+    store.answer(qid, "add_contact")
+    r = AssistantPass(store, cfg, PROFESSION, llm).respond_for_project("proj_a")
+    assert r["drafted"] and store.drafts[0]["to"] == ["stranger@elsewhere.test"]
+    assert store.drafts[0]["subject"] == "RE: Old ask"
+    assert ("add_contact", "proj_a", "other@elsewhere.test") not in store.calls
