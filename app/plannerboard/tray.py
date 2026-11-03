@@ -15,6 +15,7 @@ Everything here is best-effort; no failure may affect the server process.
 """
 
 import argparse
+import os
 import json
 import sys
 import threading
@@ -29,8 +30,11 @@ COLORS = {"green": (46, 160, 67), "amber": (210, 153, 34), "red": (218, 54, 51),
 
 def fetch_health(host, port, token=None, timeout=5):
     url = f"http://{host}:{port}/api/health"
+    token = token or os.environ.get("PB_SESSION_TOKEN") or os.environ.get("PB_API_TOKEN")
     try:
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers={"X-Requested-With": "EmailBoss"})
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
         if token:
             req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -93,6 +97,7 @@ def main(argv=None):
     ap.add_argument("--token", default=None)
     ap.add_argument("--poll", type=int, default=POLL_SECONDS)
     a = ap.parse_args(argv)
+    a.token = a.token or os.environ.get("PB_SESSION_TOKEN") or None
     try:
         import pystray
         from PIL import Image  # noqa: F401
@@ -100,7 +105,7 @@ def main(argv=None):
         print(f"tray: pystray/Pillow unavailable ({e}); nothing to do. pip install plannerboard[tray]")
         return 0
     state = {"color": "grey", "tip": "Email Boss: starting"}
-    url = f"http://{a.host}:{a.port}"
+    url = f"http://{a.host}:{a.port}/" + (f"auth/{a.token}" if a.token else "")
     icon = pystray.Icon("plannerboard", make_icon_image("grey"), "Email Boss", menu=pystray.Menu(
         pystray.MenuItem(lambda i: state["tip"].splitlines()[0], lambda i, it: None, enabled=False),
         pystray.Menu.SEPARATOR,

@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_file
+from flask import redirect, Flask, Response, jsonify, request, send_file
 
 from . import paths as _paths
 from . import profession as _profession
@@ -227,13 +227,66 @@ def _api_package():
     return mod
 
 
-def _token_ok(cfg):
-    if not cfg.requires_token:
-        return True
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_JSON_TYPES = ("application/json",)
+_FORM_TYPES = ("multipart/form-data",)
+SESSION_COOKIE = "pb_session"
+
+
+def _host_name(host: str) -> str:
+    h = (host or "").strip().lower()
+    if h.startswith("["):
+        return h.split("]")[0] + "]"
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _constant_eq(a: str, b: str) -> bool:
+    import hmac
+    return bool(a) and bool(b) and hmac.compare_digest(a, b)
+
+
+def _token_ok(cfg, session_token: str = "") -> bool:
+    """Every /api/* request needs proof it came from this app's own window:
+    the per-launch session cookie (set by /auth/<token>), or a bearer that
+    equals the session token or, off loopback, the configured api_token."""
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer ") and cfg.api_token and auth[7:].strip() == cfg.api_token:
+    bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    if session_token and (_constant_eq(cookie, session_token) or _constant_eq(bearer, session_token)):
+        return True
+    if cfg.requires_token and cfg.api_token and (_constant_eq(bearer, cfg.api_token) or _constant_eq(cookie, cfg.api_token)):
         return True
     return False
+
+
+def _host_ok(cfg) -> bool:
+    """Reject DNS-rebinding: the Host header must be the address we serve on."""
+    host = _host_name(request.host)
+    if not cfg.requires_token:  # loopback bind
+        return host in _LOOPBACK_HOSTS
+    return host in _LOOPBACK_HOSTS or host == str(cfg.bind).lower()
+
+
+def _origin_ok() -> bool:
+    """A present Origin must be our own origin (same host as Host)."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    if origin == "null":
+        return False
+    from urllib.parse import urlsplit
+    o = urlsplit(origin)
+    return _host_name(o.netloc) == _host_name(request.host)
+
+
+def _content_type_ok() -> bool:
+    if request.method not in _WRITE_METHODS:
+        return True
+    ct = (request.content_type or "").split(";")[0].strip().lower()
+    if not ct and (request.content_length or 0) == 0:
+        return True  # empty-body POST (e.g. /api/restart)
+    return ct in _JSON_TYPES or ct in _FORM_TYPES
 
 
 def create_app(config_path=None, config=None, testing=None):
@@ -283,14 +336,46 @@ def create_app(config_path=None, config=None, testing=None):
 
     _api_package().register_blueprints(app)
 
+    import secrets as _secrets
+    rt.session_token = _secrets.token_urlsafe(32)
+    # Tests drive the API with Flask's test client and no window; the gate is
+    # off there unless a test turns it on (PB_ENFORCE_AUTH=1 or app.config).
+    app.config["PB_ENFORCE_AUTH"] = (not testing) or os.environ.get("PB_ENFORCE_AUTH") == "1"
+
     @app.before_request
-    def _bearer_gate():
+    def _api_gate():
         path = request.path or ""
-        if path.startswith("/api/") and not _token_ok(rt.config):
-            # Setup must stay reachable from the owner's own browser on loopback;
-            # a non-loopback bind protects everything.
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if not path.startswith("/api/"):
+            return None
+        if not _host_ok(rt.config):
+            return jsonify({"ok": False, "error": "bad_host"}), 400
+        if not _origin_ok():
+            return jsonify({"ok": False, "error": "bad_origin"}), 403
+        if not _content_type_ok():
+            return jsonify({"ok": False, "error": "unsupported_media_type",
+                            "message": "Send JSON (Content-Type: application/json)."}), 415
+        if app.config.get("PB_ENFORCE_AUTH") and not _token_ok(rt.config, rt.session_token):
+            return jsonify({"ok": False, "error": "unauthorized",
+                            "message": "Open Email Boss from the app window."}), 401
         return None
+
+    @app.route("/auth/<token>")
+    def auth_bootstrap(token):
+        """The app window (or the browser the server opened) lands here once per
+        launch; the matching cookie is what every /api/* call then carries."""
+        import time as _t
+        ok = _constant_eq(token, rt.session_token) or \
+            (rt.config.requires_token and _constant_eq(token, rt.config.api_token or ""))
+        if not ok:
+            _t.sleep(0.5)
+            return Response("Not a valid Email Boss link for this session.", status=403, mimetype="text/plain")
+        nxt = request.args.get("next") or "/"
+        if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
+            nxt = "/"
+        resp = redirect(nxt)
+        resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="Lax",
+                        secure=False, path="/", max_age=60 * 60 * 24 * 30)
+        return resp
 
     @app.teardown_request
     def _release_stranded(exc=None):
@@ -304,13 +389,12 @@ def create_app(config_path=None, config=None, testing=None):
         if not p.exists():
             return Response(f"{name} not found", status=404, mimetype="text/plain")
         html = p.read_text(encoding="utf-8")
-        token = rt.config.api_token if rt.config.requires_token else ""
-        meta = f'<meta name="pb-token" content="{token}">'
-        if "<head>" in html:
-            html = html.replace("<head>", "<head>" + meta, 1)
-        else:
-            html = meta + html
-        return Response(html, mimetype="text/html")
+        # No token is ever written into the page (it used to be, off loopback);
+        # the session cookie from /auth/<token> is the only credential.
+        resp = Response(html, mimetype="text/html")
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        return resp
 
     @app.route("/")
     def serve_board():

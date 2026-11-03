@@ -97,7 +97,8 @@ def license_creds_getter(rt: Any):
                 except Exception:
                     lid = ""
             return {"lid": lid, "fingerprint": client.fingerprint, "activation": act,
-                    "server_url": client.server_url, "status": st.get("status", "")}
+                    "server_url": client.server_url, "status": st.get("status", ""),
+                    "sign": getattr(client, "sign_request", None)}
         except Exception:
             return {}
     return _get

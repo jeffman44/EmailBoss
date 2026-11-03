@@ -61,7 +61,9 @@ class EmailBossProvider:
             c = self._creds() or {}
         except Exception:
             c = {}
-        return {k: (c.get(k) or "") for k in ("lid", "fingerprint", "activation", "server_url", "status")}
+        out = {k: (c.get(k) or "") for k in ("lid", "fingerprint", "activation", "server_url", "status")}
+        out["sign"] = c.get("sign") if callable(c.get("sign")) else None
+        return out
 
     def available(self) -> bool:
         c = self.creds()
@@ -82,9 +84,17 @@ class EmailBossProvider:
                 data = {}
             return e.code, data if isinstance(data, dict) else {}
 
-    def _auth(self) -> dict:
+    def _auth(self, path: str = "/v1/ai/complete") -> dict:
+        """Identity plus, when the license client offers it, a proof of
+        possession (HMAC over lid|fingerprint|ts|path with the device secret)."""
         c = self.creds()
-        return {"lid": c["lid"], "fingerprint": c["fingerprint"], "activation": c["activation"]}
+        out = {"lid": c["lid"], "fingerprint": c["fingerprint"], "activation": c["activation"]}
+        if c.get("sign"):
+            try:
+                out.update(c["sign"](path) or {})
+            except Exception:  # noqa: BLE001
+                pass
+        return out
 
     # ---------------------------------------------------------------- balance
     def balance(self) -> dict:
@@ -92,7 +102,7 @@ class EmailBossProvider:
         if not self.available():
             return {}
         try:
-            code, data = self._post("/v1/ai/balance", self._auth(), timeout=15)
+            code, data = self._post("/v1/ai/balance", self._auth("/v1/ai/balance"), timeout=15)
         except (URLError, OSError, socket.timeout, TimeoutError):
             return {}
         if code == 200 and isinstance(data, dict):
@@ -105,7 +115,7 @@ class EmailBossProvider:
         if not self.available():
             return "", "license not active"
         try:
-            code, data = self._post("/v1/ai/checkout", {**self._auth(), "pack": pack}, timeout=20)
+            code, data = self._post("/v1/ai/checkout", {**self._auth("/v1/ai/checkout"), "pack": pack}, timeout=20)
         except (URLError, OSError, socket.timeout, TimeoutError) as e:
             return "", f"{ERR_NETWORK}: {getattr(e, 'reason', e)}"
         if code == 200 and data.get("url"):
@@ -121,7 +131,7 @@ class EmailBossProvider:
         if not self.available():
             self.last_error_code = ERR_LICENSE
             return LLMResult.failure(f"{ERR_LICENSE}: Email Boss AI needs an active license", model=label)
-        body = {**self._auth(), "task": task or "", "tier": tier, "system": system or "",
+        body = {**self._auth("/v1/ai/complete"), "task": task or "", "tier": tier, "system": system or "",
                 "user": user, "max_tokens": int(max_tokens), "temperature": float(temperature)}
         if json_schema:
             body["json_schema"] = json_schema

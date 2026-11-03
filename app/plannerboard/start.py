@@ -279,7 +279,7 @@ def open_browser_later(url, delay=1.5):
     threading.Thread(target=go, daemon=True, name="open-browser").start()
 
 
-def start_tray(port, bind):
+def start_tray(port, bind, token=""):
     try:
         import pystray  # noqa: F401
         import PIL  # noqa: F401
@@ -290,12 +290,15 @@ def start_tray(port, bind):
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        env = dict(os.environ)
+        if token:
+            env["PB_SESSION_TOKEN"] = token  # the tray polls /api/health with it
         if getattr(sys, "frozen", False):
             # PyInstaller bundle: the executable IS this module; re-enter it in tray mode.
             cmd = [sys.executable, "--tray-only", "--port", str(port), "--bind", bind]
         else:
             cmd = [sys.executable, "-m", "plannerboard.tray", "--port", str(port), "--host", bind]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, **kwargs)
         print(f"Tray icon: started (pid {proc.pid})")
         return proc
     except Exception as e:
@@ -348,10 +351,10 @@ def main(argv=None):
 
     if args.desktop:
         from . import desktop
-        running = desktop.DesktopState(cfg.paths.data_root).running_url()
+        running = desktop.DesktopState(cfg.paths.data_root).running()
         if running:
-            print(f"[desktop] engine already running at {running}; opening a window on it")
-            return desktop.attach_window(running)
+            print(f"[desktop] engine already running at {running[0]}; opening a window on it")
+            return desktop.attach_window(running[0], running[1])
         bind = "127.0.0.1"
         port = 0  # chosen by desktop.run()
 
@@ -402,20 +405,22 @@ def main(argv=None):
             if not args.no_tray and not cfg.setup_required:
                 from urllib.parse import urlparse
                 u = urlparse(url)
-                tray_proc = start_tray(u.port, u.hostname)
+                tray_proc = start_tray(u.port, u.hostname, getattr(rt, "session_token", ""))
 
         desktop.ENGINE_READY_HOOK = _after_engine
         return desktop.run(app, rt, cfg, on_exit=_cleanup)
 
     if not args.no_tray and not cfg.setup_required:
-        tray_proc = start_tray(port, "127.0.0.1" if bind == "0.0.0.0" else bind)
+        tray_proc = start_tray(port, "127.0.0.1" if bind == "0.0.0.0" else bind, getattr(rt, "session_token", ""))
 
     if bind not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: binding {bind}; every /api request needs the bearer token")
     url = f"http://{'127.0.0.1' if bind in ('0.0.0.0', '') else bind}:{port}/"
+    auth_url = f"{url}auth/{getattr(rt, 'session_token', '')}"
     print(f"Serving on {url}" + ("  (setup required)" if cfg.setup_required else ""))
-    if cfg.setup_required and not args.no_browser and os.environ.get("PB_NO_BROWSER") != "1":
-        open_browser_later(url)
+    print(f"Open this link once in your browser (it signs this browser in): {auth_url}")
+    if not args.no_browser and os.environ.get("PB_NO_BROWSER") != "1":
+        open_browser_later(auth_url)
     try:
         app.run(host=bind, port=port, debug=False, threaded=True, use_reloader=False)
     finally:

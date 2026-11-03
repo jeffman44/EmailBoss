@@ -214,11 +214,17 @@ def test_workflows_put_guards_occupied_stage(client):
 
 def test_bearer_token_required_off_loopback(data_root):
     cfg = make_config(data_root, server={"port": 8080, "bind": "0.0.0.0", "api_token": "tok123"})
-    c = create_app(config=cfg).test_client()
+    app = create_app(config=cfg)
+    app.config["PB_ENFORCE_AUTH"] = True
+    c = app.test_client()
     assert c.get("/api/health").status_code == 401
     assert c.get("/api/health", headers={"Authorization": "Bearer wrong"}).status_code == 401
     assert c.get("/api/health", headers={"Authorization": "Bearer tok123"}).status_code == 200
-    assert b'name="pb-token" content="tok123"' in c.get("/").data
+    # the token is never written into the page (it used to be)
+    assert b'content="tok123"' not in c.get("/").data
+    # the configured token also works as a bootstrap link off loopback
+    assert c.get("/auth/tok123").status_code == 302
+    assert c.get("/api/health").status_code == 200
 
 
 def test_read_file_sandbox(client, rt):

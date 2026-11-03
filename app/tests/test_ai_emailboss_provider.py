@@ -93,3 +93,15 @@ def test_llm_facade_marks_credits_exhausted(tmp_path):
               "features": {"classify": True}}}, {})
     assert llm.run("triage.classify", {"subject": "x", "body": "y", "from_name": "a", "from_email": "a@b.c"}) is None
     assert llm.credits_exhausted is True and llm.status()["credits_exhausted"] is True
+
+
+def test_proof_of_possession_is_sent_when_the_client_signs():
+    rec = Recorder([_Resp({"ok": True, "text": "x", "credits_charged": 1, "balance": 9})])
+    seen = []
+    def sign(path):
+        seen.append(path)
+        return {"ts": 1700000000, "proof": "abc"}
+    p = EmailBossProvider(lambda: {**CREDS, "sign": sign}, opener=rec)
+    assert p.complete("s", "u").ok
+    body = json.loads(rec.requests[0][0].data)
+    assert body["proof"] == "abc" and body["ts"] == 1700000000 and seen == ["/v1/ai/complete"]

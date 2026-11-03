@@ -70,9 +70,14 @@ class DesktopState:
     def __init__(self, data_root):
         self.path = Path(data_root) / "desktop.json"
 
-    def write(self, url, pid=None):
+    def write(self, url, pid=None, token=""):
         try:
-            self.path.write_text(json.dumps({"url": url, "pid": pid or os.getpid(), "version": __version__}))
+            self.path.write_text(json.dumps({"url": url, "pid": pid or os.getpid(), "version": __version__,
+                                             "token": token}))
+            try:
+                os.chmod(self.path, 0o600)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             print(f"[desktop] could not write {self.path}: {e}")
 
@@ -88,12 +93,18 @@ class DesktopState:
         except Exception:  # noqa: BLE001
             pass
 
-    def running_url(self):
-        """URL of a live engine from a previous launch, or None."""
+    def running(self):
+        """(url, token) of a live engine from a previous launch, or None."""
         doc = self.read()
         if not doc or not doc.get("url"):
             return None
-        return doc["url"] if wait_for_http(doc["url"] + "api/health", timeout=1.5) else None
+        if not wait_for_http(doc["url"] + "api/health", timeout=1.5):
+            return None
+        return doc["url"], str(doc.get("token") or "")
+
+    def running_url(self):
+        r = self.running()
+        return r[0] if r else None
 
 
 class Bridge:
@@ -190,7 +201,7 @@ def run(app, rt, cfg, on_exit=None):
     if not wait_for_http(url + "api/health"):
         srv.shutdown()
         return 1
-    state.write(url)
+    state.write(url, token=getattr(rt, "session_token", ""))
     print(f"[desktop] engine on {url} (ephemeral; window only)")
     if ENGINE_READY_HOOK:
         try:
@@ -200,8 +211,12 @@ def run(app, rt, cfg, on_exit=None):
 
     ref = {}
     bridge = Bridge(ref, url, cfg.paths.data_root)
+    # Land on the auth bootstrap so the window holds the per-launch session
+    # cookie; nothing else can call /api/* without it.
+    token = getattr(rt, "session_token", "") or getattr(app, "pb_session_token", "")
+    first = f"{url}auth/{token}" if token else url
     try:
-        open_window(url, ref, bridge)
+        open_window(first, ref, bridge)
     finally:
         state.clear()
         try:
@@ -216,10 +231,11 @@ def run(app, rt, cfg, on_exit=None):
     return 0
 
 
-def attach_window(url):
+def attach_window(url, token: str = ""):
     """Open a window on an engine that is already running (second launch)."""
     ref = {}
-    open_window(url, ref, Bridge(ref, url, ""))
+    first = f"{url}auth/{token}" if token else url
+    open_window(first, ref, Bridge(ref, url, ""))
     return 0
 
 
