@@ -170,6 +170,43 @@ Env vars: `ANTHROPIC_API_KEY`, `AI_MARKUP`, `AI_MIN_CREDITS_PER_CALL`, `AI_TRIAL
 `AI_RATE_PER_MIN`, `AI_MAX_TOKENS`, `AI_MODEL_FAST`, `AI_MODEL_SMART`, `STRIPE_CREDIT_PACKS`,
 `STRIPE_SECRET_KEY` (table in `license_server/README.md`).
 
+## Release signing (update check)
+
+The in-app update check (`app/plannerboard/updater.py`) trusts a signed
+manifest, not the download host. The release workflow (windows job, after the
+Inno Setup step) runs `app/scripts/make_update_manifest.py`, which writes:
+
+- `update.json`: `{version, published, channel, windows: {url, sha256, size}, notes_url}` as
+  canonical JSON (sorted keys, no spaces). The file IS the signed bytes; the
+  app verifies the signature over the downloaded bytes and only then parses them.
+- `update.json.sig`: base64url Ed25519 signature over those bytes.
+
+Both are uploaded as release assets, so
+`https://github.com/jeffman44/emailboss/releases/latest/download/update.json`
+(and `.sig`) always point at the newest non-prerelease.
+
+**Key.** The CI secret `EB_RELEASE_SIGNING_KEY` is the PEM (PKCS8 Ed25519) of the
+production license private key, the same key family as license tokens. Its public
+half is `DEFAULT_PUBLIC_KEY_PEM` in `app/plannerboard/license/client.py`, and
+`RELEASE_PUBLIC_KEY_PEM` (the key the updater verifies with) defaults to it, so
+every installed app already trusts it. To use a separate release key later, paste
+its public PEM into `RELEASE_PUBLIC_KEY_PEM`, ship that build, and only then
+switch the secret. The workflow refuses to publish a tag release when the secret
+is missing and re-verifies the manifest it just wrote. Dev-channel builds (source
+checkouts, tests) verify with the dev key instead, like license tokens.
+
+**What the app checks.** Signature, then the manifest shape (https installer URL,
+64-hex sha256, positive size), then `channel` equals `updates.channel`, then
+semver newer than `__version__`. Download streams to `<data_root>/updates/`,
+enforces the signed size and sha256, and install re-hashes the file just before
+launching `Setup.exe /SILENT /CLOSEAPPLICATIONS /RELAUNCH=1` (Windows only).
+Nothing is installed without a click in the UI.
+
+**Rotation interaction.** Rotating the license key (below) also changes the key
+that verifies update manifests, and an old build only trusts its one key. So the
+release that ships the new public key must be signed with the OLD private key;
+only the release after it is signed with the new one. Rotate the secret last.
+
 ## What is enforced where
 
 | check | client | server |
@@ -240,6 +277,7 @@ Env vars: `ANTHROPIC_API_KEY`, `AI_MARKUP`, `AI_MIN_CREDITS_PER_CALL`, `AI_TRIAL
   `trial_budget`.
 - `/v1/deactivate` needs the device proof (or, for a seat made before 1.3.0,
   the license key). A lost laptop is released from the portal.
+- Update manifests share the license key family (see "Release signing"): a rotation needs one bridging release signed with the old key.
 - Key rotation has no `kid`: both sides hold exactly one public key, so a
   rotation re-signs every live license and needs a client release that
   ships the new key.

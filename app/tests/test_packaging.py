@@ -46,7 +46,7 @@ def test_python_dash_m_entry_point():
     r = subprocess.run([sys.executable, "-m", "plannerboard", "--version"], capture_output=True, text=True,
                        cwd=str(APP), timeout=60)
     assert r.returncode == 0, r.stderr
-    assert "Email Boss 1.3.0" in (r.stdout + r.stderr)
+    assert "Email Boss 1.3.1" in (r.stdout + r.stderr)
 
 
 def test_version_files_agree():
@@ -72,3 +72,34 @@ def test_pyinstaller_spec_lists_every_resource():
     shipped = {p.name for p in (PKG / "professions").glob("*.json")}
     bundled = {Path(src).name for src, dest in g["datas"] if dest.replace("\\", "/") == "plannerboard/professions"}
     assert shipped == bundled
+
+
+def test_spec_windows_hiddenimports_for_webview_and_tray():
+    """pywebview's Edge WebView2 backend, pythonnet, the keyring Windows
+    backend and pystray's Windows backend are all loaded by name at runtime."""
+    spec = APP / "scripts" / "build_pyinstaller.spec"
+    text = spec.read_text(encoding="utf-8")
+    head = text.split("block_cipher = None")[0]
+    for name in ("webview.platforms.edgechromium", "clr_loader", "pythonnet", "pystray._win32",
+                 "win32ctypes.pywin32.win32cred", "plannerboard.updater", "plannerboard.api.update_api"):
+        assert f'"{name}"' in head, name
+    for pkg in ('"webview"', '"pythonnet"', '"clr_loader"'):
+        assert pkg in head                                    # collect_all list
+    g = {"__file__": str(spec)}
+    exec(compile(head, str(spec), "exec"), g)
+    assert "binaries" in g and "plannerboard.tray" in g["hiddenimports"]
+
+
+def test_installer_script_supports_silent_update_relaunch():
+    iss = (APP / "installer" / "emailboss.iss").read_text(encoding="utf-8")
+    assert "RELAUNCH" in iss and "skipifnotsilent" in iss
+    assert "PrivilegesRequiredOverridesAllowed" not in iss      # no admin mode: silent updates never raise UAC
+    from plannerboard import updater
+    assert "/SILENT" in updater.INSTALL_ARGS and "/CLOSEAPPLICATIONS" in updater.INSTALL_ARGS
+    assert "/RELAUNCH=1" in updater.INSTALL_ARGS
+
+
+def test_release_workflow_signs_and_uploads_manifest():
+    wf = (APP.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert "make_update_manifest.py" in wf and "EB_RELEASE_SIGNING_KEY" in wf
+    assert wf.count("app/dist/update.json.sig") == 2 and wf.count("app/dist/update.json\n") == 2

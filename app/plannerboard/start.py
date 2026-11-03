@@ -261,6 +261,16 @@ def start_license_heartbeat(rt, app):
     return True
 
 
+def start_update_check(rt, app):
+    """Daily signed-manifest check (updates.enabled). Never installs anything."""
+    try:
+        from . import updater
+        return updater.start_update_thread(rt, app)
+    except Exception as e:
+        print(f"[update] not started: {type(e).__name__}: {e}")
+        return False
+
+
 def mail_thread_summary(rt):
     runner = getattr(rt, "mail_runner", None)
     if runner is None or not getattr(runner, "threads", None):
@@ -323,7 +333,7 @@ def main(argv=None):
     parser.add_argument("--version", action="version", version=f"Email Boss {__version__}")
     parser.add_argument("--tray-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--desktop", action="store_true",
-                        help="native window on an ephemeral loopback port (no browser, no fixed port)")
+                        help="native window on a loopback port (no browser)")
     args = parser.parse_args(argv)
     if getattr(sys, "frozen", False) and not args.tray_only and os.environ.get("PB_SERVER_MODE") != "1":
         args.desktop = True  # the packaged app IS the desktop app; PB_SERVER_MODE=1 for headless
@@ -349,9 +359,18 @@ def main(argv=None):
         print(f"Config LOAD ERROR: {cfg.load_error}")
     print(f"Data root: {cfg.paths.data_root}")
 
+    restart_wait = bool(os.environ.pop("PB_RESTART_WAIT", None))
     if args.desktop:
         from . import desktop
-        running = desktop.DesktopState(cfg.paths.data_root).running()
+        state = desktop.DesktopState(cfg.paths.data_root)
+        if restart_wait:
+            # /api/restart started us: the old process is still dying and its
+            # desktop.json still answers. Wait for it, do not attach to it.
+            for _ in range(30):
+                if not state.running():
+                    break
+                time.sleep(0.5)
+        running = state.running()
         if running:
             print(f"[desktop] engine already running at {running[0]}; opening a window on it")
             return desktop.attach_window(running[0], running[1])
@@ -359,7 +378,7 @@ def main(argv=None):
         port = 0  # chosen by desktop.run()
 
     probe_host = "127.0.0.1" if bind in ("0.0.0.0", "") else bind
-    if os.environ.pop("PB_RESTART_WAIT", None):
+    if restart_wait:
         # Restarted by /api/restart on a platform without execv: the old
         # process is still letting go of the port.
         for _ in range(30):
@@ -371,6 +390,11 @@ def main(argv=None):
         return 0
     global _INSTANCE_LOCK
     _INSTANCE_LOCK = acquire_instance_lock(cfg.paths.lock_file)
+    for _ in range(30 if restart_wait else 0):
+        if _INSTANCE_LOCK is not None:
+            break
+        time.sleep(0.5)     # the old process still holds the lock file
+        _INSTANCE_LOCK = acquire_instance_lock(cfg.paths.lock_file)
     if _INSTANCE_LOCK is None:
         print("Another Email Boss instance holds the lock file. Exiting cleanly.")
         return 0
@@ -388,6 +412,7 @@ def main(argv=None):
         install_triage_pipeline(rt)
         start_triage_thread(rt)
         start_license_heartbeat(rt, app)
+        start_update_check(rt, app)
         print(f"Mail: {mail_thread_summary(rt)}")
     if args.desktop:
         from . import desktop
@@ -406,12 +431,14 @@ def main(argv=None):
                 from urllib.parse import urlparse
                 u = urlparse(url)
                 tray_proc = start_tray(u.port, u.hostname, getattr(rt, "session_token", ""))
+                rt.tray_proc = tray_proc
 
         desktop.ENGINE_READY_HOOK = _after_engine
         return desktop.run(app, rt, cfg, on_exit=_cleanup)
 
     if not args.no_tray and not cfg.setup_required:
         tray_proc = start_tray(port, "127.0.0.1" if bind == "0.0.0.0" else bind, getattr(rt, "session_token", ""))
+        rt.tray_proc = tray_proc
 
     if bind not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: binding {bind}; every /api request needs the bearer token")

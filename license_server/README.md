@@ -182,6 +182,10 @@ starts.
    accepts. Activations re-sign themselves on the next heartbeat.
 5. Tell customers on old builds to update; their next heartbeat on the new
    build pulls a new activation.
+6. Release signing uses the same key family (`docs/LICENSING.md` "Release
+   signing"): the release that ships the new public key must still be signed
+   with the OLD key (old builds only trust that one), then update the CI secret
+   `EB_RELEASE_SIGNING_KEY` to the new private PEM for the next release.
 
 `keys/DEV_ONLY_private.pem` is checked in for development and tests only. It
 must be rotated before production: anyone with it can mint keys the shipped

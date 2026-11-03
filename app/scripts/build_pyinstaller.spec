@@ -53,6 +53,8 @@ datas += _tree(PKG / "professions", "plannerboard/professions")
 datas += _tree(PKG / "ai" / "prompts", "plannerboard/ai/prompts")
 datas += [(str(PKG / "schema.sql"), "plannerboard")]
 
+binaries = []
+
 hiddenimports = [
     # keyring backends are loaded by entry point, not by import
     "keyring.backends.Windows",
@@ -70,9 +72,8 @@ hiddenimports = [
     # package modules imported by name at runtime
     "plannerboard.tray",
     "plannerboard.desktop",
-    # pywebview backends (loaded by name)
-    "webview", "webview.platforms", "webview.platforms.edgechromium", "webview.platforms.winforms",
-    "webview.platforms.cocoa", "webview.platforms.gtk",
+    "plannerboard.updater",
+    "plannerboard.api.update_api",
     "plannerboard.mail.pa_folder",
     "plannerboard.mail.imap",
     "plannerboard.mail.gmail",
@@ -85,7 +86,50 @@ hiddenimports = [
     "yaml",
     "cryptography.hazmat.primitives.asymmetric.ed25519",
 ]
-for optional in ("pystray", "PIL", "pdfplumber", "openpyxl", "httpx", "plyer", "clr", "clr_loader", "tzdata"):
+
+if sys.platform == "win32":
+    hiddenimports += [
+        # Windows Credential Manager backend for keyring
+        "win32ctypes.pywin32.pywintypes", "win32ctypes.pywin32.win32cred", "win32ctypes.core",
+        # pywebview: Edge WebView2 through pythonnet (loaded by name from webview.guilib)
+        "webview.platforms.edgechromium", "webview.platforms.winforms",
+        "clr", "clr_loader", "pythonnet",
+        # pystray picks its backend with importlib at runtime
+        "pystray._win32", "pystray._base",
+    ]
+elif sys.platform == "darwin":
+    hiddenimports += ["webview.platforms.cocoa"]
+else:
+    hiddenimports += ["webview.platforms.gtk"]
+hiddenimports += ["webview", "webview.platforms"]
+
+# Packages whose DLLs / data / .NET assemblies / dist-info are found by path or
+# metadata, not by import: collect them whole. On Windows this is what ships
+# Python.Runtime.dll, ClrLoader.dll, Microsoft.Web.WebView2.Core.dll,
+# Microsoft.Web.WebView2.WinForms.dll and WebView2Loader.dll (webview/lib/**),
+# webview/js/*, and the keyring / pystray entry-point metadata.
+try:
+    from PyInstaller.utils.hooks import collect_all, copy_metadata
+    _collect = ["webview", "pystray", "keyring"]
+    if sys.platform == "win32":
+        _collect += ["pythonnet", "clr_loader", "win32ctypes"]
+    for _pkg in _collect:
+        try:
+            _d, _b, _h = collect_all(_pkg)
+            datas += _d
+            binaries += _b
+            hiddenimports += _h
+        except Exception as _e:  # package not installed in this build env
+            print(f"spec: collect_all({_pkg}) skipped: {_e}")
+    for _dist in ("keyring", "pywebview", "pystray"):
+        try:
+            datas += copy_metadata(_dist)
+        except Exception:
+            pass
+except ImportError:
+    pass  # py_compile / static check without PyInstaller
+
+for optional in ("PIL", "pdfplumber", "openpyxl", "httpx", "plyer", "tzdata"):
     try:
         __import__(optional)
         hiddenimports.append(optional)
@@ -99,7 +143,7 @@ block_cipher = None
 a = Analysis(  # noqa: F821
     [str(ENTRY)],
     pathex=[str(APP_DIR)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

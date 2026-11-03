@@ -5,6 +5,10 @@ Work top to bottom. Nothing ships until every box is ticked.
 ## 1. Keys
 
 - [x] 2026-11-03: production signing pair generated; public half embedded as `DEFAULT_PUBLIC_KEY_PEM`, dev key only trusted on the dev channel. Private half is NOT in the repo (see license_server/keys/README.md).
+- [ ] GitHub repository secret `EB_RELEASE_SIGNING_KEY` holds the production private key PEM
+  (the one matching `DEFAULT_PUBLIC_KEY_PEM`). The windows job fails a tag release without it.
+  After the first release, download `update.json` + `update.json.sig` from the release page and
+  confirm `python app/scripts/make_update_manifest.py` output verifies (the workflow does this too).
 - [ ] Decide whether this release rotates the license signing key. Rotate
       when the previous private key may have been exposed, when the shipped
       public key is still `DEV_ONLY_public.pem`, or on the yearly schedule.
@@ -63,6 +67,10 @@ Work top to bottom. Nothing ships until every box is ticked.
 - [ ] Wheel built (`app/dist/plannerboard-<version>-py3-none-any.whl`) for
       the venv installers.
 - [ ] Record the SHA256 of every artifact in the release notes.
+- [ ] Release assets include `update.json` and `update.json.sig` (signed update manifest).
+  On a machine running the previous version: Settings > General > Check for updates now shows
+  the new version; Update now, then Restart and install, ends with the new version running.
+  Work through `docs/WINDOWS_RUNTIME_CHECK.md` on a real Windows box before the first public release.
 
 ## 5. Smoke on a clean VM (per platform)
 

@@ -6338,6 +6338,7 @@ async function loadHealthBadges() {
     const j = await r.json();
     HEALTH = j;
     renderMailBanner();
+    renderUpdateBanner();
     const down = Array.isArray(j.watchers_down) ? j.watchers_down : [];
     const restart = Array.isArray(j.restart_needed) ? j.restart_needed : [];
     let h = '';
@@ -8116,6 +8117,15 @@ function renderSettingsGeneral() {
     });
     h += `</div>`;
   }
+
+  // UPDATES
+  h += `<div class="set-sec"><div class="set-sec-lbl">Updates</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Email Boss ${esc((HEALTH && HEALTH.version) || '')}</div>
+      <div class="set-row-sub" id="set-upd-result">${esc(updateResultLine(HEALTH && HEALTH.update))}</div>
+    </div>
+    <button class="set-btn" id="set-upd-check" data-on-click='{"f":"checkForUpdatesNow"}'>Check for updates now</button>
+    </div></div>`;
   return h;
 }
 
@@ -9507,6 +9517,89 @@ function renderMailBanner() {
   else if (m.ok === false || m.error) msg = 'Mail not connected right now' + (m.error ? ': ' + String(m.error).slice(0, 120) : '.');
   el.classList.toggle('show', !!msg);
   el.innerHTML = msg ? `<span>${esc(msg)}</span><a data-on-click='{"f":"openSettings","a":["mail"]}'>Open Settings &gt; Mail</a>` : '';
+}
+
+// ── updates: quiet banner + Settings > General > Updates ──────────────────
+// The engine only ever reports, downloads and installs when asked (updater.py).
+// Stage: idle -> busy (downloading) -> ready (verified, waiting for the second click).
+let _updStage = 'idle', _updMsg = '';
+const UPD_LATER_KEY = 'pb_update_later';
+function updateLaterVersion() { try { return localStorage.getItem(UPD_LATER_KEY) || ''; } catch (e) { return ''; } }
+function updateResultLine(u) {
+  if (!u) return 'Not checked yet.';
+  const when = u.checked_at ? ' Checked ' + String(u.checked_at).replace('T', ' ').replace('Z', ' UTC') + '.' : '';
+  if (u.error) return 'Could not check for updates: ' + u.error;
+  if (u.available) return 'Email Boss ' + u.latest + ' is available.' + when;
+  if (!u.checked_at) return 'Not checked yet.';
+  return 'You have the latest version (' + u.current + ').' + when;
+}
+function renderUpdateBanner() {
+  const el = document.getElementById('update-banner');
+  if (!el) return;
+  const u = (HEALTH && HEALTH.update) || {};
+  const show = !!u.available && (_updStage !== 'idle' || updateLaterVersion() !== u.latest);
+  el.classList.toggle('show', show);
+  if (!show) { el.innerHTML = ''; return; }
+  const v = esc(String(u.latest || ''));
+  const later = `<button class="eb-btn" data-on-click='{"f":"updateLater"}'>Later</button>`;
+  if (_updStage === 'busy') { el.innerHTML = `<span>${esc(_updMsg || 'Working...')}</span>`; return; }
+  if (_updStage === 'ready') {
+    el.innerHTML = `<span>Email Boss ${v} is downloaded and checked. Email Boss will close, update and reopen.</span>
+      <button class="eb-btn" data-on-click='{"f":"updateInstall"}'>Restart and install</button>${later}`;
+    return;
+  }
+  const err = _updMsg ? `<span>${esc(_updMsg)}</span>` : '';
+  if (u.can_install === false) {
+    const n = /^https:\/\//.test(String(u.notes_url || '')) ? `<button class="eb-btn" data-on-click='{"f":"openExternalUrl","a":[${JSON.stringify(u.notes_url).replace(/[&"'<>]/g, c => ({'&':'&amp;','"':'&quot;',"'":'&#39;','<':'&lt;','>':'&gt;'}[c]))}]}'>What's new</button>` : '';
+    el.innerHTML = `<span>Email Boss ${v} is available.</span>${n}${later}`;
+    return;
+  }
+  el.innerHTML = `<span>Email Boss ${v} is available.</span>${err}
+    <button class="eb-btn" data-on-click='{"f":"updateNow"}'>Update now</button>${later}`;
+}
+function openExternalUrl(url) {
+  if (!/^https:\/\//.test(String(url || ''))) return;
+  const api = window.pywebview && window.pywebview.api;
+  if (api && api.open_external) api.open_external(url); else window.open(url, '_blank', 'noopener');
+}
+function updateLater() {
+  const u = (HEALTH && HEALTH.update) || {};
+  try { localStorage.setItem(UPD_LATER_KEY, String(u.latest || '')); } catch (e) { /* private mode */ }
+  _updStage = 'idle'; _updMsg = '';
+  renderUpdateBanner();
+}
+async function updateNow() {
+  _updStage = 'busy'; _updMsg = 'Downloading the update...'; renderUpdateBanner();
+  try {
+    const r = await fetch('/api/update/download', { method: 'POST', body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { _updStage = 'idle'; _updMsg = 'The update did not download: ' + (j.error || ('HTTP ' + r.status)); }
+    else { _updStage = 'ready'; _updMsg = ''; }
+  } catch (e) { _updStage = 'idle'; _updMsg = 'The update did not download: ' + e.message; }
+  renderUpdateBanner();
+}
+async function updateInstall() {
+  _updStage = 'busy'; _updMsg = 'Starting the installer. Email Boss closes now and reopens when it is done.'; renderUpdateBanner();
+  try {
+    const r = await fetch('/api/update/install', { method: 'POST', body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { _updStage = 'idle'; _updMsg = 'Could not start the installer: ' + (j.error || ('HTTP ' + r.status)); renderUpdateBanner(); }
+  } catch (e) { /* the engine is already shutting down */ }
+}
+async function checkForUpdatesNow() {
+  const out = document.getElementById('set-upd-result'), btn = document.getElementById('set-upd-check');
+  if (btn) btn.disabled = true;
+  if (out) { out.style.color = ''; out.textContent = 'Checking...'; }
+  try {
+    const r = await fetch('/api/update?refresh=1');
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    HEALTH = Object.assign(HEALTH || {}, { update: j });
+    try { localStorage.removeItem(UPD_LATER_KEY); } catch (e) { /* ignore */ }
+    if (out) { out.style.color = j.error ? 'var(--c-e06c6c)' : (j.available ? 'var(--c-97dda5)' : ''); out.textContent = updateResultLine(j); }
+    renderUpdateBanner();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not check for updates: ' + e.message; } }
+  finally { if (btn) btn.disabled = false; }
 }
 
 // ── keyboard: j/k move, a/n/h triage, e open, ? cheat sheet ────────────────

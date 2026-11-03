@@ -765,3 +765,56 @@ def test_board_round3_surfaces(server, browser, tmp_path):
     assert errors == [], "\n".join(errors)
     assert stub.app.unknown == [], f"page hit endpoints the stub does not define: {stub.app.unknown}"
     page.close()
+
+
+def test_update_banner_and_settings_check(server, browser):
+    """A signed release is available: quiet banner, two-step Update now ->
+    Restart and install, Later hides it for that version, and Settings >
+    General has the check button with a result line."""
+    stub.app.unknown.clear()
+    stub.app.calls.clear()
+    upd = {"available": True, "latest": "9.9.9", "current": "0.1.0", "checked_at": stub.ts(-1), "error": None,
+           "notes_url": "https://example.com/notes", "can_install": True}
+    stub.HEALTH["update"] = upd
+    stub.UPDATE_STATE.update(upd, ok=True)
+    errors = []
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    _collect(page, errors)
+    try:
+        page.goto(server + "/", wait_until="networkidle")
+        page.evaluate("() => localStorage.removeItem('pb_update_later')")
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(1000)
+        banner = page.inner_text("#update-banner")
+        assert "Email Boss 9.9.9 is available." in banner and "Update now" in banner and "Later" in banner
+        page.click("#update-banner button:has-text('Update now')")
+        page.wait_for_selector("#update-banner button:has-text('Restart and install')")
+        assert ("POST", "/api/update/download") in stub.app.calls
+        assert ("POST", "/api/update/install") not in stub.app.calls      # never auto-installs
+        page.click("#update-banner button:has-text('Restart and install')")
+        page.wait_for_timeout(500)
+        assert ("POST", "/api/update/install") in stub.app.calls
+
+        # Later: hidden for 9.9.9 after a reload
+        page.evaluate("() => { _updStage = 'idle'; renderUpdateBanner(); }")
+        page.click("#update-banner button:has-text('Later')")
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(800)
+        assert not page.evaluate("() => document.getElementById('update-banner').classList.contains('show')")
+
+        # Settings > General > Check for updates now
+        page.click("#gear-btn")
+        page.wait_for_selector("#set-upd-check")
+        page.click("#set-upd-check")
+        page.wait_for_function("() => /9\\.9\\.9 is available/.test(document.getElementById('set-upd-result').textContent)")
+        assert page.evaluate("() => document.getElementById('update-banner').classList.contains('show')")
+        stub.UPDATE_STATE.update(available=False, latest="0.1.0")
+        page.click("#set-upd-check")
+        page.wait_for_function("() => /latest version/.test(document.getElementById('set-upd-result').textContent)")
+    finally:
+        stub.HEALTH["update"] = {"available": False, "latest": "0.1.0", "current": "0.1.0", "checked_at": None,
+                                 "error": None, "notes_url": None, "can_install": True}
+        stub.UPDATE_STATE.update(available=False, latest="0.1.0", url=None, notes_url=None)
+    assert errors == [], errors
+    assert stub.app.unknown == [], stub.app.unknown
+    page.close()

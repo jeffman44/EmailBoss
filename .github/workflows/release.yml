@@ -64,6 +64,30 @@ jobs:
           }
           $lines | Set-Content app\dist\SHA256SUMS.txt -Encoding ASCII
           $lines
+      - name: Signed update manifest
+        shell: pwsh
+        env:
+          EB_RELEASE_SIGNING_KEY: ${{ secrets.EB_RELEASE_SIGNING_KEY }}
+          IS_RELEASE: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '') && 'yes' || 'no' }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if (-not $env:EB_RELEASE_SIGNING_KEY) {
+            if ($env:IS_RELEASE -eq 'yes') { throw "secret EB_RELEASE_SIGNING_KEY is not set: refusing to publish a release without update.json" }
+            Write-Host "EB_RELEASE_SIGNING_KEY not set; skipping update.json (not a release build)"
+            exit 0
+          }
+          $ver  = "${{ steps.v.outputs.version }}"
+          $tag  = if ($env:IS_RELEASE -eq 'yes') { $env:RELEASE_TAG } else { "v$ver" }
+          $exe  = (Get-ChildItem app\dist\*Setup.exe | Select-Object -First 1).FullName
+          $url  = "https://github.com/${{ github.repository }}/releases/download/$tag/" + (Split-Path $exe -Leaf)
+          $key  = Join-Path $env:RUNNER_TEMP "release_signing_key.pem"
+          Set-Content -Path $key -Value $env:EB_RELEASE_SIGNING_KEY -NoNewline -Encoding ascii
+          try {
+            python app\scripts\make_update_manifest.py --version $ver --exe $exe --url $url --key $key --out app\dist --verify
+            if ($LASTEXITCODE -ne 0) { throw "make_update_manifest.py failed" }
+          } finally {
+            Remove-Item $key -Force -ErrorAction SilentlyContinue
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: EmailBoss-${{ steps.v.outputs.version }}-windows
@@ -72,6 +96,8 @@ jobs:
             app/dist/*.zip
             app/dist/*.whl
             app/dist/SHA256SUMS.txt
+            app/dist/update.json
+            app/dist/update.json.sig
       - name: GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -82,5 +108,7 @@ jobs:
             app/dist/*.zip
             app/dist/*.whl
             app/dist/SHA256SUMS.txt
+            app/dist/update.json
+            app/dist/update.json.sig
           generate_release_notes: false
           body_path: docs/RELEASE_NOTES.md

@@ -88,6 +88,21 @@ def trusted_public_key_pem() -> str:
     return DEV_PUBLIC_KEY_PEM if CHANNEL == "dev" else DEFAULT_PUBLIC_KEY_PEM
 
 
+# Public key that verifies the signed release manifest (update.json.sig, see
+# plannerboard/updater.py and docs/LICENSING.md "Release signing"). Defaults to
+# the production license key, so the app already trusts it; a separate
+# "release" key pair can be introduced later by pasting its public PEM here and
+# putting the matching private PEM in the CI secret EB_RELEASE_SIGNING_KEY.
+RELEASE_PUBLIC_KEY_PEM = DEFAULT_PUBLIC_KEY_PEM
+
+
+def release_public_key_pem() -> str:
+    """Key for release manifests: the dev key on the dev channel (tests,
+    source checkouts), RELEASE_PUBLIC_KEY_PEM on a shipped build."""
+    from .._channel import CHANNEL
+    return DEV_PUBLIC_KEY_PEM if CHANNEL == "dev" else RELEASE_PUBLIC_KEY_PEM
+
+
 GRACE_DAYS = 14
 HEARTBEAT_INTERVAL = timedelta(hours=24)
 HTTP_TIMEOUT = 10
@@ -102,7 +117,7 @@ META_DEVICE_SECRET = "license.device_secret"
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Write paths that must keep working in read-only mode so the user can fix it.
-_READ_ONLY_EXEMPT_PREFIXES = ("/api/license", "/api/setup", "/api/health", "/api/restart")
+_READ_ONLY_EXEMPT_PREFIXES = ("/api/license", "/api/setup", "/api/health", "/api/restart", "/api/update")
 
 
 class LicenseError(Exception):

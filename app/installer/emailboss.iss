@@ -19,7 +19,8 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\Programs\EmailBoss
 DefaultGroupName={#AppName}
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; No "dialog" override: an admin-mode install would make every silent in-app
+; update raise a UAC prompt (Inno reuses the previous install's privilege level).
 OutputDir=..\dist
 OutputBaseFilename=EmailBoss-{#AppVersion}-Setup
 Compression=lzma2/max
@@ -51,8 +52,27 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: autostart
 
 [Run]
-; WebView2 runtime is on every Windows 10/11 box with Edge; the exe reports if it is missing.
+; WebView2 runtime is on every Windows 10/11 box with Edge; the exe shows a message with the
+; Microsoft download link if it is missing (desktop.ensure_webview2).
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; In-app update (updater.py runs: Setup.exe /SILENT /CLOSEAPPLICATIONS /RELAUNCH=1): start the new version.
+Filename: "{app}\{#AppExe}"; Flags: nowait skipifnotsilent; Check: RelaunchRequested
+
+[Code]
+function RelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  rc: Integer;
+begin
+  if CurStep = ssInstall then
+    // Restart Manager closed the window; the tray helper is the same EmailBoss.exe and has no
+    // window to close. Per-user install: this only ends the signed-in user's own processes.
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, rc);
+end;
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"

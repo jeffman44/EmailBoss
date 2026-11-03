@@ -251,7 +251,13 @@ HEALTH = {
            "balance": None, "low_credits": False, "credits_exhausted": False},
     "license": {"status": "ok", "plan": "solo", "expires": d(300), "grace_days_left": None},
     "business_hours": PROFESSION["business_hours"], "project_count": 3, "pending_triage": 3,
+    "update": {"available": False, "latest": "0.1.0", "current": "0.1.0", "checked_at": None, "error": None,
+               "notes_url": None, "can_install": True},
 }
+
+UPDATE_STATE = {"ok": True, "enabled": True, "channel": "stable", "current": "0.1.0", "latest": "0.1.0",
+                "available": False, "url": None, "notes_url": None, "can_install": True, "downloaded": False,
+                "checked_at": "2026-11-03T12:00:00Z", "error": None}
 
 CONFIG = {
     "schema_version": 1, "user": PROFESSION["user"], "profession": {"template": "general", "overrides": {}},
@@ -769,6 +775,21 @@ def api_alert_ack(aid):
 @app.route("/api/health")
 def api_health():
     return jsonify(HEALTH)
+
+
+@app.route("/api/update")
+def api_update():
+    return jsonify(UPDATE_STATE)
+
+
+@app.route("/api/update/download", methods=["POST"])
+def api_update_download():
+    return jsonify({"ok": True, "path": "updates/EmailBoss-9.9.9-Setup.exe"})
+
+
+@app.route("/api/update/install", methods=["POST"])
+def api_update_install():
+    return jsonify({"ok": True, "installing": True})
 
 
 @app.route("/api/hp-history", methods=["GET", "PUT"])

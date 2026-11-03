@@ -62,6 +62,9 @@ DEFAULTS = {
     "assistant": {"schedule_minutes": 60, "max_items": 10, "drafts_to": "local",
                   "auto_create": False},
     "license": {"key": "", "server_url": "https://license.example.com", "activation": {}},
+    # Signed update check (plannerboard/updater.py). url "" = the GitHub
+    # releases "latest" manifest; the channel must match the manifest's.
+    "updates": {"enabled": True, "channel": "stable", "url": ""},
     "features": {"money": True, "game_layer": True, "analytics": True},
     # Board display preferences (Settings > Display). light_theme None means
     # "follow the profession": light unless the game layer is on.

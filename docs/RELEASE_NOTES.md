@@ -1,5 +1,23 @@
 # Release notes
 
+## 1.3.1
+
+- Fixes the 1.3.0 desktop launch: the window's health probe was refused by
+  the new session gate, so the app gave up after 20 seconds. The window now
+  also keeps the same local port between launches so settings persist, and
+  a missing WebView2 runtime shows a plain message with the download link
+  instead of exiting silently.
+- Signed update check: the app looks for a new release once a day, verifies
+  the signed manifest, and offers "Update now" (two clicks, never automatic).
+  Settings > General > "Check for updates now".
+- Built-in "Sign in with Google" and "Sign in with Microsoft" ship in this
+  build (Google app in Testing mode: only listed test users until Google
+  verifies the app).
+- Windows runtime review: PyInstaller bundle includes the WebView2 and
+  keyring backends, installer never asks for admin, restart works in
+  desktop mode. Owner checklist in docs/WINDOWS_RUNTIME_CHECK.md.
+
+
 ## 1.3.0
 
 Built from a simulation of twelve kinds of users (plumber, property manager,

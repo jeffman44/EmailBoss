@@ -133,6 +133,12 @@ def health_payload(r):
     except Exception as e:
         lic = {"status": "error", "error": str(e)}
     pending = db.count_pending_triage()
+    try:
+        from ..updater import updater_from_app
+        from flask import current_app
+        upd = updater_from_app(current_app).summary()
+    except Exception as e:  # noqa: BLE001
+        upd = {"available": False, "latest": None, "current": __version__, "checked_at": None, "error": str(e)}
     return {
         "status": "ok" if probe.get("ok") else "degraded",
         "version": __version__,
@@ -155,6 +161,7 @@ def health_payload(r):
         "mail": mail,
         "ai": ai,
         "license": lic,
+        "update": upd,
         "business_hours": r.hours.as_dict(),
         "project_count": db.conn.execute("SELECT COUNT(*) FROM projects WHERE archived = 0").fetchone()[0],
         "pending_triage": pending,
@@ -219,6 +226,12 @@ def api_restart():
         # The new process waits for this port to free up before its own
         # single-instance probe (start.py reads PB_RESTART_WAIT).
         os.environ["PB_RESTART_WAIT"] = "1"
+        tray = getattr(r, "tray_proc", None)
+        if tray is not None:
+            try:
+                tray.terminate()    # the new process starts its own icon
+            except Exception:
+                pass
         # Werkzeug marks its listening socket inheritable (for its reloader);
         # the re-exec'd process must not inherit it or the port stays busy.
         try:
