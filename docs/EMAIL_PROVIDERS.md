@@ -8,8 +8,8 @@ for the schema); the triage pipeline never knows which one produced a file.
 |---|---|---|---|---|---|---|
 | Drop folder | `pa_folder` | a flow that writes JSON files | no | no (drafts stay in the board) | no | locked-down Microsoft 365 tenants, anything that can write a file |
 | IMAP | `imap` | host, user, app password | yes | yes (APPEND to Drafts) | yes (SMTP) | any mailbox, no cloud project needed |
-| Gmail API | `gmail` | a Google Cloud OAuth client | yes | yes (`drafts.create`) | yes (`messages.send`) | Gmail and Google Workspace |
-| Microsoft Graph | `graph` | an Entra app registration | yes | yes (`createReply`) | yes (`sendMail`) | Microsoft 365 when you can register an app |
+| Gmail API | `gmail` | nothing (built-in sign-in); your own OAuth client optional | yes | yes (`drafts.create`) | yes (`messages.send`) | Gmail and Google Workspace |
+| Microsoft Graph | `graph` | nothing (built-in sign-in); your own app registration optional | yes | yes (`createReply`) | yes (`sendMail`) | Microsoft 365 |
 
 "Mail client" is the MAIL view on the board: folders, a message list, a
 reading pane and a composer. "Send" means a person pressing Send there, and
@@ -21,9 +21,20 @@ last_fetch, error` afterwards. Secrets (passwords, OAuth tokens) are stored in
 the OS keyring under service `EmailBoss`, never in `plannerboard.json`.
 
 Polling interval is `mail.poll_seconds` (default 300, minimum 60). On first
-connect the IMAP, Gmail and Graph providers look back two days, then keep a
+connect the IMAP, Gmail and Graph providers look back 30 days, then keep a
 watermark (UID, Gmail history id, Graph delta token) so nothing is fetched
 twice.
+
+## Built-in sign-in (1.3.0)
+
+"Sign in with Google" and "Sign in with Microsoft" work out of the box: the
+app ships with Email Boss's own OAuth client ids (`PB_GMAIL_CLIENT_ID`,
+`PB_GMAIL_CLIENT_SECRET`, `PB_GRAPH_CLIENT_ID`, set at build time; the Google
+"secret" for an installed app is not confidential, Google says so in its
+docs). Both flows use PKCE on a loopback redirect. A user who prefers their
+own cloud project can still paste a client id under Advanced; the steps below
+describe that path. The wizard also offers "Use an app password instead" for
+every provider.
 
 ## Gmail API
 
