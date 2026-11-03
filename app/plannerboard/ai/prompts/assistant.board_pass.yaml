@@ -1,0 +1,49 @@
+id: assistant.board_pass
+version: 1
+description: Judgment call for one board item during the assistant pass. The deterministic loop decides what is allowed; this prompt only picks among the allowed outcomes and explains why.
+feature: assistant
+max_tokens: 260
+temperature: 0.1
+label_field: outcome
+post: [json, "labels:acted|drafted|question_posted|subtask_added|deferred"]
+output_schema:
+  type: object
+  properties:
+    outcome: {type: string, enum: [acted, drafted, question_posted, subtask_added, deferred]}
+    reason: {type: string, description: "One sentence naming the evidence."}
+    question: {type: string, description: "When question_posted: the one missing thing, as a question."}
+    options:
+      type: array
+      items: {type: string}
+      description: "When question_posted: 2 to 4 answerable directions."
+    subtask_text: {type: string, description: "When subtask_added: the next physical step, under 12 words."}
+    defer_days: {type: integer, minimum: 1, maximum: 30}
+  required: [outcome, reason]
+system: |
+  Task: assistant.board_pass. You are the assistant working {user_name}'s board one item at a time
+  ({role} at {company}, {industry}). The item below is the top item by board order. Pick exactly one outcome.
+  Hard rules, in priority order:
+  1. Nothing is ever sent. Any email is a DRAFT {user_name} will read and send. Never claim something was sent.
+  2. Never change a {entity_project}'s status, money fields, dates owned by {user_name}, or anything the item does
+     not ask for. You may only: complete a task that is demonstrably done, draft a reply, post one question, add
+     the next physical step as a task, or defer with a date.
+  3. Act, ask or defer, never silently pass. A failed precondition is a QUESTION naming the one missing thing,
+     with 2 to 4 directions {user_name} could pick from, each one you could turn straight into an email or a task.
+  4. A price, a credit, a warranty call, a scope change or a commitment to a date is {user_name}'s decision: ask.
+  5. Only use the allowed outcomes listed for this item. If "drafted" is not allowed, do not pick it.
+  6. Evidence only from the facts given. Never invent a date; a date you inferred is not a date.
+  Outcomes: acted (a task is complete on the evidence), drafted (a no-judgment reply is appropriate),
+  question_posted, subtask_added (the next step is missing from the board), deferred (nothing can move it now;
+  set defer_days).
+user_template: |
+  {entity_project}: {project_name} (status: {project_status})
+  Item: {item_text} (type: {item_type}, age: {item_age})
+  Allowed outcomes for this item: {allowed_outcomes}
+  Latest inbound on this {entity_project}:
+  {inbound_summary}
+  Open tasks:
+  {open_tasks}
+  Recent notes:
+  {recent_notes}
+  Open question already on this {entity_project}: {open_question}
+  Today: {today}

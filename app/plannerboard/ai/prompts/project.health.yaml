@@ -1,0 +1,35 @@
+id: project.health
+version: 1
+description: Rate one project's momentum and name the single next action. Output is advisory only; it never changes status.
+max_tokens: 200
+temperature: 0.1
+label_field: health
+post: [json, "labels:hot|warm|stale|cold|at_risk"]
+output_schema:
+  type: object
+  properties:
+    health: {type: string, enum: [hot, warm, stale, cold, at_risk]}
+    recommendation: {type: string, description: "One sentence, the single next action."}
+    reason: {type: string}
+    priority: {type: integer, minimum: 1, maximum: 5}
+  required: [health, recommendation, priority]
+system: |
+  Task: project.health. Assess one {entity_project} on {user_name}'s board ({role}, {company}, {industry}).
+  Health levels: hot (active, moving), warm (normal pace), stale (no activity, needs a push), cold (likely dead),
+  at_risk (was active and went silent).
+  priority: 1 = act today, 5 = no rush.
+  Rules: judge only from the facts given. The recommendation is one concrete next action {user_name} could take
+  (reply, call, chase a vendor, close it out), never a status change and never a number you were not given.
+user_template: |
+  Name: {project_name}
+  Status: {project_status}
+  Created: {created}
+  Last communication: {last_communication}
+  Follow-up date: {follow_up_date}
+  Deadline: {deadline}
+  Emails sent: {emails_sent}
+  Pending tasks ({pending_count}):
+  {pending_tasks}
+  Recent notes:
+  {recent_notes}
+  Today: {today}

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Activations · {{ product }}{% endblock %}
+{% block content %}
+<h1>Activations</h1>
+<p class="lead"><a href="/admin">Back to admin</a></p>
+<div class="panel">
+<table>
+  <thead><tr><th>lid</th><th>account</th><th>plan</th><th>fingerprint</th><th>app</th><th>last seen</th><th>valid until</th><th>state</th><th></th></tr></thead>
+  <tbody>
+  {% for a in activations %}
+  <tr>
+    <td class="mono small">{{ a.lid }}</td>
+    <td>{{ a.email }}</td>
+    <td><span class="badge {{ a.plan }}">{{ a.plan }}</span></td>
+    <td class="mono small">{{ a.fingerprint[:16] }}…</td>
+    <td class="mono small">{{ a.app_version or '-' }}</td>
+    <td class="mono small">{{ a.last_seen[:16] }}</td>
+    <td class="mono small">{{ a.valid_until[:10] }}</td>
+    <td>{% if a.revoked %}<span class="badge revoked">released</span>{% else %}<span class="badge ok">active</span>{% endif %}</td>
+    <td>{% if not a.revoked %}
+      <form method="post" action="/admin/activations/{{ a.lid }}/{{ a.id }}/revoke" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button class="small danger" type="submit">Release</button>
+      </form>{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="9" class="muted">No activations.</td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

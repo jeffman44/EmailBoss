@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e "app[dev,tray,attachments,http]" -e license_server pytest httpx
+      - run: make check PY=python
+      - run: cd app && python -m pytest -q
+      - run: cd license_server && python -m pytest -q
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Version
+        id: v
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "app[dev,tray,attachments,http,desktop]" pyinstaller build
+      - name: Build bundle (release channel)
+        shell: pwsh
+        run: app\scripts\build_release.ps1 -Python python
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y; }
+          & $iscc /DAppVersion=${{ steps.v.outputs.version }} app\installer\emailboss.iss
+          Get-ChildItem app\dist\*Setup.exe | ForEach-Object {
+            "$($_.Name)  sha256 $((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EmailBoss-${{ steps.v.outputs.version }}-windows
+          path: |
+            app/dist/*Setup.exe
+            app/dist/*.zip
+            app/dist/*.whl
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/dist/*Setup.exe
+            app/dist/*.zip
+            app/dist/*.whl
+          generate_release_notes: false
+          body_path: docs/RELEASE_NOTES.md

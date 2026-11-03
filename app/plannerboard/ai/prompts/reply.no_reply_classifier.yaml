@@ -1,0 +1,47 @@
+id: reply.no_reply_classifier
+version: 1
+description: Decide whether an inbound message needs a reply from the user, and if so whether a draft can be written without judgment.
+feature: draft_reply
+max_tokens: 200
+temperature: 0.0
+label_field: decision
+post: [json, "labels:clear|draft|ask"]
+output_schema:
+  type: object
+  properties:
+    decision: {type: string, enum: [clear, draft, ask]}
+    reason: {type: string}
+    question_for_user: {type: string, description: "Only when decision is ask: the one thing the user must decide."}
+    directions:
+      type: array
+      items: {type: string}
+      description: "Only when decision is ask: 2 to 4 possible response directions, each phrased so it could become an email."
+    date_mentioned: {type: string, description: "ISO date if the email states a hard date, else empty."}
+  required: [decision, reason]
+system: |
+  Task: reply.no_reply_classifier. {user_name} ({role} at {company}) has an open "respond" task on an inbound email.
+  Decide what it needs.
+  clear: no reply is needed. Order or shipping confirmations, delivery notices, "thanks / got it / sounds good" with
+    no question, automatic replies, out-of-office, read receipts, calendar accepts, FYI forwards with no ask aimed at
+    {user_name}, or a thread {user_name} already answered later.
+  draft: a reply is needed and takes NO judgment: an acknowledgement the sender is waiting on, confirming receipt,
+    or restating a schedule or status that is already in the facts provided below.
+  ask: a reply is needed and takes judgment: any question aimed at {user_name} that the facts below cannot answer,
+    anything about price, scope changes, credits, warranty, disputes, commitments to dates, or a form or document
+    the sender wants {company} to fill out and return.
+  Rules: use only the email and the facts given. If the email states a hard date, copy it into date_mentioned
+  even when the decision is clear. When in doubt between draft and ask, choose ask.
+  Internal domains: {internal_domains}.
+user_template: |
+  Inbound email
+  From: {from_name} <{from_email}>
+  Date: {received_at}
+  Subject: {subject}
+  Body:
+  {body}
+
+  {entity_project}: {project_name} (status: {project_status})
+  Facts {user_name} is allowed to share with this sender:
+  {visible_facts}
+  Open tasks on the {entity_project}:
+  {open_tasks}

@@ -1,0 +1,43 @@
+{
+ "id": "AAMkAGExample001",
+ "receivedDateTime": "2026-10-01T15:12:03+00:00",
+ "hasAttachments": true,
+ "internetMessageId": "<abc-001@mail.northwind.example>",
+ "subject": "RE: Northwind Plaza lobby project - revised proposal",
+ "bodyPreview": "Hi, we reviewed the revised proposal. Approved to proceed, please go ahead and schedule. Ref PR-10442.",
+ "importance": "normal",
+ "conversationId": "CONV-NORTHWIND-1",
+ "isRead": false,
+ "internetMessageHeaders": [
+  {
+   "name": "From",
+   "value": "Dana Whitfield <dana@northwind.example>"
+  },
+  {
+   "name": "To",
+   "value": "Sam User <sam@acme.example>"
+  },
+  {
+   "name": "Cc",
+   "value": "Ops Desk <ops@northwind.example>"
+  }
+ ],
+ "isHtml": true,
+ "body": "<html><body><p>Hi Sam,</p><p>We reviewed the revised proposal. <b>Approved to proceed</b>, please go ahead and schedule. Ref PR-10442.</p><p>Docs here: <a href=\"https://www.dropbox.com/s/abc/plans.pdf\">plans</a></p><p>Thanks,<br>Dana</p><div>From: Sam User<br>Sent: Monday<br>To: Dana<br>Subject: proposal</div><p>old quoted text</p></body></html>",
+ "from": "dana@northwind.example",
+ "toRecipients": "sam@acme.example",
+ "ccRecipients": "ops@northwind.example",
+ "attachments": [
+  {
+   "@odata.type": "#microsoft.graph.fileAttachment",
+   "id": "AAMkAGExample001-1",
+   "lastModifiedDateTime": "2026-10-01T15:12:03+00:00",
+   "name": "Signed Proposal.pdf",
+   "contentType": "application/pdf",
+   "size": 24,
+   "isInline": false,
+   "contentId": null,
+   "contentBytes": "JVBERi0xLjQgZmFrZSBwZGYgYnl0ZXM="
+  }
+ ]
+}

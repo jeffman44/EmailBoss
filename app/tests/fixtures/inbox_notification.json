@@ -1,0 +1,22 @@
+{
+ "id": "AAMkAGExample002",
+ "receivedDateTime": "2026-10-01T16:00:00+00:00",
+ "hasAttachments": false,
+ "internetMessageId": "<notif-77@notifications.someapp.example>",
+ "subject": "Your weekly digest is ready",
+ "bodyPreview": "3 of your workflows ran this week.",
+ "importance": "low",
+ "conversationId": "CONV-DIGEST-77",
+ "isRead": true,
+ "internetMessageHeaders": [
+  {
+   "name": "From",
+   "value": "noreply@someapp.example"
+  }
+ ],
+ "isHtml": false,
+ "body": "3 of your workflows ran this week. Unsubscribe at any time.",
+ "from": "noreply@someapp.example",
+ "toRecipients": "sam@acme.example",
+ "attachments": []
+}

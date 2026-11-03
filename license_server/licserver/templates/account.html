@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Account · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Account</h1>
+<div class="panel">
+  <dl class="kv">
+    <dt>email</dt><dd>{{ account.email }}</dd>
+    <dt>created</dt><dd class="mono">{{ account.created }}</dd>
+    <dt>role</dt><dd>{% if account.is_admin %}admin{% else %}customer{% endif %}</dd>
+  </dl>
+</div>
+<h2>Change password</h2>
+<div class="panel">
+<form method="post" action="/account/password">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="current">current password</label>
+  <input id="current" type="password" name="current" required autocomplete="current-password">
+  <label for="password">new password</label>
+  <input id="password" type="password" name="password" required minlength="8" autocomplete="new-password">
+  <label for="password2">repeat</label>
+  <input id="password2" type="password" name="password2" minlength="8" autocomplete="new-password">
+  <div class="actions"><button class="primary" type="submit">Change password</button></div>
+</form>
+</div>
+{% endblock %}

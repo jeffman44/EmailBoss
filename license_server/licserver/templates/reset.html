@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}New password · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Choose a new password</h1>
+<div class="panel">
+<form method="post" action="/reset/{{ token }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="password">new password</label>
+  <input id="password" type="password" name="password" required minlength="8" autocomplete="new-password">
+  <label for="password2">repeat</label>
+  <input id="password2" type="password" name="password2" minlength="8" autocomplete="new-password">
+  <div class="actions"><button class="primary" type="submit">Set password</button></div>
+</form>
+</div>
+{% endblock %}

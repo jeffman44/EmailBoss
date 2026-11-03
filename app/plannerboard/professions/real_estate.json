@@ -1,0 +1,572 @@
+{
+  "id": "real_estate",
+  "label": "Real Estate Agent",
+  "description": "Seller listings and buyer clients from lead response through contract and closing.",
+  "icon": "🏠",
+  "entity": {
+    "project": "Deal",
+    "projects": "Deals",
+    "client": "Client",
+    "location": "Property",
+    "contact": "Contact",
+    "quote": "Listing proposal"
+  },
+  "work_types": [
+    {
+      "id": "listing",
+      "label": "Listing",
+      "short": "LIST",
+      "color": "#f0b429",
+      "workflow_id": "listing"
+    },
+    {
+      "id": "buyer",
+      "label": "Buyer",
+      "short": "BUY",
+      "color": "#4fc3f7",
+      "workflow_id": "buyer"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "mls_no",
+      "label": "MLS #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "list_price",
+      "label": "List price",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "closing_date",
+      "label": "Closing date",
+      "type": "date",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "lender",
+      "label": "Lender",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "title_company",
+      "label": "Title",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "mls_no",
+      "label": "MLS #",
+      "regex": "\\bMLS\\s*#?\\s*:?\\s*([A-Z]?\\d{6,10})\\b",
+      "unique_match": true
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "showing_request",
+      "offer",
+      "inspection",
+      "lender",
+      "title_escrow"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "listing",
+      "showing",
+      "offer",
+      "counter",
+      "inspection",
+      "appraisal",
+      "closing",
+      "escrow",
+      "earnest money",
+      "contingency",
+      "disclosure",
+      "comps"
+    ],
+    "acronyms": [
+      "MLS",
+      "CMA",
+      "HOA",
+      "FSBO",
+      "EMD"
+    ],
+    "scope_phrases": [
+      "as-is",
+      "seller concession",
+      "contingent on financing"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "residential real estate",
+    "role_noun": "real estate agent"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "mls_no",
+    "closing_date"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "listing",
+        "label": "Listing",
+        "icon": "🏠",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "lead",
+            "label": "Lead",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond to lead",
+              "date_type": "sla",
+              "sla_hours": 2,
+              "category": "lead"
+            },
+            "advance_on_task_complete": "appointment"
+          },
+          {
+            "id": "appointment",
+            "label": "Appointment Set",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare listing presentation",
+              "date_type": "follow_up",
+              "days": 2
+            },
+            "advance_on_task_complete": "proposal"
+          },
+          {
+            "id": "proposal",
+            "label": "Proposal",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Send listing proposal",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "proposal_sent"
+          },
+          {
+            "id": "proposal_sent",
+            "label": "Proposal Sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up with seller",
+              "date_type": "follow_up",
+              "days": 3
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "listed",
+            "label": "Listed",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Review showings and feedback",
+              "date_type": "follow_up",
+              "days": 7,
+              "category": "listing"
+            }
+          },
+          {
+            "id": "under_contract",
+            "label": "Under Contract",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Track contingencies",
+              "date_type": "follow_up",
+              "days": 5,
+              "category": "closing"
+            },
+            "advance_on_task_complete": "complete"
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "lead",
+        "won_transition": {
+          "from": "proposal_sent",
+          "to": "listed"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "buyer",
+        "label": "Buyer",
+        "icon": "🔑",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "lead",
+            "label": "Lead",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond to lead",
+              "date_type": "sla",
+              "sla_hours": 2,
+              "category": "lead"
+            },
+            "advance_on_task_complete": "searching"
+          },
+          {
+            "id": "searching",
+            "label": "Searching",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Send new matches",
+              "date_type": "follow_up",
+              "days": 3
+            }
+          },
+          {
+            "id": "offer_out",
+            "label": "Offer Out",
+            "role": "out",
+            "column": true
+          },
+          {
+            "id": "under_contract",
+            "label": "Under Contract",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Track contingencies",
+              "date_type": "follow_up",
+              "days": 5,
+              "category": "closing"
+            },
+            "advance_on_task_complete": "complete"
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "lead",
+        "won_transition": {
+          "from": "offer_out",
+          "to": "under_contract"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "lead",
+            "proposal",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Listing proposal",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

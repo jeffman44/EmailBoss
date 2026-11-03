@@ -1,0 +1,537 @@
+{
+  "id": "insurance_agency",
+  "label": "Insurance Agency",
+  "description": "Quotes through binding and renewal, plus claims reported to carriers.",
+  "icon": "🛡️",
+  "entity": {
+    "project": "Account",
+    "projects": "Accounts",
+    "client": "Insured",
+    "location": "Risk location",
+    "contact": "Contact",
+    "quote": "Quote"
+  },
+  "work_types": [
+    {
+      "id": "policy",
+      "label": "Quote / Policy",
+      "short": "POL",
+      "color": "#f0b429",
+      "workflow_id": "policy"
+    },
+    {
+      "id": "claim",
+      "label": "Claim",
+      "short": "CLM",
+      "color": "#4fc3f7",
+      "workflow_id": "claim"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "policy_no",
+      "label": "Policy #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "claim_no",
+      "label": "Claim #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "carrier",
+      "label": "Carrier",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "line",
+      "label": "Line of business",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "effective_date",
+      "label": "Effective",
+      "type": "date",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "policy_no",
+      "label": "Policy #",
+      "regex": "\\bPolicy\\s*(?:No\\.?|#)?\\s*:?\\s*([A-Z0-9-]{6,20})\\b",
+      "unique_match": true
+    },
+    {
+      "key": "claim_no",
+      "label": "Claim #",
+      "regex": "\\bClaim\\s*(?:No\\.?|#)?\\s*:?\\s*([A-Z0-9-]{5,20})\\b",
+      "unique_match": true
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "carrier_notice",
+      "claim",
+      "renewal_notice",
+      "certificate_request",
+      "payment"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "policy",
+      "premium",
+      "coverage",
+      "endorsement",
+      "certificate",
+      "renewal",
+      "carrier",
+      "deductible",
+      "claim",
+      "binder",
+      "loss run"
+    ],
+    "acronyms": [
+      "COI",
+      "GL",
+      "WC",
+      "BOP",
+      "E&O",
+      "D&O",
+      "ACORD"
+    ],
+    "scope_phrases": [
+      "additional insured",
+      "waiver of subrogation",
+      "per occurrence"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "independent insurance agency",
+    "role_noun": "agent"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "policy_no",
+    "carrier",
+    "effective_date"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "policy",
+        "label": "Quote / Policy",
+        "icon": "🛡️",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "quote_needed",
+            "label": "Quote Needed",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare and send quote",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "quote_sent"
+          },
+          {
+            "id": "quote_sent",
+            "label": "Quote Sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up with prospect",
+              "date_type": "follow_up",
+              "days": 4
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "bound",
+            "label": "Bound",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Bind coverage and issue documents",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "binding"
+            },
+            "advance_on_task_complete": "issued"
+          },
+          {
+            "id": "issued",
+            "label": "Issued",
+            "role": "in_progress",
+            "column": true
+          },
+          {
+            "id": "renewal",
+            "label": "Renewal",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare renewal",
+              "date_type": "follow_up",
+              "days": 10,
+              "category": "renewal"
+            },
+            "advance_on_task_complete": "quote_sent"
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "quote_needed",
+        "won_transition": {
+          "from": "quote_sent",
+          "to": "bound"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "claim",
+        "label": "Claim",
+        "icon": "📋",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "reported",
+            "label": "Reported",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "File claim with carrier",
+              "date_type": "sla",
+              "sla_hours": 4,
+              "category": "claim"
+            },
+            "advance_on_task_complete": "with_carrier"
+          },
+          {
+            "id": "with_carrier",
+            "label": "With Carrier",
+            "role": "waiting",
+            "column": true,
+            "owning_task": {
+              "text": "Check claim status",
+              "date_type": "follow_up",
+              "days": 5,
+              "category": "claim"
+            }
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "reported",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "quote_needed",
+            "renewal",
+            "reported",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Quote",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

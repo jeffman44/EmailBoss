@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}My licenses · {{ product }}{% endblock %}
+{% block content %}
+<h1>My licenses</h1>
+<p class="lead">Keys are signed; paste one into the app to activate this device. Each activation uses a seat.</p>
+{% for lic in licenses %}
+<div class="panel" id="{{ lic.lid }}">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <span class="badge {{ lic.plan }}">{{ lic.plan }}</span>
+    <span class="badge {{ lic.state }}">{{ lic.state }}</span>
+    <span class="mono muted small">{{ lic.lid }}</span>
+    <span class="muted small" style="margin-left:auto">seats {{ lic.seats_used }}/{{ lic.seats }} · expires <span class="mono">{{ lic.expires[:10] }}</span></span>
+  </div>
+  <div class="keybox">
+    <textarea readonly id="key-{{ lic.lid }}" spellcheck="false">{{ lic.key }}</textarea>
+    <button type="button" class="copy" data-target="key-{{ lic.lid }}">Copy key</button>
+  </div>
+  <div class="small muted">features: <span class="mono">{{ lic.features | join(', ') }}</span></div>
+  {% if lic.devices %}
+  <table style="margin-top:12px">
+    <thead><tr><th>device</th><th>app</th><th>first seen</th><th>last seen</th><th>valid until</th><th></th></tr></thead>
+    <tbody>
+    {% for d in lic.devices %}
+      <tr>
+        <td class="mono">{{ d.fingerprint[:16] }}…{% if d.revoked %} <span class="badge revoked">released</span>{% endif %}</td>
+        <td class="mono">{{ d.app_version or '-' }}</td>
+        <td class="mono small">{{ d.first_seen[:10] }}</td>
+        <td class="mono small">{{ d.last_seen[:16] }}</td>
+        <td class="mono small">{{ d.valid_until[:10] }}</td>
+        <td>{% if not d.revoked %}
+          <form method="post" action="/licenses/{{ lic.lid }}/devices/{{ d.id }}/deactivate" class="inline" onsubmit="return confirm('Release this device?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf }}">
+            <button class="small danger" type="submit">Deactivate</button>
+          </form>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="small muted" style="margin:10px 0 0">No devices activated yet.</p>{% endif %}
+</div>
+{% else %}
+<div class="panel">No licenses on this account yet. {% if settings.trial_enabled %}Trials are issued at signup.{% endif %}</div>
+{% endfor %}
+{% endblock %}
+{% block scripts %}
+<script>
+document.querySelectorAll('button.copy').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var ta = document.getElementById(b.dataset.target);
+    ta.select();
+    var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy key'; }, 1500); };
+    if (navigator.clipboard) { navigator.clipboard.writeText(ta.value).then(done, function () { document.execCommand('copy'); done(); }); }
+    else { document.execCommand('copy'); done(); }
+  });
+});
+</script>
+{% endblock %}

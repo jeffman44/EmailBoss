@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Admin · {{ product }}{% endblock %}
+{% block content %}
+<h1>Admin</h1>
+<div class="actions" style="margin-top:0">
+  <a class="btn primary" href="/admin/issue">Issue license</a>
+  <a class="btn" href="/admin/activations">Activations</a>
+  <a class="btn" href="/admin/audit">Audit log</a>
+</div>
+<h2>Licenses ({{ licenses | length }})</h2>
+<div class="panel">
+<table>
+  <thead><tr><th>lid</th><th>account</th><th>plan</th><th>seats</th><th>expires</th><th>state</th><th></th></tr></thead>
+  <tbody>
+  {% for l in licenses %}
+  <tr>
+    <td class="mono small">{{ l.lid }}</td>
+    <td>{{ l.email }}</td>
+    <td><span class="badge {{ l.plan }}">{{ l.plan }}</span></td>
+    <td class="mono">{{ l.seats_used }}/{{ l.seats }}</td>
+    <td class="mono small">{{ l.expires[:10] }}</td>
+    <td><span class="badge {{ l.state }}">{{ l.state }}</span></td>
+    <td style="white-space:nowrap">
+      <form method="post" action="/admin/licenses/{{ l.lid }}/renew" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="days" value="365">
+        <button class="small" type="submit">+365d</button>
+      </form>
+      {% if not l.revoked %}
+      <form method="post" action="/admin/licenses/{{ l.lid }}/revoke" class="inline" onsubmit="return confirm('Revoke {{ l.lid }}?')">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button class="small danger" type="submit">Revoke</button>
+      </form>{% endif %}
+    </td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">No licenses issued.</td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>
+<h2>Accounts ({{ accounts | length }})</h2>
+<div class="panel">
+<table>
+  <thead><tr><th>email</th><th>created</th><th>licenses</th><th>admin</th><th></th></tr></thead>
+  <tbody>
+  {% for a in accounts %}
+  <tr>
+    <td>{{ a.email }}</td>
+    <td class="mono small">{{ a.created[:10] }}</td>
+    <td class="mono">{{ a.license_count }}</td>
+    <td>{% if a.is_admin %}<span class="badge ok">admin</span>{% endif %}</td>
+    <td style="white-space:nowrap">
+      <a class="btn small" href="/admin/issue?email={{ a.email }}">Issue</a>
+      <form method="post" action="/admin/accounts/{{ a.id }}/admin" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="hidden" name="value" value="{{ 0 if a.is_admin else 1 }}">
+        <button class="small" type="submit">{{ 'Remove admin' if a.is_admin else 'Make admin' }}</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

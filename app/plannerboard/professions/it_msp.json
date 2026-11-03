@@ -1,0 +1,525 @@
+{
+  "id": "it_msp",
+  "label": "IT Managed Services",
+  "description": "Support tickets with a one-hour acknowledgement SLA, plus project quotes through approval.",
+  "icon": "🖥️",
+  "entity": {
+    "project": "Ticket",
+    "projects": "Tickets",
+    "client": "Client",
+    "location": "Site",
+    "contact": "Contact",
+    "quote": "Quote"
+  },
+  "work_types": [
+    {
+      "id": "ticket",
+      "label": "Ticket",
+      "short": "TKT",
+      "color": "#4fc3f7",
+      "workflow_id": "ticket"
+    },
+    {
+      "id": "project",
+      "label": "Project / Quote",
+      "short": "PRJ",
+      "color": "#f0b429",
+      "workflow_id": "project"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "ticket_no",
+      "label": "Ticket #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "priority",
+      "label": "Priority",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "asset",
+      "label": "Asset / Device",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "vendor_case",
+      "label": "Vendor case #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "ticket_no",
+      "label": "Ticket #",
+      "regex": "\\b(?:Ticket|TKT|Case|INC)\\s*#?\\s*:?\\s*(\\d{4,9})\\b",
+      "unique_match": true
+    },
+    {
+      "key": "vendor_case",
+      "label": "Vendor case",
+      "regex": "\\b(?:SR|Case)\\s*#?\\s*:?\\s*([A-Z0-9-]{6,16})\\b",
+      "unique_match": false
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 1,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "outage",
+      "access_request",
+      "vendor_case",
+      "renewal",
+      "security_alert"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@",
+      "alerts@",
+      "monitoring@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "ticket",
+      "outage",
+      "server",
+      "backup",
+      "firewall",
+      "Microsoft 365",
+      "VPN",
+      "laptop",
+      "onboarding",
+      "offboarding",
+      "license",
+      "patch"
+    ],
+    "acronyms": [
+      "MSP",
+      "RMM",
+      "MFA",
+      "VPN",
+      "SLA",
+      "EDR",
+      "SSO"
+    ],
+    "scope_phrases": [
+      "covered under agreement",
+      "billable project",
+      "out of scope"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "IT managed services",
+    "role_noun": "account manager"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "ticket_no",
+    "priority"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "ticket",
+        "label": "Ticket",
+        "icon": "🎫",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "new",
+            "label": "New",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Acknowledge and triage ticket",
+              "date_type": "sla",
+              "sla_hours": 1,
+              "category": "triage"
+            },
+            "advance_on_task_complete": "in_progress"
+          },
+          {
+            "id": "in_progress",
+            "label": "In Progress",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Update client",
+              "date_type": "follow_up",
+              "days": 1,
+              "category": "ticket"
+            }
+          },
+          {
+            "id": "waiting_client",
+            "label": "Waiting on Client",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "waiting_vendor",
+            "label": "Waiting on Vendor",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Resolved",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "new",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "project",
+        "label": "Project / Quote",
+        "icon": "🖥️",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "quote_needed",
+            "label": "Quote Needed",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare and send quote",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "quote_sent"
+          },
+          {
+            "id": "quote_sent",
+            "label": "Quote Sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up with client",
+              "date_type": "follow_up",
+              "days": 5
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "approved",
+            "label": "Approved",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Order hardware and schedule",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "ordering"
+            },
+            "advance_on_task_complete": "scheduled"
+          },
+          {
+            "id": "scheduled",
+            "label": "Scheduled",
+            "role": "in_progress",
+            "column": true
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Complete",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "quote_needed",
+        "won_transition": {
+          "from": "quote_sent",
+          "to": "approved"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "new",
+            "quote_needed",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Quote",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

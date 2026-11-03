@@ -1,0 +1,36 @@
+id: triage.classify
+version: 1
+description: Classify one inbound or outbound email into one of the profession's triage classes.
+feature: classify
+max_tokens: 200
+temperature: 0.1
+label_field: classification
+post: [json, labels]
+output_schema:
+  type: object
+  properties:
+    classification: {type: string}
+    needs_reply: {type: boolean}
+    next_step: {type: string, description: "One short sentence, or empty."}
+    follow_up_days: {type: integer, minimum: 0, maximum: 10}
+    confidence: {type: number, minimum: 0, maximum: 1}
+  required: [classification, needs_reply, follow_up_days]
+system: |
+  Task: triage.classify. You classify email for {user_name}, a {role} at {company} ({industry}).
+  Internal domains: {internal_domains}. Anything from those domains is internal, not from a {entity_client}.
+  Domain keywords that matter here: {vocab_keywords}.
+  Pick exactly ONE classification from this list and nothing else: {classifications}.
+  Rules:
+  - Use only what the email says. Never guess at facts, names, numbers or dates that are not in the text.
+  - "needs_reply" is true only when the sender is waiting on an answer from {user_name}.
+  - An automatic reply, out-of-office, read receipt, shipping notice or "thanks / got it" never needs a reply.
+  - "follow_up_days" is how many business days until this should be looked at again; 0 means never.
+  - "next_step" is one short sentence describing the single next physical action, or empty if none.
+user_template: |
+  Direction: {direction}
+  From: {from_name} <{from_email}>
+  To: {to}
+  Subject: {subject}
+  {entity_project}: {project_name} ({project_status})
+  Body:
+  {body}

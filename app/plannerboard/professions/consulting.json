@@ -1,0 +1,464 @@
+{
+  "id": "consulting",
+  "label": "Consulting",
+  "description": "Engagements from scoping through proposal, kickoff and delivery.",
+  "icon": "💼",
+  "entity": {
+    "project": "Engagement",
+    "projects": "Engagements",
+    "client": "Client",
+    "location": "Account",
+    "contact": "Stakeholder",
+    "quote": "Proposal"
+  },
+  "work_types": [
+    {
+      "id": "engagement",
+      "label": "Engagement",
+      "short": "ENG",
+      "color": "#f0b429",
+      "workflow_id": "engagement"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "sow_no",
+      "label": "SOW #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "engagement_type",
+      "label": "Type",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "hours_budget",
+      "label": "Hours budget",
+      "type": "number",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "quote_sent_date",
+      "label": "Sent on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "won_date",
+      "label": "Won on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "sow_no",
+      "label": "SOW #",
+      "regex": "\\b(?:SOW|Statement\\s*of\\s*Work)\\s*#?\\s*:?\\s*([A-Z0-9-]{3,12})\\b",
+      "unique_match": true
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "proposal_request",
+      "status_update",
+      "deliverable_feedback",
+      "invoice"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "proposal",
+      "statement of work",
+      "deliverable",
+      "milestone",
+      "kickoff",
+      "stakeholder",
+      "retainer",
+      "workshop",
+      "readout"
+    ],
+    "acronyms": [
+      "SOW",
+      "MSA",
+      "NDA",
+      "KPI",
+      "RFP"
+    ],
+    "scope_phrases": [
+      "time and materials",
+      "fixed fee",
+      "out of scope",
+      "assumptions"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "professional consulting",
+    "role_noun": "consultant"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "sow_no",
+    "engagement_type",
+    "quote_amount"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "engagement",
+        "label": "Engagement",
+        "icon": "💼",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "scoping",
+            "label": "Scoping",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare and send proposal",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "proposal_sent"
+          },
+          {
+            "id": "proposal_sent",
+            "label": "Proposal Sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up with client",
+              "date_type": "follow_up",
+              "days": 5
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "kickoff",
+            "label": "Kickoff",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Schedule kickoff and set up engagement",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "setup"
+            },
+            "advance_on_task_complete": "delivery"
+          },
+          {
+            "id": "delivery",
+            "label": "Delivery",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Send status update",
+              "date_type": "follow_up",
+              "days": 7,
+              "category": "delivery"
+            }
+          },
+          {
+            "id": "awaiting_client",
+            "label": "Awaiting Client",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "scoping",
+        "won_transition": {
+          "from": "proposal_sent",
+          "to": "kickoff"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "scoping",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Proposal",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

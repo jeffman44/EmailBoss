@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "licserver"
+version = "0.1.0"
+description = "License and login portal for Email Boss (FastAPI, SQLite, Ed25519)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "cryptography>=42",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["licserver*"]
+
+[tool.setuptools.package-data]
+licserver = ["templates/*.html", "templates/admin/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

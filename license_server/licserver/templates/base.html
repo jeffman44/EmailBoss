@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ product }} Licensing{% endblock %}</title>
+<link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">{{ product }} <span>// licensing</span></a>
+  <nav>
+    {% if account %}
+      <a href="/dashboard" class="{% if request.url.path == '/dashboard' %}active{% endif %}">Licenses</a>
+      <a href="/download" class="{% if request.url.path == '/download' %}active{% endif %}">Download</a>
+      <a href="/account" class="{% if request.url.path == '/account' %}active{% endif %}">Account</a>
+      {% if account.is_admin %}<a href="/admin" class="{% if request.url.path.startswith('/admin') %}active{% endif %}">Admin</a>{% endif %}
+      <form method="post" action="/logout" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button class="link" type="submit">Sign out</button>
+      </form>
+    {% else %}
+      <a href="/login">Sign in</a>
+      <a href="/signup">Create account</a>
+    {% endif %}
+  </nav>
+</header>
+<main class="{% block main_class %}{% endblock %}">
+  {% if notice %}<div class="flash notice">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer>{{ product }} license server</footer>
+{% block scripts %}{% endblock %}
+</body>
+</html>

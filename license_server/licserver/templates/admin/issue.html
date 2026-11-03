@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Issue license · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Issue license</h1>
+<p class="lead">An unknown email gets an account with a temporary password (welcome mail queued).</p>
+<div class="panel">
+<form method="post" action="/admin/issue">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="email">customer email</label>
+  <input id="email" type="email" name="email" value="{{ email or '' }}" required autofocus>
+  <label for="plan">plan</label>
+  <select id="plan" name="plan">
+    {% for pid, p in plans.items() %}<option value="{{ pid }}" {% if pid == 'solo' %}selected{% endif %}>{{ pid }} ({{ p.seats }} seats, {{ p.days }} days)</option>{% endfor %}
+  </select>
+  <label for="seats">seats (0 = plan default)</label>
+  <input id="seats" type="number" name="seats" value="0" min="0" max="500">
+  <label for="days">days (0 = plan default)</label>
+  <input id="days" type="number" name="days" value="0" min="0" max="3650">
+  <label for="features">features override (comma separated, blank = plan default)</label>
+  <input id="features" type="text" name="features" value="" class="mono">
+  <label><input type="checkbox" name="send_email" value="1" checked> email the key to the customer</label>
+  <div class="actions"><button class="primary" type="submit">Issue</button><a class="btn" href="/admin">Cancel</a></div>
+</form>
+</div>
+{% endblock %}

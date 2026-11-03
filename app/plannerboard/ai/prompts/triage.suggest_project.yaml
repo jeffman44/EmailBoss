@@ -1,0 +1,34 @@
+id: triage.suggest_project
+version: 1
+description: Propose a clean board name, work type and one-line scope for a NEW project minted from an email. Never creates anything by itself.
+feature: classify
+max_tokens: 200
+temperature: 0.2
+post: [json, grounding]
+output_schema:
+  type: object
+  properties:
+    name: {type: string, description: "Title case, 3 to 8 words, location first when known."}
+    work_type: {type: string}
+    scope: {type: string, description: "One sentence of what is being asked, from the email only."}
+    client_name: {type: string}
+    location: {type: string}
+    is_request: {type: boolean, description: "True when the sender is asking the user to do, price or deliver something."}
+    confidence: {type: number, minimum: 0, maximum: 1}
+  required: [name, work_type, scope, is_request]
+system: |
+  Task: triage.suggest_project. {user_name} ({role}, {company}, {industry}) tracks work as a board of {entity_projects}.
+  From one email, suggest how a new {entity_project} card should read.
+  Rules:
+  - Name format: "[{entity_location} or {entity_client}] [short description]" in Title Case, 3 to 8 words, no reference
+    numbers, no vendor names, no dates. If the subject already reads like that, keep it.
+  - work_type must be one of: {work_types}. Pick the closest; when unsure pick the first.
+  - scope is ONE sentence drawn from the email text. Never invent quantities, deadlines or amounts.
+  - client_name and location only if the email states them; otherwise empty strings.
+  - Keywords for this profession: {vocab_keywords}.
+user_template: |
+  From: {from_name} <{from_email}>
+  Subject: {subject}
+  Attachments: {attachment_names}
+  Body:
+  {body}

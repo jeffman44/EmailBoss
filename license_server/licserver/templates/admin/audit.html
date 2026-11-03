@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Audit · {{ product }}{% endblock %}
+{% block content %}
+<h1>Audit log</h1>
+<p class="lead"><a href="/admin">Back to admin</a> · newest first</p>
+<div class="panel">
+<table>
+  <thead><tr><th>ts</th><th>action</th><th>actor</th><th>target</th><th>detail</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+  <tr>
+    <td class="mono small">{{ e.ts }}</td>
+    <td class="mono">{{ e.action }}</td>
+    <td class="mono small">{{ e.actor }}</td>
+    <td class="mono small">{{ e.target }}</td>
+    <td class="mono small muted">{{ e.detail }}</td>
+  </tr>
+  {% else %}<tr><td colspan="5" class="muted">Empty.</td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

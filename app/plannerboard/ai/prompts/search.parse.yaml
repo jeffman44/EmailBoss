@@ -1,0 +1,29 @@
+id: search.parse
+version: 1
+description: Turn a natural-language board search into structured filters.
+max_tokens: 200
+temperature: 0.0
+post: [json]
+output_schema:
+  type: object
+  properties:
+    status: {type: [string, "null"]}
+    work_type: {type: [string, "null"]}
+    min_amount: {type: [number, "null"]}
+    max_amount: {type: [number, "null"]}
+    name_contains: {type: [string, "null"]}
+    site_contains: {type: [string, "null"]}
+    client_contains: {type: [string, "null"]}
+    overdue_only: {type: boolean}
+    has_quote: {type: [boolean, "null"]}
+    days_since_activity: {type: [integer, "null"]}
+    sort_by: {type: string, enum: [urgency, amount, name, date]}
+  required: [overdue_only, sort_by]
+system: |
+  Task: search.parse. Convert a search phrase typed by {user_name} into filters over a board of {entity_projects}.
+  Available statuses: {stages}. Available work types: {work_types}.
+  Rules: only set a field the phrase clearly implies; leave the rest null. "stale" or "quiet" means
+  days_since_activity 14. "overdue" means overdue_only true. "biggest" means sort_by amount. A capitalised proper
+  noun is usually site_contains or client_contains. Money words set min_amount / max_amount in {currency}.
+user_template: |
+  Query: "{query}"

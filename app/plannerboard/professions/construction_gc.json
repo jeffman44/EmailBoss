@@ -1,0 +1,638 @@
+{
+  "id": "construction_gc",
+  "label": "General Contractor",
+  "description": "Bids through award and preconstruction, change orders, RFIs and submittals.",
+  "icon": "🏗️",
+  "entity": {
+    "project": "Project",
+    "projects": "Projects",
+    "client": "Owner",
+    "location": "Jobsite",
+    "contact": "Contact",
+    "quote": "Bid"
+  },
+  "work_types": [
+    {
+      "id": "bid",
+      "label": "Bid",
+      "short": "BID",
+      "color": "#f0b429",
+      "workflow_id": "bid"
+    },
+    {
+      "id": "change_order",
+      "label": "Change Order",
+      "short": "CO",
+      "color": "#c678dd",
+      "workflow_id": "change_order"
+    },
+    {
+      "id": "rfi",
+      "label": "RFI / Submittal",
+      "short": "RFI",
+      "color": "#4fc3f7",
+      "workflow_id": "rfi"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "project_no",
+      "label": "Project #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "co_number",
+      "label": "CO #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "rfi_number",
+      "label": "RFI #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "architect",
+      "label": "Architect",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "bid_due",
+      "label": "Bid due",
+      "type": "date",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "quote_sent_date",
+      "label": "Sent on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "won_date",
+      "label": "Won on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "project_no",
+      "label": "Project #",
+      "regex": "\\b(?:Project|Job)\\s*#?\\s*:?\\s*(\\d{4,8})\\b",
+      "unique_match": true
+    },
+    {
+      "key": "rfi_number",
+      "label": "RFI #",
+      "regex": "\\bRFI\\s*#?\\s*:?\\s*(\\d{1,5})\\b",
+      "unique_match": false
+    },
+    {
+      "key": "co_number",
+      "label": "CO #",
+      "regex": "\\b(?:CO|Change\\s*Order)\\s*#?\\s*:?\\s*(\\d{1,5})\\b",
+      "unique_match": false
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "bid_invitation",
+      "award",
+      "rfi",
+      "submittal",
+      "change_order"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "bid",
+      "takeoff",
+      "submittal",
+      "RFI",
+      "change order",
+      "punch list",
+      "schedule of values",
+      "pay application",
+      "lien waiver",
+      "subcontractor"
+    ],
+    "acronyms": [
+      "RFI",
+      "CO",
+      "SOV",
+      "GC",
+      "ITB",
+      "RFP",
+      "AIA",
+      "NTP"
+    ],
+    "scope_phrases": [
+      "per plans and specifications",
+      "furnish and install",
+      "allowance",
+      "excluded"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "commercial construction",
+    "role_noun": "project manager"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "project_no",
+    "co_number",
+    "rfi_number",
+    "quote_amount"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "bid",
+        "label": "Bid",
+        "icon": "🏗️",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "takeoff",
+            "label": "Takeoff",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare and submit bid",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "submitted"
+          },
+          {
+            "id": "submitted",
+            "label": "Bid Submitted",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up on bid",
+              "date_type": "follow_up",
+              "days": 7
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "awarded",
+            "label": "Awarded",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Execute contract and set up job",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "setup"
+            },
+            "advance_on_task_complete": "preconstruction"
+          },
+          {
+            "id": "preconstruction",
+            "label": "Preconstruction",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Confirm submittals and schedule",
+              "date_type": "follow_up",
+              "days": 10,
+              "category": "preconstruction"
+            },
+            "advance_on_task_complete": "in_progress"
+          },
+          {
+            "id": "in_progress",
+            "label": "In Progress",
+            "role": "in_progress",
+            "column": true
+          },
+          {
+            "id": "punch_list",
+            "label": "Punch List",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Close punch list",
+              "date_type": "follow_up",
+              "days": 5,
+              "category": "closeout"
+            },
+            "advance_on_task_complete": "complete"
+          },
+          {
+            "id": "cold",
+            "label": "Lost / Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Complete",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "takeoff",
+        "won_transition": {
+          "from": "submitted",
+          "to": "awarded"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "change_order",
+        "label": "Change Order",
+        "icon": "📝",
+        "color": "#c678dd",
+        "stages": [
+          {
+            "id": "pricing",
+            "label": "Pricing",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Price and send change order",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "sent"
+          },
+          {
+            "id": "sent",
+            "label": "Sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up on change order",
+              "date_type": "follow_up",
+              "days": 5
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "approved",
+            "label": "Approved",
+            "role": "won",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "pricing",
+        "won_transition": {
+          "from": "sent",
+          "to": "approved"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "rfi",
+        "label": "RFI / Submittal",
+        "icon": "❓",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "open",
+            "label": "Open",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond to RFI",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "rfi"
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting on Architect",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Answered",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "open",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "takeoff",
+            "pricing",
+            "open",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Bid",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

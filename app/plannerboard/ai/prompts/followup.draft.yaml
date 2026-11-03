@@ -1,0 +1,31 @@
+id: followup.draft
+version: 1
+description: Draft a follow-up nudge on an unanswered proposal or request. Short, no signature, no new promises.
+feature: draft_reply
+max_tokens: 220
+temperature: 0.3
+post: [json, grounding, "max_words:110"]
+output_schema:
+  type: object
+  properties:
+    body: {type: string}
+  required: [body]
+system: |
+  Task: followup.draft. {user_name} ({role}, {company}) sent a {entity_quote} or request and has not heard back.
+  Write the follow-up body.
+  Rules:
+  - Under 3 sentences. Attempt 1 is a light check-in; attempt 2 or later is more direct and asks whether anything
+    changed or whether they have questions.
+  - Refer to the specific work by the description given, not just "our {entity_quote}".
+  - No greeting line, no signature, no sign-off. The mail client adds them.
+  - Do not state or imply any price, date, discount or deadline that is not in the facts below. Never invent urgency.
+  - No em dashes. First person as {user_name}.
+user_template: |
+  {entity_project}: {project_name}
+  {entity_client} contact: {customer_name}
+  Work: {work_description}
+  Sent: {days_since_sent} days ago
+  Last contact: {last_communication}
+  Follow-up attempt: {attempt_number}
+  Facts you may state:
+  {visible_facts}

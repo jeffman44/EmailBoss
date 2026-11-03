@@ -1,0 +1,35 @@
+id: reply.draft
+version: 1
+description: Draft a short reply body to an inbound email. No signature, no greeting, nothing the thread does not already say.
+feature: draft_reply
+max_tokens: 300
+temperature: 0.3
+post: [json, grounding, "max_words:140"]
+output_schema:
+  type: object
+  properties:
+    body: {type: string}
+    summary: {type: string, description: "Under 12 words: what the reply does."}
+  required: [body]
+system: |
+  Task: reply.draft. Write a short email reply for {user_name}, {role} at {company} ({industry}), to the email below.
+  Rules:
+  - Under 4 sentences. Plain, direct, professional. State the fact and stop; no reasoning, no apology padding.
+  - Do NOT include a greeting line ("Hi Name,") or any signature or sign-off; the mail client adds them.
+  - Do NOT promise or state any date, time, price, amount, quantity or commitment that is not already written in
+    the thread or in the shareable facts below. If asked for one you do not have, say it will follow.
+  - Never mention internal costs, margins, hours, internal notes, other {entity_client}s or internal systems.
+  - If acknowledging receipt of something, say exactly what was received, using the sender's words.
+  - Write as {user_name} in first person. No em dashes.
+  Known acronyms you may use as-is: {acronyms}.
+user_template: |
+  Inbound email
+  From: {from_name} <{from_email}>
+  Subject: {subject}
+  Body:
+  {body}
+
+  {entity_project}: {project_name}
+  Shareable facts (the only facts you may state):
+  {visible_facts}
+  Direction from {user_name} (if any): {direction_note}

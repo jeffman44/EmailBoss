@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Sign in · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Sign in</h1>
+<div class="panel">
+<form method="post" action="/login">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next or '/dashboard' }}">
+  <label for="email">email</label>
+  <input id="email" type="email" name="email" value="{{ email or '' }}" required autofocus autocomplete="username">
+  <label for="password">password</label>
+  <input id="password" type="password" name="password" required autocomplete="current-password">
+  <div class="actions">
+    <button class="primary" type="submit">Sign in</button>
+    <a class="small" href="/forgot">Forgot password?</a>
+  </div>
+</form>
+</div>
+<p class="small muted">No account yet? <a href="/signup">Create one</a>.</p>
+{% endblock %}

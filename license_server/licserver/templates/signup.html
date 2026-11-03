@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Create account · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Create account</h1>
+{% if settings.trial_enabled %}<p class="lead">Includes a {{ settings.trial_days }}-day trial license.</p>{% endif %}
+<div class="panel">
+<form method="post" action="/signup">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="email">email</label>
+  <input id="email" type="email" name="email" value="{{ email or '' }}" required autofocus autocomplete="username">
+  <label for="password">password (8+ characters)</label>
+  <input id="password" type="password" name="password" required minlength="8" autocomplete="new-password">
+  <label for="password2">repeat password</label>
+  <input id="password2" type="password" name="password2" minlength="8" autocomplete="new-password">
+  <div class="actions"><button class="primary" type="submit">Create account</button></div>
+</form>
+</div>
+<p class="small muted">Already have one? <a href="/login">Sign in</a>.</p>
+{% endblock %}

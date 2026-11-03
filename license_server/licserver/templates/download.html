@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Download · {{ product }}{% endblock %}
+{% block content %}
+<h1>Download {{ product }}</h1>
+<p class="lead">Install, then paste your license key under Settings &gt; License.</p>
+<div class="grid">
+{% for l in links %}
+  <div class="panel">
+    <div class="mono muted small">{{ l.id }}</div>
+    <h3 style="margin:6px 0 12px">{{ l.label }}</h3>
+    <a class="btn primary" href="{{ l.url }}">Download</a>
+  </div>
+{% else %}
+  <div class="panel muted">No download links are configured yet (set DOWNLOAD_URL_WINDOWS, DOWNLOAD_URL_MACOS, DOWNLOAD_URL_LINUX on the server).</div>
+{% endfor %}
+</div>
+{% endblock %}

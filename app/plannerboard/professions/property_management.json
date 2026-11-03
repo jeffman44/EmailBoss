@@ -1,0 +1,540 @@
+{
+  "id": "property_management",
+  "label": "Property Management",
+  "description": "Tenant work orders through vendor dispatch and verification, plus lease proposals and renewals.",
+  "icon": "🏢",
+  "entity": {
+    "project": "Ticket",
+    "projects": "Tickets",
+    "client": "Tenant",
+    "location": "Property",
+    "contact": "Contact",
+    "quote": "Proposal"
+  },
+  "work_types": [
+    {
+      "id": "work_order",
+      "label": "Work Order",
+      "short": "WO",
+      "color": "#4fc3f7",
+      "workflow_id": "work_order"
+    },
+    {
+      "id": "lease",
+      "label": "Lease / Renewal",
+      "short": "LEASE",
+      "color": "#f0b429",
+      "workflow_id": "lease"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "unit",
+      "label": "Unit / Suite",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "work_order",
+      "label": "WO #",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "vendor",
+      "label": "Vendor",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "tenant",
+      "label": "Tenant",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quoted",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Approved",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "quote_sent_date",
+      "label": "Sent on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "won_date",
+      "label": "Won on",
+      "type": "date",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "work_order",
+      "label": "WO #",
+      "regex": "\\b(?:WO|Work\\s*Order|Ticket)\\s*#?\\s*:?\\s*(\\d{4,8})\\b",
+      "unique_match": true
+    },
+    {
+      "key": "unit",
+      "label": "Unit",
+      "regex": "\\b(?:Unit|Suite|Ste\\.?)\\s*#?\\s*([A-Z]?\\d{1,5}[A-Z]?)\\b",
+      "unique_match": false
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "SLA"
+    },
+    {
+      "id": "quote",
+      "label": "Quote request"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "America/New_York",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk",
+      "maintenance_request",
+      "lease_inquiry",
+      "vendor_invoice",
+      "tenant_complaint"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "tenant",
+      "lease",
+      "renewal",
+      "work order",
+      "vendor",
+      "HVAC",
+      "plumbing",
+      "move-in",
+      "move-out",
+      "CAM",
+      "rent roll",
+      "inspection"
+    ],
+    "acronyms": [
+      "WO",
+      "CAM",
+      "NNN",
+      "HOA",
+      "COI",
+      "LOI"
+    ],
+    "scope_phrases": [
+      "tenant improvement",
+      "landlord responsibility",
+      "tenant responsibility"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "commercial and residential property management",
+    "role_noun": "property manager"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "unit",
+    "work_order",
+    "vendor"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": true,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "work_order",
+        "label": "Work Order",
+        "icon": "🔧",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "new",
+            "label": "New",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Dispatch vendor",
+              "date_type": "sla",
+              "sla_hours": 4,
+              "category": "dispatch"
+            },
+            "advance_on_task_complete": "dispatched"
+          },
+          {
+            "id": "dispatched",
+            "label": "Dispatched",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Confirm work complete",
+              "date_type": "follow_up",
+              "days": 3,
+              "category": "dispatch"
+            },
+            "advance_on_task_complete": "verify"
+          },
+          {
+            "id": "verify",
+            "label": "Verify",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Confirm with tenant and approve invoice",
+              "date_type": "follow_up",
+              "days": 2,
+              "category": "closeout"
+            },
+            "advance_on_task_complete": "complete"
+          },
+          {
+            "id": "complete",
+            "label": "Complete",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "new",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "lease",
+        "label": "Lease / Renewal",
+        "icon": "📄",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "proposal",
+            "label": "Proposal",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Prepare and send lease proposal",
+              "date_type": "quote"
+            },
+            "advance_on_task_complete": "negotiating"
+          },
+          {
+            "id": "negotiating",
+            "label": "Negotiating",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up with prospect",
+              "date_type": "follow_up",
+              "days": 5
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "executed",
+            "label": "Executed",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Set up tenant and move-in",
+              "date_type": "sla",
+              "sla_hours": 8,
+              "category": "setup"
+            },
+            "advance_on_task_complete": "complete"
+          },
+          {
+            "id": "cold",
+            "label": "Cold",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Complete",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "proposal",
+        "won_transition": {
+          "from": "negotiating",
+          "to": "executed"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "new",
+            "proposal",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "quote",
+          "label": "Lease proposal",
+          "match": {
+            "date_type": "quote"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "SLA",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

@@ -1,0 +1,44 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+ENV/
+
+# build output
+app/build/
+app/dist/
+license_server/build/
+license_server/dist/
+
+# runtime data (never commit a user's data root or a server database)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+EmailBoss/
+licserver.db*
+*.log
+logs/
+mail_cache/
+backups/
+project_files/
+
+# secrets: only the DEV_ONLY key pair is tracked
+license_server/keys/*
+!license_server/keys/DEV_ONLY_private.pem
+!license_server/keys/DEV_ONLY_public.pem
+!license_server/keys/README.md
+.env
+.env.*
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

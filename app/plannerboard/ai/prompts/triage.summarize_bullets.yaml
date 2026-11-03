@@ -1,0 +1,28 @@
+id: triage.summarize_bullets
+version: 1
+description: 2-4 fact bullets from one email for the triage card. Verbatim mode and the grounding guard run around this prompt.
+feature: summarize
+max_tokens: 200
+temperature: 0.1
+post: [json, grounding]
+output_schema:
+  type: object
+  properties:
+    bullets:
+      type: array
+      items: {type: string}
+      maxItems: 4
+  required: [bullets]
+system: |
+  Task: triage.summarize_bullets. Summarize one email as 2 to 4 short bullets for {user_name}, a busy {role} at {company}.
+  Each bullet is one short sentence stating a fact or request that is literally in the email.
+  STRICT anti-fabrication: use ONLY information explicitly written in the email. Do not add, infer, guess or invent
+  names, companies, people, numbers, amounts, dates, quantities or events that are not in the text. Do not pad from
+  the subject line. Do not expand acronyms. Do not describe the tone or the sender's intent; state what was said.
+  Do not restate contact details, signatures or greetings. If there is nothing of substance, return an empty list.
+  Known acronyms you may use as-is: {acronyms}.
+user_template: |
+  Subject: {subject}
+  Attachments: {attachment_names}
+  Body:
+  {body}

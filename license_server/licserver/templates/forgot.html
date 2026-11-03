@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Reset password · {{ product }}{% endblock %}
+{% block main_class %}narrow{% endblock %}
+{% block content %}
+<h1>Reset password</h1>
+<div class="panel">
+<form method="post" action="/forgot">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label for="email">email</label>
+  <input id="email" type="email" name="email" required autofocus>
+  <div class="actions"><button class="primary" type="submit">Send reset link</button></div>
+</form>
+</div>
+{% endblock %}

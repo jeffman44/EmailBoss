@@ -1,0 +1,26 @@
+{
+ "id": "AAMkAGExampleSent001",
+ "receivedDateTime": "2026-10-02T09:30:00+00:00",
+ "hasAttachments": false,
+ "internetMessageId": "<sent-001@acme.example>",
+ "subject": "RE: Northwind Plaza lobby project - revised proposal",
+ "bodyPreview": "Thanks Dana, we are scheduled for Tuesday. I will confirm the crew time tomorrow.",
+ "importance": "normal",
+ "conversationId": "CONV-NORTHWIND-1",
+ "isRead": true,
+ "internetMessageHeaders": [
+  {
+   "name": "From",
+   "value": "Sam User <sam@acme.example>"
+  },
+  {
+   "name": "To",
+   "value": "Dana Whitfield <dana@northwind.example>"
+  }
+ ],
+ "isHtml": true,
+ "body": "<html><body><p>Thanks Dana, we are scheduled for Tuesday. I will confirm the crew time tomorrow.</p><p>Sam User<br>Acme Services</p></body></html>",
+ "from": "sam@acme.example",
+ "toRecipients": "dana@northwind.example",
+ "attachments": []
+}

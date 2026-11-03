@@ -1,0 +1,35 @@
+id: triage.match_rerank
+version: 1
+description: Tie-break ONE email among existing candidate projects. Chooses from the candidates given or abstains; never proposes a new project.
+feature: match_rerank
+max_tokens: 200
+temperature: 0.0
+post: [json]
+output_schema:
+  type: object
+  properties:
+    project_id: {type: [string, "null"], description: "One of the candidate ids, or null to abstain."}
+    confidence: {type: number, minimum: 0, maximum: 1}
+    evidence: {type: string, description: "The phrase in the email that decides it, quoted."}
+    ambiguous: {type: boolean}
+  required: [project_id, confidence, ambiguous]
+system: |
+  Task: triage.match_rerank. An email could belong to more than one existing {entity_project} on {user_name}'s board.
+  Choose the ONE candidate the email is actually about, or abstain.
+  Rules:
+  - project_id MUST be one of the candidate ids listed, or null. Never invent an id. Never suggest creating anything.
+  - Decide on evidence that is in the email: a reference number, a {entity_location}, a named unit or item, a
+    thread subject, a person who is a contact on exactly one candidate.
+  - A sender or a subject keyword alone is NOT enough. Two candidates at the same {entity_location} that could both
+    take this email means ambiguous=true and project_id=null.
+  - Anything about money, a scope change or a dispute: abstain (ambiguous=true) so a person decides.
+  - confidence above 0.85 means you would bet the card on it.
+user_template: |
+  Email
+  From: {from_name} <{from_email}>
+  Subject: {subject}
+  Body:
+  {body}
+
+  Candidates (id | name | status | location | contacts | reference values)
+  {candidates}

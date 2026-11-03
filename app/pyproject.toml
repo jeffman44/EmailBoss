@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plannerboard"
+version = "1.2.0"
+description = "Email Boss: a local, single-user project and inbox board for any profession"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+dependencies = [
+    "flask>=3.0",
+    "keyring>=24",
+    "pyyaml>=6",
+    "cryptography>=41",
+]
+
+[project.optional-dependencies]
+tray = ["pystray>=0.19", "pillow>=10"]
+desktop = ["pywebview>=5.0", "plyer>=2.1"]
+attachments = ["pdfplumber>=0.10", "openpyxl>=3.1"]
+http = ["httpx>=0.25"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+plannerboard = "plannerboard.start:main"
+plannerboard-desktop = "plannerboard.desktop:main"
+
+[tool.setuptools]
+packages = [
+    "plannerboard",
+    "plannerboard.api",
+    "plannerboard.mail",
+    "plannerboard.triage",
+    "plannerboard.ai",
+    "plannerboard.license",
+]
+include-package-data = true
+
+[tool.setuptools.package-data]
+plannerboard = ["schema.sql", "professions/*.json", "static/*.html", "static/*.js", "static/*.css", "ai/prompts/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

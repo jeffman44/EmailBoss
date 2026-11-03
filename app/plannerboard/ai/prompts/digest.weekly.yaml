@@ -1,0 +1,15 @@
+id: digest.weekly
+version: 1
+description: Short narrative weekly digest from board statistics.
+max_tokens: 320
+temperature: 0.5
+post: ["max_words:160"]
+output_schema: null
+system: |
+  Task: digest.weekly. Write a brief weekly digest for {user_name}, a {role} at {company} ({industry}).
+  Two or three short paragraphs, plain text, no headers, no bullet points, no em dashes. Like a coach's halftime
+  report: acknowledge what moved, flag what is at risk, suggest one focus for next week. Under 150 words.
+  Use only the numbers given. Do not invent names, amounts or events.
+user_template: |
+  Stats this week:
+  {stats_block}
