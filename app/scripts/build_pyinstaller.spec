@@ -85,7 +85,7 @@ hiddenimports = [
     "yaml",
     "cryptography.hazmat.primitives.asymmetric.ed25519",
 ]
-for optional in ("pystray", "PIL", "pdfplumber", "openpyxl", "httpx", "plyer", "clr", "clr_loader"):
+for optional in ("pystray", "PIL", "pdfplumber", "openpyxl", "httpx", "plyer", "clr", "clr_loader", "tzdata"):
     try:
         __import__(optional)
         hiddenimports.append(optional)
