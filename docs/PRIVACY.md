@@ -31,6 +31,7 @@ for the network you expose it on.
 |---|---|---|---|
 | Your mail provider (IMAP server, Gmail API, Microsoft Graph) | every poll (`mail.poll_seconds`) | credentials or OAuth token, folder and watermark queries; for drafts, the draft text | your mail |
 | Your AI provider (Anthropic, OpenAI or compatible host, or a local Ollama / LM Studio) | only when an AI feature fires | the trimmed email text, project summary fields and your name / company / role as listed in `AI_SETUP.md` under "Privacy: what text is sent" | classifications, summaries, draft text |
+| Email Boss AI (the built-in AI, `ai.provider = emailboss`) | only when an AI feature fires | the text of the email being worked on (trimmed), the project summary fields and your name / company / role, plus your license id, machine fingerprint hash and a signed device proof | classifications, summaries, draft text, your credit balance |
 | The license server (`license.server_url`) | activation, then one heartbeat a day | license key, machine fingerprint (a SHA-256 hash of hostname, MAC, OS and machine id; the raw values never leave the machine), app version | a signed activation |
 | Nothing else | | | |
 
@@ -55,8 +56,17 @@ by Stripe and never reach the license server. Details: `LICENSING.md`.
 - Mail providers and AI providers see the data you send them under their
   own terms. The app lets you choose which ones, including fully local
   options (IMAP to your own server, Ollama).
-- The license server is operated by us. It never receives mail content,
-  project data or AI prompts.
+- The license server is operated by us. Its license endpoints never
+  receive mail content or project data.
+- **Email Boss AI.** When you use the built-in AI, the text of the email
+  being worked on (and the project fields listed above) is sent to our AI
+  relay and from there to the model vendor (Anthropic) to produce the
+  answer. The relay does not store or log that text: it keeps only
+  metadata for billing (time, task name, model tier, token counts, credits
+  charged). The vendor processes it under its API terms, which do not use
+  API traffic for training. If you do not want any email text to leave
+  your computer, set AI to "Off" or use a local model (Ollama) in
+  Settings > AI.
 
 ## Deleting your data
 

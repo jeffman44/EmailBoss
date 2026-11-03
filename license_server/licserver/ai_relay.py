@@ -1,9 +1,16 @@
 """Email Boss AI relay: metered model calls charged against a per-license credit wallet.
 
-Endpoints (device API, authenticated by the signed activation token):
+Endpoints (device API, authenticated by the signed activation token AND
+the device proof of possession, see licenses.py):
     POST /v1/ai/complete   forward one prompt to the vendor, charge the wallet
-    GET  /v1/ai/balance    wallet balance and the packs on sale
+    POST /v1/ai/balance    wallet balance and the packs on sale
     POST /v1/ai/checkout   create a Stripe Checkout session for a credit pack
+
+Abuse limits on /complete: `task` must be a known prompt id; input is capped
+per tier (413 input_too_large); a reserve (input estimate at chars/4 tokens
+plus max_tokens of output, at the tier's prices) is debited as a hold before
+the vendor call and settled to the real cost after; vendor spend per license
+per UTC day is capped (AI_DAILY_USD_PER_LID, 429 daily_cap).
 
 Prompt and completion text are never stored or logged; the ledger holds
 metadata only. Errors are {"ok": false, "error": "<message>", "code": "<code>"}.
@@ -25,7 +32,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .keys import SigningError
-from .licenses import _check_license_live, signer_of
+from .licenses import _check_license_live, check_proof, signer_of
 from .models import parse_iso, utcnow
 from .web import RateLimiter
 
@@ -37,6 +44,17 @@ API_VERSION = "2023-06-01"
 TIMEOUT_S = 60
 JSON_TOOL_NAME = "emit_result"
 STRIPE_SESSIONS_URL = "https://api.stripe.com/v1/checkout/sessions"
+
+# Task ids the relay serves: the app's prompt ids (app/plannerboard/ai/prompts/*.yaml)
+# plus the provider self-test. Anything else is refused with 400.
+ALLOWED_TASKS = frozenset({
+    "assistant.board_pass", "digest.weekly", "followup.draft", "project.health", "reply.draft",
+    "reply.no_reply_classifier", "search.parse", "triage.classify", "triage.match_rerank",
+    "triage.suggest_project", "triage.summarize_bullets", "ai.test",
+})
+
+# Input cap (system + user characters) per tier.
+INPUT_CAP_CHARS = {"fast": 40_000, "smart": 120_000}
 
 # USD per million tokens (input, output). Anthropic rows copied from the app's usage.PRICE_TABLE.
 PRICE_TABLE: dict[str, tuple[float, float]] = {
@@ -95,11 +113,21 @@ def credits_for(vendor_usd: float, markup: float, minimum: int) -> int:
     return max(int(minimum), int(math.ceil(raw)))
 
 
-def reserve_credits(settings, max_tokens: int) -> int:
-    """Worst case for a call: max_tokens of output at the smart-tier output price."""
-    price = lookup_price(settings.ai_model_smart) or (3.0, 15.0)
-    usd = int(max_tokens) * price[1] / 1_000_000.0
-    return credits_for(usd, settings.ai_markup, settings.ai_min_credits)
+def tier_model(settings, tier: str) -> str:
+    return settings.ai_model_smart if tier == "smart" else settings.ai_model_fast
+
+
+def reserve_usd(settings, max_tokens: int, input_chars: int = 0, tier: str = "smart") -> float:
+    """Worst case for a call at the tier's prices: the input estimated at
+    chars/4 tokens plus max_tokens of output."""
+    price = lookup_price(tier_model(settings, tier)) or (3.0, 15.0)
+    in_tok = int(math.ceil(max(0, int(input_chars)) / 4.0))
+    return (in_tok * price[0] + int(max_tokens) * price[1]) / 1_000_000.0
+
+
+def reserve_credits(settings, max_tokens: int, input_chars: int = 0, tier: str = "smart") -> int:
+    return credits_for(reserve_usd(settings, max_tokens, input_chars, tier), settings.ai_markup,
+                       settings.ai_min_credits)
 
 
 # ------------------------------------------------------------------ vendor
@@ -182,9 +210,11 @@ def vendor_call(model: str, system: str, user: str, max_tokens: int, temperature
 
 # ------------------------------------------------------------------ auth
 
-def authenticate(app, lid: str, fingerprint: str, activation: str) -> dict:
-    """Verify the signed activation token and that the license is live.
-    Returns the license row; raises AiError(403, 'license', ...) otherwise."""
+def authenticate(app, lid: str, fingerprint: str, activation: str, ts=None, proof: str = "",
+                 path: str = "") -> dict:
+    """Verify the signed activation token, that the license is live, and the
+    device proof (HMAC over lid|fingerprint|ts|path with the device key).
+    Returns the license row; raises AiError(403, ...) otherwise."""
     def deny(reason: str, message: str) -> AiError:
         return AiError(403, "license", message, reason)
 
@@ -208,6 +238,9 @@ def authenticate(app, lid: str, fingerprint: str, activation: str) -> dict:
     act = db.get_activation(lid, fingerprint)
     if not act or act["revoked"]:
         raise deny("not_activated", "This device is not activated on that license.")
+    if not check_proof(act, lid, fingerprint, ts, proof, path):
+        raise AiError(403, "proof_invalid", "Device proof missing, stale or wrong. Refresh the license.",
+                      "proof_invalid")
     return lic
 
 
@@ -225,6 +258,8 @@ class CompleteIn(BaseModel):
     lid: str = Field(min_length=1, max_length=64)
     fingerprint: str = Field(min_length=16, max_length=128)
     activation: str = Field(min_length=20, max_length=8192)
+    ts: Optional[int] = None
+    proof: str = Field(default="", max_length=128)
     task: str = Field(default="", max_length=64)
     tier: str = "fast"
     system: str = Field(default="", max_length=200_000)
@@ -234,10 +269,20 @@ class CompleteIn(BaseModel):
     json_schema: Optional[dict] = None
 
 
+class BalanceIn(BaseModel):
+    lid: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=16, max_length=128)
+    activation: str = Field(min_length=20, max_length=8192)
+    ts: Optional[int] = None
+    proof: str = Field(default="", max_length=128)
+
+
 class CheckoutIn(BaseModel):
     lid: str = Field(min_length=1, max_length=64)
     fingerprint: str = Field(min_length=16, max_length=128)
     activation: str = Field(min_length=20, max_length=8192)
+    ts: Optional[int] = None
+    proof: str = Field(default="", max_length=128)
     pack: str = Field(min_length=1, max_length=128)
 
 
@@ -256,20 +301,31 @@ def ai_complete(body: CompleteIn, request: Request):
     app = request.app
     settings, db = app.state.settings, app.state.db
     try:
-        authenticate(app, body.lid, body.fingerprint, body.activation)
+        authenticate(app, body.lid, body.fingerprint, body.activation, body.ts, body.proof, "/v1/ai/complete")
         if body.tier not in ("fast", "smart"):
             raise AiError(400, "bad_request", "tier must be 'fast' or 'smart'.")
+        if body.task not in ALLOWED_TASKS:
+            raise AiError(400, "bad_task", "Unknown task.")
+        input_chars = len(body.system or "") + len(body.user or "")
+        if input_chars > INPUT_CAP_CHARS[body.tier]:
+            raise AiError(413, "input_too_large",
+                          f"Input is too long for the {body.tier} tier ({INPUT_CAP_CHARS[body.tier]} characters max).")
         if not _limiter(app).hit(body.lid):
             raise AiError(429, "rate_limited", "Too many AI requests; slow down.")
         if not settings.anthropic_api_key:
             raise AiError(503, "relay_disabled", "The AI relay is not configured on this server.")
         max_tokens = max(1, min(int(body.max_tokens), settings.ai_max_tokens))
         temperature = min(1.0, max(0.0, float(body.temperature)))
-        model = settings.ai_model_smart if body.tier == "smart" else settings.ai_model_fast
+        model = tier_model(settings, body.tier)
+        cap = float(getattr(settings, "ai_daily_usd_per_lid", 5.0) or 0.0)
+        if cap > 0 and db.vendor_usd_today(body.lid) + reserve_usd(settings, max_tokens, input_chars, body.tier) > cap:
+            raise AiError(429, "daily_cap", "Daily AI limit for this license reached. It resets at midnight UTC.")
         wallet = db.ensure_wallet(body.lid, settings.ai_trial_credits)
-        need = reserve_credits(settings, max_tokens)
-        if wallet["balance"] < need:
-            raise AiError(402, "no_credits", f"Not enough AI credits (need {need}, have {wallet['balance']}).")
+        hold = reserve_credits(settings, max_tokens, input_chars, body.tier)
+        # The hold is debited BEFORE the vendor call, so concurrent calls can
+        # never spend credits the wallet does not have.
+        if db.debit(body.lid, hold) is None:
+            raise AiError(402, "no_credits", f"Not enough AI credits (need {hold}, have {wallet['balance']}).")
     except AiError as e:
         return _fail(e)
 
@@ -279,6 +335,7 @@ def ai_complete(body: CompleteIn, request: Request):
         res = vendor_call(model, body.system, body.user, max_tokens, temperature, body.json_schema,
                           api_key=settings.anthropic_api_key, transport=transport)
     except VendorError as ve:
+        db.refund(body.lid, hold)
         db.ledger_insert(body.lid, body.fingerprint, body.task, body.tier, model, 0, 0, 0.0, 0, False, ve.kind)
         log.warning("vendor call failed lid=%s kind=%s", body.lid, ve.kind)
         return _fail(AiError(502, "vendor", "The AI vendor call failed."))
@@ -286,9 +343,13 @@ def ai_complete(body: CompleteIn, request: Request):
 
     usd = vendor_cost_usd(res["model"], res["input_tokens"], res["output_tokens"], fallback_model=model)
     want = credits_for(usd, settings.ai_markup, settings.ai_min_credits)
-    # Concurrent calls can drain the wallet between the reserve check and here;
-    # never go negative, take what is left.
-    charged, balance = db.debit_upto(body.lid, want)
+    # Settle the hold: refund the unused part, or take the overrun from what
+    # is left (the input estimate can undershoot; never go negative).
+    if want <= hold:
+        charged, balance = want, db.refund(body.lid, hold - want)
+    else:
+        extra, balance = db.debit_upto(body.lid, want - hold)
+        charged = hold + extra
     db.ledger_insert(body.lid, body.fingerprint, body.task, body.tier, res["model"], res["input_tokens"],
                      res["output_tokens"], usd, charged, True, "" if charged == want else "short_charge")
     return {"ok": True, "text": res["text"], "parsed": res["parsed"], "input_tokens": res["input_tokens"],
@@ -298,12 +359,13 @@ def ai_complete(body: CompleteIn, request: Request):
 
 # ------------------------------------------------------------------ balance
 
-@router.get("/balance")
-def ai_balance(request: Request, lid: str = "", fingerprint: str = "", activation: str = ""):
+@router.post("/balance")
+def ai_balance(body: BalanceIn, request: Request):
     app = request.app
     settings, db = app.state.settings, app.state.db
+    lid = body.lid
     try:
-        authenticate(app, lid, fingerprint, activation)
+        authenticate(app, lid, body.fingerprint, body.activation, body.ts, body.proof, "/v1/ai/balance")
     except AiError as e:
         return _fail(e)
     wallet = db.ensure_wallet(lid, settings.ai_trial_credits)
@@ -358,7 +420,7 @@ def create_checkout_session(app, lid: str, pack_id: str) -> dict:
 def ai_checkout(body: CheckoutIn, request: Request):
     app = request.app
     try:
-        authenticate(app, body.lid, body.fingerprint, body.activation)
+        authenticate(app, body.lid, body.fingerprint, body.activation, body.ts, body.proof, "/v1/ai/checkout")
         out = create_checkout_session(app, body.lid, body.pack)
     except AiError as e:
         return _fail(e)

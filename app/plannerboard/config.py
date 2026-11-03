@@ -33,7 +33,7 @@ SECRET_KEYS = {
 }
 
 MAIL_PROVIDERS = ("pa_folder", "imap", "gmail", "graph", "none")
-AI_PROVIDERS = ("none", "anthropic", "openai", "ollama")
+AI_PROVIDERS = ("emailboss", "none", "anthropic", "openai", "ollama")
 
 DEFAULTS = {
     "schema_version": SCHEMA_VERSION,
@@ -63,6 +63,12 @@ DEFAULTS = {
                   "auto_create": False},
     "license": {"key": "", "server_url": "https://license.example.com", "activation": {}},
     "features": {"money": True, "game_layer": True, "analytics": True},
+    # Board display preferences (Settings > Display). light_theme None means
+    # "follow the profession": light unless the game layer is on.
+    "display": {"large_text": False, "light_theme": None},
+    # IANA zone the user picked; "" = the OS zone. The board also writes it
+    # into the profession's business_hours override so it wins over a template.
+    "timezone": "",
 }
 
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -379,6 +385,8 @@ class Config:
                         "key_present": bool(lic.get("key")),
                         "dev_mode": os.environ.get("PB_LICENSE_DEV") == "1"},
             "features": self.features,
+            "display": dict(self.doc.get("display") or {}),
+            "timezone": self.doc.get("timezone") or "",
             "data_root": str(self.paths.data_root),
         }
 

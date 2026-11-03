@@ -61,8 +61,11 @@ def create_account(request_or_app, email: str, password: str | None = None, *, v
                    actor: str = "self") -> tuple[dict, Optional[str]]:
     """Create an account; returns (account, temp_password_or_None).
 
-    The first account ever created becomes admin when LIC_ADMIN_EMAILS is empty;
-    otherwise admin status follows that list.
+    Nobody becomes admin at creation. An address in LIC_ADMIN_EMAILS is
+    promoted only once the email is VERIFIED (verification link or a
+    completed password reset, both of which prove inbox access), see
+    promote_if_listed(); the alternative is the CLI
+    `python -m licserver.admin_seed <email>`.
     """
     app = getattr(request_or_app, "app", request_or_app)
     db, settings = app.state.db, app.state.settings
@@ -70,10 +73,44 @@ def create_account(request_or_app, email: str, password: str | None = None, *, v
     temp = None
     if not password:
         temp = password = secrets.token_urlsafe(12)
-    is_admin = (email in settings.admin_emails) if settings.admin_emails else (db.account_count() == 0)
-    acct = db.create_account(email, hash_password(password), is_admin=is_admin, verified=verified)
-    db.audit("account.create", actor=actor, target=acct["id"], detail={"email": email, "is_admin": is_admin})
+    acct = db.create_account(email, hash_password(password), is_admin=False, verified=verified)
+    db.audit("account.create", actor=actor, target=acct["id"], detail={"email": email, "verified": verified})
+    if verified:
+        acct = promote_if_listed(app, acct)
     return acct, temp
+
+
+def promote_if_listed(app, acct: dict) -> dict:
+    """Grant admin to a VERIFIED account whose email is in LIC_ADMIN_EMAILS."""
+    db, settings = app.state.db, app.state.settings
+    if acct and acct.get("verified") and not acct.get("is_admin") and acct["email"] in settings.admin_emails:
+        db.set_admin(acct["id"], True)
+        db.audit("account.admin_granted", actor="verified_email", target=acct["id"], detail={"email": acct["email"]})
+        acct = db.get_account(acct["id"])
+    return acct
+
+
+def mark_email_verified(app, aid: str) -> dict:
+    db = app.state.db
+    db.mark_verified(aid)
+    db.audit("account.verified", actor=aid, target=aid)
+    return promote_if_listed(app, db.get_account(aid))
+
+
+def send_verification(app, acct: dict) -> None:
+    settings = app.state.settings
+    token = app.state.db.create_verification(acct["id"])
+    mailer.send_verification(acct["email"], settings.product_name, f"{settings.base_url}/verify/{token}")
+
+
+def safe_next(target: str, default: str = "/dashboard") -> str:
+    """Only a plain in-site path survives: starts with one '/', no second
+    slash or backslash after it, no scheme, no control characters."""
+    t = (target or "").strip()
+    if (not t.startswith("/") or t.startswith("//") or "\\" in t or ":" in t.split("?", 1)[0]
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in t) or t.startswith("/\\")):
+        return default
+    return t
 
 
 def _limiter(request: Request) -> RateLimiter:
@@ -106,7 +143,8 @@ def signup(request: Request, email: str = Form(...), password: str = Form(...),
     if db.get_account_by_email(email):
         return render(request, "signup.html", status_code=400, error="That email already has an account. Sign in instead.", email=email)
     acct, _ = create_account(request, email, password)
-    notice = "Account created."
+    send_verification(request.app, acct)
+    notice = "Account created. Check your email for a link to confirm the address."
     if settings.trial_enabled:
         from .licenses import issue_license
         lic = issue_license(request.app, acct, plan="trial", days=settings.trial_days, actor="signup")
@@ -122,7 +160,7 @@ def signup(request: Request, email: str = Form(...), password: str = Form(...),
 def login_page(request: Request):
     if current_account(request):
         return redirect("/dashboard")
-    return render(request, "login.html", next=request.query_params.get("next", "/dashboard"))
+    return render(request, "login.html", next=safe_next(request.query_params.get("next", "/dashboard")))
 
 
 @router.post("/login")
@@ -142,9 +180,7 @@ def login(request: Request, email: str = Form(...), password: str = Form(...),
     _limiter(request).reset("login:" + ip)
     sess = db.create_session(acct["id"])
     db.audit("login.ok", actor=acct["id"], target=email, detail={"ip": ip})
-    if not next.startswith("/") or next.startswith("//"):
-        next = "/dashboard"
-    resp = redirect(next)
+    resp = redirect(safe_next(next))
     set_session_cookie(resp, sess["token"], settings_of(request))
     return resp
 
@@ -205,7 +241,20 @@ def reset(request: Request, token: str, password: str = Form(...), password2: st
                       body="That reset link is no longer valid. Request a new one.")
     db.set_password(aid, hash_password(password))
     db.audit("password.reset", actor=aid, target=aid)
+    # The reset link reached the inbox, which proves the address.
+    if not (db.get_account(aid) or {}).get("verified"):
+        mark_email_verified(request.app, aid)
     return redirect("/login", notice="Password updated. Sign in with the new one.")
+
+
+@router.get("/verify/{token}", response_class=HTMLResponse)
+def verify_email(request: Request, token: str):
+    aid = db_of(request).consume_verification(token)
+    if not aid:
+        return render(request, "message.html", status_code=400, title="Link expired",
+                      body="That confirmation link is no longer valid.")
+    mark_email_verified(request.app, aid)
+    return redirect("/dashboard", notice="Email confirmed.")
 
 
 @router.get("/account", response_class=HTMLResponse)

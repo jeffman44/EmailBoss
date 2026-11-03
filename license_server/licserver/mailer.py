@@ -50,3 +50,8 @@ def send_welcome(to: str, product: str, portal_url: str, temp_password: str | No
     if temp_password:
         body += f"\nTemporary password: {temp_password}\nChange it after your first sign-in.\n"
     send(to, f"Welcome to {product}", body)
+
+
+def send_verification(to: str, product: str, verify_url: str) -> None:
+    send(to, f"Confirm your {product} email",
+         f"Confirm this address by opening:\n\n{verify_url}\n\nIf you did not sign up, ignore this.\n")

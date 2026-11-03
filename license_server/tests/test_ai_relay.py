@@ -8,7 +8,8 @@ from licserver import ai_relay
 from licserver.ai_relay import credits_for, reserve_credits, vendor_call, VendorError
 from licserver.auth import hash_password
 from licserver.billing import sign_for_test
-from licserver.licenses import issue_license, revoke_license, sign_activation
+from licserver.licenses import (compute_proof, issue_device_secret, issue_license, revoke_license, secret_hash,
+                                sign_activation)
 
 FP = "a" * 64
 PROMPT = "SECRET-PROMPT-TEXT-12345"
@@ -43,10 +44,23 @@ def ai(app):
 @pytest.fixture
 def lic(ai):
     db = ai.state.db
-    acct = db.create_account("ai@example.test", hash_password("hunter2hunter2"))
+    acct = db.create_account("ai@example.test", hash_password("hunter2hunter2"), verified=True)
     row = issue_license(ai, acct, "solo", seats=2)
     db.upsert_activation(row["lid"], FP, "1.0", "2099-01-01T00:00:00Z")
+    row["device_secret"] = issue_device_secret(db, row["lid"], FP)
     return row
+
+
+def signed(lic, path, fp=FP, ts=None):
+    import time
+    ts = int(time.time()) if ts is None else ts
+    return {"ts": ts, "proof": compute_proof(secret_hash(lic["device_secret"]), lic["lid"], fp, ts, path)}
+
+
+def auth_body(app, lic, path, **kw):
+    d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic), **signed(lic, path)}
+    d.update(kw)
+    return d
 
 
 def act_token(app, lic, fp=FP):
@@ -54,8 +68,9 @@ def act_token(app, lic, fp=FP):
 
 
 def body(app, lic, **kw):
-    d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic), "task": "triage",
-         "tier": "smart", "system": "sys", "user": PROMPT, "max_tokens": 500, "temperature": 0.2}
+    d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic), "task": "triage.classify",
+         "tier": "smart", "system": "sys", "user": PROMPT, "max_tokens": 500, "temperature": 0.2,
+         **signed(lic, "/v1/ai/complete")}
     d.update(kw)
     return d
 
@@ -140,13 +155,19 @@ def test_no_credits_402(client, ai, lic):
     assert ai.state.ai_transport.calls == []
     # reserve: 4000 tokens of sonnet output = 6c * 4 = 24
     assert reserve_credits(ai.state.settings, 4000) == 24
-    db.credit(lic["lid"], 24, "test")
-    assert client.post("/v1/ai/complete", json=body(ai, lic, max_tokens=99999)).status_code == 200
+    need = reserve_credits(ai.state.settings, 4000, len("sys") + len(PROMPT), "smart")
+    db.credit(lic["lid"], need - 1, "test")
+    assert client.post("/v1/ai/complete", json=body(ai, lic, max_tokens=99999)).status_code == 402
+    db.credit(lic["lid"], 1, "test")
+    r = client.post("/v1/ai/complete", json=body(ai, lic, max_tokens=99999))
+    assert r.status_code == 200
+    # the hold settled to the real cost: unused reserve came back
+    assert r.json()["balance"] == need - r.json()["credits_charged"]
 
 
 def test_debit_never_negative(app):
     db = app.state.db
-    acct = db.create_account("w@example.test", hash_password("hunter2hunter2"))
+    acct = db.create_account("w@example.test", hash_password("hunter2hunter2"), verified=True)
     row = issue_license(app, acct, "solo")
     db.ensure_wallet(row["lid"], 5)
     assert db.debit(row["lid"], 6) is None
@@ -202,13 +223,14 @@ def test_vendor_call_transport_errors():
 
 
 def test_balance_shape(client, ai, lic):
-    r = client.get("/v1/ai/balance", params={"lid": lic["lid"], "fingerprint": FP, "activation": act_token(ai, lic)})
+    assert client.get("/v1/ai/balance").status_code == 405
+    r = client.post("/v1/ai/balance", json=auth_body(ai, lic, "/v1/ai/balance"))
     assert r.status_code == 200, r.text
     j = r.json()
     assert j["balance"] == 300 and j["trial_granted"] is True
     assert j["packs"][0] == {"id": "price_small", "label": "500 credits ($5.00)", "credits": 500, "usd_cents": 500}
     assert j["checkout_url_base"].startswith("http")
-    bad = client.get("/v1/ai/balance", params={"lid": lic["lid"], "fingerprint": "b" * 64, "activation": act_token(ai, lic)})
+    bad = client.post("/v1/ai/balance", json=auth_body(ai, lic, "/v1/ai/balance", fingerprint="b" * 64))
     assert bad.status_code == 403
 
 
@@ -219,20 +241,17 @@ def test_checkout_session_creation(client, ai, lic):
         seen.update(url=url, form=form, secret=secret)
         return {"id": "cs_test_1", "url": "https://checkout.stripe.test/cs_test_1"}
     ai.state.stripe_transport = fake_stripe
-    r = client.post("/v1/ai/checkout", json={"lid": lic["lid"], "fingerprint": FP, "activation": act_token(ai, lic),
-                                             "pack": "price_big"})
+    r = client.post("/v1/ai/checkout", json=auth_body(ai, lic, "/v1/ai/checkout", pack="price_big"))
     assert r.status_code == 200, r.text
     assert r.json()["url"] == "https://checkout.stripe.test/cs_test_1"
     f = seen["form"]
     assert seen["url"].endswith("/v1/checkout/sessions") and seen["secret"] == "sk_stripe"
     assert f["mode"] == "payment" and f["line_items[0][price]"] == "price_big"
     assert f["metadata[kind]"] == "ai_credits" and f["metadata[lid]"] == lic["lid"] and f["metadata[credits]"] == "3000"
-    bad = client.post("/v1/ai/checkout", json={"lid": lic["lid"], "fingerprint": FP, "activation": act_token(ai, lic),
-                                               "pack": "price_nope"})
+    bad = client.post("/v1/ai/checkout", json=auth_body(ai, lic, "/v1/ai/checkout", pack="price_nope"))
     assert bad.status_code == 400 and bad.json()["code"] == "bad_pack"
     ai.state.settings.stripe_secret_key = ""
-    r = client.post("/v1/ai/checkout", json={"lid": lic["lid"], "fingerprint": FP, "activation": act_token(ai, lic),
-                                             "pack": "price_big"})
+    r = client.post("/v1/ai/checkout", json=auth_body(ai, lic, "/v1/ai/checkout", pack="price_big"))
     assert r.status_code == 503
 
 
@@ -265,7 +284,10 @@ def test_webhook_credits_wallet_once(client, ai, lic):
 
 
 def test_portal_card_and_admin_grant(client, portal, ai, lic):
-    portal.signup("admin@example.test")  # listed in admin_emails
+    portal.signup("admin@example.test")  # listed in admin_emails: admin only once verified
+    from licserver import mailer
+    link = [m for m in mailer.SENT if m["to"] == "admin@example.test" and "/verify/" in m["body"]][-1]["body"]
+    client.get(re.search(r"(/verify/\S+)", link).group(1))
     html = client.get("/dashboard").text
     assert "AI credits" in html
     db = ai.state.db
@@ -286,3 +308,78 @@ def test_portal_card_and_admin_grant(client, portal, ai, lic):
     assert "550" in client.get("/admin").text
     r = portal.post(f"/admin/licenses/{lic['lid']}/credits", credits="-5")
     assert "error=" in r.headers["location"]
+
+
+# ------------------------------------------------------------------ 1.3.0 hardening
+
+@pytest.mark.parametrize("case", ["missing", "stale", "wrong_path", "wrong_secret", "no_secret"])
+def test_proof_required(client, ai, lic, case):
+    import time
+    b = body(ai, lic)
+    if case == "missing":
+        b.pop("proof"); b.pop("ts")
+    elif case == "stale":
+        b.update(signed(lic, "/v1/ai/complete", ts=int(time.time()) - 301))
+    elif case == "wrong_path":
+        b.update(signed(lic, "/v1/ai/balance"))
+    elif case == "wrong_secret":
+        b.update(signed(dict(lic, device_secret="0" * 64), "/v1/ai/complete"))
+    elif case == "no_secret":
+        ai.state.db.set_activation_secret(lic["lid"], FP, "")
+    r = client.post("/v1/ai/complete", json=b)
+    assert r.status_code == 403 and r.json()["code"] == "proof_invalid"
+    assert ai.state.ai_transport.calls == []
+
+
+def test_task_allowlist(client, ai, lic):
+    for task in ("", "triage", "freeform.chat"):
+        r = client.post("/v1/ai/complete", json=body(ai, lic, task=task))
+        assert r.status_code == 400 and r.json()["code"] == "bad_task"
+    assert client.post("/v1/ai/complete", json=body(ai, lic, task="ai.test")).status_code == 200
+    assert ai_relay.ALLOWED_TASKS >= {"reply.draft", "digest.weekly", "search.parse"}
+
+
+def test_input_caps(client, ai, lic):
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="fast", user="x" * 40_001))
+    assert r.status_code == 413 and r.json()["code"] == "input_too_large"
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="smart", user="x" * 40_001))
+    assert r.status_code == 200
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="smart", user="x" * 120_001))
+    assert r.status_code == 413
+    assert len(ai.state.ai_transport.calls) == 1
+
+
+def test_hold_reserves_input_and_refunds_on_failure(client, ai, lic):
+    db = ai.state.db
+    s = ai.state.settings
+    big = "x" * 100_000
+    hold = reserve_credits(s, 500, len("sys") + len(big), "smart")
+    assert hold > reserve_credits(s, 500, 0, "smart")
+    db.ensure_wallet(lic["lid"], s.ai_trial_credits)
+    bal = db.get_wallet(lic["lid"])["balance"]
+    ai.state.ai_transport = FakeVendor(status=500)
+    assert client.post("/v1/ai/complete", json=body(ai, lic, user=big)).status_code == 502
+    assert db.get_wallet(lic["lid"])["balance"] == bal          # hold refunded
+
+
+def test_daily_vendor_cap(client, ai, lic):
+    ai.state.settings.ai_daily_usd_per_lid = 0.01
+    assert client.post("/v1/ai/complete", json=body(ai, lic, max_tokens=100)).status_code == 200   # 0.006 spent
+    r = client.post("/v1/ai/complete", json=body(ai, lic, max_tokens=500))
+    assert r.status_code == 429 and r.json()["code"] == "daily_cap"
+
+
+def test_trial_credits_once_per_account(client, ai):
+    db = ai.state.db
+    s = ai.state.settings
+    unverified = db.create_account("u@example.test", hash_password("hunter2hunter2"))
+    a = issue_license(ai, unverified, "solo")
+    assert db.ensure_wallet(a["lid"], s.ai_trial_credits)["balance"] == 0      # unverified: no free credits
+    verified = db.create_account("v@example.test", hash_password("hunter2hunter2"), verified=True)
+    l1, l2 = issue_license(ai, verified, "solo"), issue_license(ai, verified, "solo")
+    assert db.ensure_wallet(l1["lid"], s.ai_trial_credits)["balance"] == 300
+    assert db.ensure_wallet(l2["lid"], s.ai_trial_credits)["balance"] == 0      # second license, same account
+    # the in-app trial path funds the wallet without verification, still once
+    r = client.post("/v1/trial", json={"email": "t@example.test", "fingerprint": "c" * 64})
+    assert r.status_code == 200 and len(r.json()["device_secret"]) == 64
+    assert db.get_wallet(r.json()["license"]["lid"])["balance"] == 300

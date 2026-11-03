@@ -141,3 +141,34 @@ def test_assistant_endpoints(tmp_path):
     # a concurrent run is refused
     app.extensions["pb"]["assistant_status"]["running"] = True
     assert c.post("/api/assistant/run", json={}).status_code == 409
+
+
+def test_ui_shapes_for_search_digest_and_usage(tmp_path):
+    """The board renders {text, items[]} plainly; usage carries this month."""
+    app, _, _ = _app(tmp_path)
+    c = app.test_client()
+    r = c.post("/api/ai/search", json={"query": "harbor jobs by amount"}).get_json()
+    assert r["text"] == "Found 1 match." and r["items"][0]["project_id"] == "proj_a"
+    assert set(r["items"][0]) == {"project_id", "label", "detail"}
+    r = c.get("/api/ai/weekly-digest").get_json()
+    assert r["text"] == r["digest"] and r["text"].startswith("A steady week")
+    labels = [i["label"] for i in r["items"]]
+    assert any(l.startswith("Overdue: ") for l in labels) and all(isinstance(l, str) for l in labels)
+    u = c.get("/api/ai/usage").get_json()
+    assert u["month"]["calls"] >= 0 and "cost_usd" in u["month"]
+
+
+def test_search_without_model_says_so(tmp_path):
+    app, _, _ = _app(tmp_path, llm_on=False)
+    r = app.test_client().post("/api/ai/search", json={"query": "zzz-nothing"}).get_json()
+    assert r["ok"] and r["items"] == [] and r["text"] == "Nothing on the board matches that."
+
+
+def test_assistant_run_reports_a_sentence(tmp_path):
+    app, _, _ = _app(tmp_path, assistant_on=True)
+    r = app.test_client().post("/api/assistant/run", json={"max_items": 3}).get_json()
+    assert r["message"].endswith("Nothing was sent.") and "[object" not in r["message"]
+    assert r["summary"]["message"] == r["message"]
+    assert assistant_api.summary_sentence({"counts": {"drafted": 2, "question_posted": 1},
+                                           "triage": {"approved": 1, "created": 0, "dismissed": 0, "left": {}}}) == \
+        "Added 1 email to the board, wrote 2 drafts and asked you 1 question. Nothing was sent."

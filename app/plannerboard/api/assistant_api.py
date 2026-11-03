@@ -26,11 +26,51 @@ def _scheduler(v):
     return sched
 
 
+def _plural(n, one, many=None):
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def summary_sentence(summary) -> str:
+    """One plain sentence for a pass summary, e.g. "Sorted 2 emails, wrote
+    1 draft and asked you 1 question. Nothing was sent." """
+    if not isinstance(summary, dict):
+        return ""
+    c = summary.get("counts") or {}
+    t = summary.get("triage") or {}
+    n = lambda d, k: int((d or {}).get(k) or 0)  # noqa: E731
+    parts = []
+    sorted_n = n(t, "approved") + n(t, "created")
+    if sorted_n:
+        parts.append("added " + _plural(sorted_n, "email") + " to the board")
+    if n(t, "dismissed"):
+        parts.append("set aside " + _plural(n(t, "dismissed"), "email"))
+    if n(c, "drafted"):
+        parts.append("wrote " + _plural(n(c, "drafted"), "draft"))
+    if n(c, "question_posted"):
+        parts.append("asked you " + _plural(n(c, "question_posted"), "question"))
+    if n(c, "subtask_added"):
+        parts.append("added " + _plural(n(c, "subtask_added"), "task"))
+    if n(c, "acted"):
+        parts.append("updated " + _plural(n(c, "acted"), "item"))
+    left = sum(int(v or 0) for v in (t.get("left") or {}).values()) if isinstance(t.get("left"), dict) else 0
+    if left:
+        parts.append("left " + _plural(left, "email") + " for you to sort")
+    if not parts:
+        head = "Nothing needed doing"
+    elif len(parts) == 1:
+        head = parts[0]
+    else:
+        head = ", ".join(parts[:-1]) + " and " + parts[-1]
+    head = head[0].upper() + head[1:]
+    return head + ". Nothing was sent."
+
+
 def _public_summary(summary):
     if not isinstance(summary, dict):
         return None
     out = {k: val for k, val in summary.items() if k != "items"}
     out["item_count"] = len(summary.get("items") or [])
+    out["message"] = summary_sentence(summary)
     return out
 
 
@@ -120,4 +160,6 @@ def api_assistant_run():
         err = (v.get("assistant_status") or {}).get("error") or "assistant pass already running"
         code = 409 if "running" in err else 500
         return error_response(code, err)
-    return jsonify({"ok": True, "summary": summary})
+    if isinstance(summary, dict):
+        summary = dict(summary, message=summary_sentence(summary))
+    return jsonify({"ok": True, "summary": summary, "message": summary_sentence(summary)})

@@ -1,11 +1,12 @@
 """SQLite persistence (stdlib sqlite3, WAL, one connection per call).
 
 Tables:
-    accounts(id, email, pw_hash, created, is_admin, verified)
+    accounts(id, email, pw_hash, created, is_admin, verified, ai_trial_granted)
+    email_verifications(token, account_id, created, expires, used)
     sessions(token, account_id, csrf, created, expires)
     password_resets(token, account_id, created, expires, used)
     licenses(lid, account_id, plan, seats, features_json, issued, expires, revoked, stripe_sub_id, key)
-    activations(id, lid, fingerprint, app_version, first_seen, last_seen, valid_until, revoked)
+    activations(id, lid, fingerprint, app_version, first_seen, last_seen, valid_until, revoked, secret_hash)
     audit_log(id, ts, actor, action, target, detail)
     ai_wallets(lid, balance, trial_granted, updated)
     ai_ledger(id, lid, fingerprint, ts, task, tier, model, in_tok, out_tok, vendor_usd, credits, ok, error)
@@ -30,7 +31,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     pw_hash     TEXT NOT NULL,
     created     TEXT NOT NULL,
     is_admin    INTEGER NOT NULL DEFAULT 0,
-    verified    INTEGER NOT NULL DEFAULT 0
+    verified    INTEGER NOT NULL DEFAULT 0,
+    ai_trial_granted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS email_verifications (
+    token       TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    created     TEXT NOT NULL,
+    expires     TEXT NOT NULL,
+    used        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token       TEXT PRIMARY KEY,
@@ -69,6 +78,7 @@ CREATE TABLE IF NOT EXISTS activations (
     last_seen   TEXT NOT NULL,
     valid_until TEXT NOT NULL,
     revoked     INTEGER NOT NULL DEFAULT 0,
+    secret_hash TEXT NOT NULL DEFAULT '',
     UNIQUE (lid, fingerprint)
 );
 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -118,6 +128,14 @@ CREATE TABLE IF NOT EXISTS ai_purchases (
 
 SESSION_TTL = timedelta(days=14)
 RESET_TTL = timedelta(hours=2)
+VERIFY_TTL = timedelta(days=7)
+
+# Columns added after the first release: (table, column, DDL). init() adds
+# any that an older database lacks.
+MIGRATIONS = (
+    ("accounts", "ai_trial_granted", "ALTER TABLE accounts ADD COLUMN ai_trial_granted INTEGER NOT NULL DEFAULT 0"),
+    ("activations", "secret_hash", "ALTER TABLE activations ADD COLUMN secret_hash TEXT NOT NULL DEFAULT ''"),
+)
 
 
 def utcnow() -> datetime:
@@ -170,6 +188,10 @@ class Database:
             if self.path != ":memory:":
                 c.execute("PRAGMA journal_mode = WAL")
             c.executescript(SCHEMA)
+            for table, col, ddl in MIGRATIONS:
+                cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                if col not in cols:
+                    c.execute(ddl)
 
     def _one(self, sql: str, params: tuple = ()) -> Optional[dict]:
         with self.connect() as c:
@@ -224,6 +246,28 @@ class Database:
 
     def mark_verified(self, aid: str) -> None:
         self._exec("UPDATE accounts SET verified = 1 WHERE id = ?", (aid,))
+
+    def create_verification(self, aid: str) -> str:
+        token = secrets.token_urlsafe(32)
+        now = utcnow()
+        self._exec("INSERT INTO email_verifications(token, account_id, created, expires) VALUES (?,?,?,?)",
+                   (self._reset_digest(token), aid, iso(now), iso(now + VERIFY_TTL)))
+        return token
+
+    def consume_verification(self, token: str) -> Optional[str]:
+        """Account id for a live verification token (marks it used), else None."""
+        digest = self._reset_digest(token)
+        row = self._one("SELECT * FROM email_verifications WHERE token = ? AND used = 0", (digest,))
+        if not row:
+            return None
+        exp = parse_iso(row["expires"])
+        if not exp or exp < utcnow():
+            return None
+        with self._lock, self.connect() as c:
+            cur = c.execute("UPDATE email_verifications SET used = 1 WHERE token = ? AND used = 0", (digest,))
+            if cur.rowcount != 1:
+                return None
+        return row["account_id"]
 
     def account_count(self) -> int:
         row = self._one("SELECT COUNT(*) AS n FROM accounts")
@@ -389,6 +433,11 @@ class Database:
                 (lid, fingerprint, app_version or "", now, now, valid_until))
         return self.get_activation(lid, fingerprint)  # type: ignore[return-value]
 
+    def set_activation_secret(self, lid: str, fingerprint: str, secret_hash: str) -> None:
+        """Store the sha256 of a freshly issued device secret on the activation row."""
+        self._exec("UPDATE activations SET secret_hash = ? WHERE lid = ? AND fingerprint = ?",
+                   (secret_hash, lid, fingerprint))
+
     def claim_webhook_event(self, event_id: str, etype: str = "") -> bool:
         """True the first time an event id is seen, False on a replay."""
         if not event_id:
@@ -419,18 +468,58 @@ class Database:
             row["trial_granted"] = bool(row["trial_granted"])
         return row
 
-    def ensure_wallet(self, lid: str, trial_credits: int = 0) -> dict:
-        """Create the wallet on first use and grant the trial allowance exactly
-        once (INSERT OR IGNORE: a second call never re-grants)."""
+    def ensure_wallet(self, lid: str, trial_credits: int = 0, *, grant_trial: bool | None = None) -> dict:
+        """Create the wallet on first use. Trial credits are granted at most
+        ONCE PER ACCOUNT (not per license), and only when the wallet is
+        created (or on the explicit /v1/trial path): the account's
+        ai_trial_granted flag flips in the same transaction that funds it.
+
+        ``grant_trial`` None (default) grants only when the owning account is
+        verified; True grants regardless of verification (the /v1/trial path,
+        which proves the email by mailing the key); False never grants."""
         trial = max(0, int(trial_credits))
-        created = False
+        granted = 0
         with self._lock, self.connect() as c:
-            cur = c.execute("INSERT OR IGNORE INTO ai_wallets(lid, balance, trial_granted, updated) VALUES (?,?,1,?)",
-                            (lid, trial, iso(utcnow())))
-            created = cur.rowcount == 1
-        if created and trial:
-            self.audit("ai.trial_grant", actor="system", target=lid, detail={"credits": trial})
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                created = c.execute("INSERT OR IGNORE INTO ai_wallets(lid, balance, trial_granted, updated) "
+                                    "VALUES (?,0,0,?)", (lid, iso(utcnow()))).rowcount == 1
+                if trial and grant_trial is not False and (created or grant_trial is True):
+                    acct = c.execute("SELECT a.id, a.verified, a.ai_trial_granted FROM licenses l "
+                                     "JOIN accounts a ON a.id = l.account_id WHERE l.lid = ?", (lid,)).fetchone()
+                    eligible = acct is not None and not acct["ai_trial_granted"] and (
+                        grant_trial is True or bool(acct["verified"]))
+                    if eligible:
+                        cur = c.execute("UPDATE accounts SET ai_trial_granted = 1 WHERE id = ? AND ai_trial_granted = 0",
+                                        (acct["id"],))
+                        if cur.rowcount == 1:
+                            c.execute("UPDATE ai_wallets SET balance = balance + ?, trial_granted = 1, updated = ? "
+                                      "WHERE lid = ?", (trial, iso(utcnow()), lid))
+                            granted = trial
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        if granted:
+            self.audit("ai.trial_grant", actor="system", target=lid, detail={"credits": granted})
         return self.get_wallet(lid)  # type: ignore[return-value]
+
+    def refund(self, lid: str, credits: int) -> int:
+        """Return held credits to the wallet. Returns the new balance."""
+        n = max(0, int(credits))
+        with self._lock, self.connect() as c:
+            if n:
+                c.execute("UPDATE ai_wallets SET balance = balance + ?, updated = ? WHERE lid = ?",
+                          (n, iso(utcnow()), lid))
+            row = c.execute("SELECT balance FROM ai_wallets WHERE lid = ?", (lid,)).fetchone()
+            return int(row[0]) if row else 0
+
+    def vendor_usd_today(self, lid: str) -> float:
+        """Vendor cost recorded for this license since 00:00 UTC today."""
+        day = utcnow().strftime("%Y-%m-%dT00:00:00Z")
+        row = self._one("SELECT COALESCE(SUM(vendor_usd), 0) AS usd FROM ai_ledger WHERE lid = ? AND ts >= ?",
+                        (lid, day))
+        return float(row["usd"]) if row else 0.0
 
     def debit(self, lid: str, credits: int) -> Optional[int]:
         """Atomically subtract ``credits``. Returns the new balance, or None

@@ -86,6 +86,29 @@ def build_restart_needed():
     return out
 
 
+def _ai_credit_fields(r) -> dict:
+    """balance / low_credits / credits_exhausted for the built-in provider.
+    Reads only what the provider already knows (no network call here);
+    None balance means "not known yet" or not the built-in provider."""
+    out = {"balance": None, "low_credits": False, "credits_exhausted": False}
+    try:
+        llm = None
+        v = getattr(r, "ext", None)
+        if isinstance(v, dict):
+            llm = v.get("llm")
+        llm = llm or getattr(r, "llm", None)
+        prov = getattr(llm, "provider", None)
+        if getattr(prov, "name", "") != "emailboss":
+            return out
+        bal = getattr(prov, "last_balance", None)
+        out["balance"] = int(bal) if bal is not None else None
+        out["credits_exhausted"] = bool(getattr(llm, "credits_exhausted", False)) or out["balance"] == 0
+        out["low_credits"] = out["balance"] is not None and out["balance"] < 50
+    except Exception:
+        pass
+    return out
+
+
 def health_payload(r):
     db = r.store
     probe = db.write_probe()
@@ -104,6 +127,7 @@ def health_payload(r):
     except Exception as e:
         ai = {"provider": r.config.ai_provider, "ok": False, "error": str(e)}
     ai.setdefault("budget_hit", False)
+    ai.update(_ai_credit_fields(r))
     try:
         lic = r.license_status() or {}
     except Exception as e:
@@ -186,7 +210,11 @@ def api_restart():
         # Always restart through the module entry point: sys.argv[0] may be a
         # console-script shim or the start.py file itself, neither of which
         # survives a bare re-exec as a plain script.
-        cmd = [sys.executable, "-m", "plannerboard.start"] + list(sys.argv[1:])
+        if getattr(sys, "frozen", False):
+            # Frozen build: sys.executable IS the app, "-m" would be parsed as its argument.
+            cmd = [sys.executable] + list(sys.argv[1:])
+        else:
+            cmd = [sys.executable, "-m", "plannerboard.start"] + list(sys.argv[1:])
         # The new process waits for this port to free up before its own
         # single-instance probe (start.py reads PB_RESTART_WAIT).
         os.environ["PB_RESTART_WAIT"] = "1"

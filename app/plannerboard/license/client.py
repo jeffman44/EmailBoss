@@ -22,12 +22,22 @@ State lives in app_meta through the two callables passed in:
     license.last_heartbeat ISO timestamp of the last successful heartbeat
     license.clock_hwm      highest wall-clock time this client has observed
     license.revoked        non-empty reason string when the server said no
+    license.device_secret  per-device secret from /v1/activate or /v1/trial
+                           (proof of possession, see sign_request)
+
+Proof of possession: heartbeat, deactivate and every /v1/ai/* call carry
+    ts    = unix seconds
+    proof = hex(HMAC-SHA256(device_key, f"{lid}|{fingerprint}|{ts}|{path}"))
+with device_key = sha256(device_secret) as hex text (the value the server
+stores, so it can recompute the MAC without ever holding the secret).
 
 Dependencies: stdlib + cryptography (Ed25519).
 """
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import threading
@@ -77,6 +87,7 @@ META_ACTIVATION = "license.activation"
 META_LAST_HEARTBEAT = "license.last_heartbeat"
 META_CLOCK_HWM = "license.clock_hwm"
 META_REVOKED = "license.revoked"
+META_DEVICE_SECRET = "license.device_secret"
 
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Write paths that must keep working in read-only mode so the user can fix it.
@@ -296,11 +307,75 @@ class LicenseClient:
         if payload.get("fingerprint") != self.fingerprint:
             raise LicenseError("activation is for a different machine", "fingerprint")
         with self._lock:
+            if data.get("device_secret"):
+                self._meta_set(META_DEVICE_SECRET, str(data["device_secret"]))
             self._meta_set(META_ACTIVATION, token)
             self._meta_set(META_LAST_HEARTBEAT, iso(self._now()))
             self._meta_set(META_REVOKED, "")
             self._invalidate()
         return payload
+
+    # -------------------------------------------------- proof of possession
+
+    def device_secret(self) -> str:
+        return (self._meta_get(META_DEVICE_SECRET, None) or "").strip()
+
+    def _lid(self) -> str:
+        key = self.stored_key()
+        if key:
+            try:
+                return str(self.parse_key(key).get("lid") or "")
+            except LicenseError:
+                pass
+        act = self.stored_activation()
+        if act:
+            try:
+                return str(self.parse_activation(act).get("lid") or "")
+            except LicenseError:
+                pass
+        return ""
+
+    def _proof(self, path: str, lid: str, secret: str) -> dict:
+        ts = int(time.time())   # real wall clock: the server checks it within 300 s
+        device_key = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        msg = f"{lid}|{self.fingerprint}|{ts}|{path}".encode("utf-8")
+        return {"ts": ts, "proof": hmac.new(device_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()}
+
+    def sign_request(self, path: str) -> dict:
+        """{ts, proof} for a device call to `path` (e.g. "/v1/ai/complete").
+
+        An activation from before 1.3.0 has no device secret yet; the first
+        call upgrades it with one forced heartbeat (key-based, once). Returns
+        {} when no secret can be had (the server then answers proof_invalid)."""
+        secret = self.device_secret()
+        if not secret and self.stored_key():
+            try:
+                self.heartbeat(force=True)
+            except Exception:  # noqa: BLE001 - signing must never raise into the caller
+                pass
+            secret = self.device_secret()
+        lid = self._lid()
+        if not secret or not lid:
+            return {}
+        return self._proof(path, lid, secret)
+
+    def start_trial(self, email: str) -> dict:
+        """POST /v1/trial: the server creates the account (if new), issues a
+        trial key (also emailed), activates this machine and returns the
+        device secret. Stores everything like activate()."""
+        email = (email or "").strip()
+        if "@" not in email:
+            raise LicenseError("a valid email is required", "bad_email", http_status=400)
+        data = self._post("/v1/trial", {"email": email, "fingerprint": self.fingerprint,
+                                        "app_version": self.app_version})
+        key = (data.get("key") or "").strip()
+        if not key:
+            raise LicenseError("server response had no license key", "server")
+        payload = self.parse_key(key)
+        with self._lock:
+            self._meta_set(META_KEY, key)
+        act = self._store_activation(data)
+        return {"license": payload, "activation": act}
 
     def activate(self, key: str) -> dict:
         """Verify the key locally, then POST /v1/activate and store the activation."""
@@ -313,6 +388,24 @@ class LicenseClient:
             self._meta_set(META_KEY, key)
         act = self._store_activation(data)
         return {"license": payload, "activation": act}
+
+    def start_trial(self, email: str) -> dict:
+        """POST /v1/trial: the server creates the trial license, claims this
+        machine, emails the key and returns it. Stored exactly like activate()."""
+        email = (email or "").strip()
+        if not email or "@" not in email:
+            raise LicenseError("Enter a valid email address.", "bad_email")
+        data = self._post("/v1/trial", {
+            "email": email, "fingerprint": self.fingerprint, "app_version": self.app_version,
+        })
+        key = str(data.get("key") or "").strip()
+        if not key:
+            raise LicenseError("server response had no license key", "server")
+        payload = self.parse_key(key)
+        with self._lock:
+            self._meta_set(META_KEY, key)
+        act = self._store_activation(data)
+        return {"license": payload, "activation": act, "key": key}
 
     def heartbeat(self, force: bool = False) -> dict:
         """Daily refresh of the activation. Returns {"ok", "skipped"?, "error"?}.
@@ -332,11 +425,24 @@ class LicenseClient:
         if not force and last and self._now() - last < HEARTBEAT_INTERVAL:
             return {"ok": True, "skipped": "recent"}
         body = {"lid": payload["lid"], "fingerprint": self.fingerprint, "app_version": self.app_version}
+        secret = self.device_secret()
+        if secret:
+            body.update(self._proof("/v1/heartbeat", payload["lid"], secret))
+        else:
+            body["key"] = key   # pre-1.3.0 activation: the server upgrades it once and returns a secret
         try:
             data = self._post("/v1/heartbeat", body)
         except LicenseError as exc:
             if exc.code == "offline" or exc.http_status >= 500:
                 return {"ok": False, "offline": True, "error": str(exc)}
+            if exc.code == "proof_invalid":
+                # Lost or rotated secret: re-activate with the stored key (the
+                # seat is already ours, so this refreshes rather than claims).
+                try:
+                    self.activate(key)
+                    return {"ok": True, "reactivated": True}
+                except LicenseError as exc2:
+                    exc = exc2
             with self._lock:
                 self._meta_set(META_REVOKED, f"{exc.code}: {exc}")
                 if exc.http_status in (403, 404, 410):
@@ -356,7 +462,10 @@ class LicenseClient:
         if key:
             try:
                 payload = self.parse_key(key)
-                self._post("/v1/deactivate", {"lid": payload["lid"], "fingerprint": self.fingerprint})
+                body = {"lid": payload["lid"], "fingerprint": self.fingerprint}
+                secret = self.device_secret()
+                body.update(self._proof("/v1/deactivate", payload["lid"], secret) if secret else {"key": key})
+                self._post("/v1/deactivate", body)
             except LicenseError as exc:
                 # Local state is cleared regardless; report the server side.
                 result = {"ok": False, "error": str(exc), "code": exc.code}
@@ -365,6 +474,7 @@ class LicenseClient:
             self._meta_set(META_KEY, "")
             self._meta_set(META_LAST_HEARTBEAT, "")
             self._meta_set(META_REVOKED, "")
+            self._meta_set(META_DEVICE_SECRET, "")
             self._invalidate()
         return result
 
@@ -388,10 +498,21 @@ class LicenseClient:
                 "PB_LICENSE_DEV is set but this is a release build; license checks stay on")
         return False
 
+    def _trial_fields(self, st: dict) -> dict:
+        is_trial = st.get("plan") == "trial"
+        days_left = 0
+        exp = parse_iso(st.get("expires"))
+        if is_trial and exp:
+            delta = exp - self._effective_now()
+            days_left = max(0, delta.days + (1 if delta.seconds else 0))
+        st["trial"] = is_trial
+        st["days_left"] = days_left
+        return st
+
     def status(self, use_cache: bool = True) -> dict:
         if use_cache and self._status_cache and time.monotonic() - self._status_cache[0] < STATUS_CACHE_SECONDS:
             return dict(self._status_cache[1])
-        st = self._compute_status()
+        st = self._trial_fields(self._compute_status())
         self._status_cache = (time.monotonic(), st)
         return dict(st)
 

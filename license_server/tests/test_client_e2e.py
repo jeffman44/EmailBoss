@@ -95,3 +95,49 @@ def test_client_end_to_end(client, app):
 
     # grace math constant is what the docs promise
     assert GRACE_DAYS == 14
+
+
+def _client_for(app, client, meta=None):
+    meta = meta if meta is not None else Meta()
+    return meta, LicenseClient({"license": {}}, meta.get_, meta.set_, server_url="http://testserver",
+                               public_key_pem=app.state.signer.public_key_pem(), transport=_transport(client))
+
+
+def test_sign_request_is_accepted_by_the_relay(client, app):
+    lic = _lic(app)
+    meta, lc = _client_for(app, client)
+    lc.activate(lic["key"])
+    assert len(meta["license.device_secret"]) == 64
+    app.state.settings.anthropic_api_key = ""          # relay off: auth passes, then 503
+    body = {"lid": lic["lid"], "fingerprint": machine_fingerprint(), "activation": lc.stored_activation(),
+            "task": "ai.test", "tier": "fast", "user": "hi", **lc.sign_request("/v1/ai/complete")}
+    r = client.post("/v1/ai/complete", json=body)
+    assert r.status_code == 503, r.text
+    body.update(lc.sign_request("/v1/ai/balance"))
+    assert client.post("/v1/ai/complete", json=body).json()["code"] == "proof_invalid"
+    assert client.post("/v1/ai/balance", json={k: body[k] for k in ("lid", "fingerprint", "activation", "ts", "proof")}).status_code == 200
+    # deactivate is signed too
+    assert lc.deactivate()["ok"] is True
+    assert app.state.db.get_activation(lic["lid"], machine_fingerprint())["revoked"] == 1
+
+
+def test_legacy_client_upgrades_and_lost_secret_recovers(client, app):
+    lic = _lic(app)
+    meta, lc = _client_for(app, client)
+    lc.activate(lic["key"])
+    # simulate a pre-1.3.0 install: no secret on either side
+    meta["license.device_secret"] = ""
+    app.state.db.set_activation_secret(lic["lid"], machine_fingerprint(), "")
+    signed = lc.sign_request("/v1/ai/complete")          # forces the upgrade heartbeat
+    assert signed and len(meta["license.device_secret"]) == 64
+    # lost secret locally while the server still has one: heartbeat re-activates
+    meta["license.device_secret"] = "f" * 64
+    assert lc.heartbeat(force=True) == {"ok": True, "reactivated": True}
+    assert meta["license.device_secret"] != "f" * 64 and lc.status(use_cache=False)["status"] == "ok"
+
+
+def test_start_trial(client, app):
+    meta, lc = _client_for(app, client)
+    res = lc.start_trial("trial-e2e@example.test")
+    assert res["license"]["plan"] == "trial" and meta["license.device_secret"]
+    assert lc.status(use_cache=False)["status"] == "ok"

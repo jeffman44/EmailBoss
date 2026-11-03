@@ -142,7 +142,10 @@ def api_ai_usage():
     budget = float(getattr(getattr(llm, "meter", None), "daily_budget_usd",
                            ((v.get("cfg").get("ai") or {}).get("daily_budget_usd") or 0.0)))
     prov = _builtin_provider(llm)
-    return jsonify({"ok": True, "today": today, "budget_usd": budget,
+    month = _usage_month(st)
+    if prov is not None:
+        month["credits"] = int(round(float(month.get("cost_usd") or 0) * 100))
+    return jsonify({"ok": True, "today": today, "month": month, "budget_usd": budget,
                     "budget_hit": bool(llm.budget_hit) if llm is not None else False,
                     "provider": llm.provider_name if llm is not None else "none",
                     "model": llm.model if llm is not None else "",
@@ -150,6 +153,21 @@ def api_ai_usage():
                     "balance": getattr(prov, "last_balance", None) if prov is not None else None,
                     "credits_today": int(round(float(today.get("cost_usd") or 0) * 100)) if prov is not None else None,
                     "credits_exhausted": bool(getattr(llm, "credits_exhausted", False))})
+
+
+def _usage_month(st) -> dict:
+    """Calls and cost this calendar month from the local usage ledger."""
+    out = {"calls": 0, "cost_usd": 0.0}
+    if st is None:
+        return out
+    try:
+        conn = getattr(st, "conn", None) or getattr(st, "_conn", None)
+        row = conn.execute("SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM ai_usage WHERE substr(ts, 1, 7) = ?",
+                           (date.today().strftime("%Y-%m"),)).fetchone()
+        out = {"calls": int(row[0] or 0), "cost_usd": round(float(row[1] or 0), 4)}
+    except Exception:
+        pass
+    return out
 
 
 _balance_cache: dict = {"ts": 0.0, "data": {}}
@@ -476,7 +494,28 @@ def api_ai_search():
     else:
         results.sort(key=lambda p: (p.get("follow_up_date") or "9999-12-31"))
     results = results[:25]
-    return jsonify({"ok": True, "query": query, "filters": filters, "results": results, "count": len(results)})
+    return jsonify({"ok": True, "query": query, "filters": filters, "results": results, "count": len(results),
+                    "text": _search_sentence(len(results), filters, ai_used=not _offline(llm)),
+                    "items": [_item(p, v) for p in results]})
+
+
+def _item(p: dict, v=None) -> dict:
+    """A row the board can render without knowing the project schema."""
+    detail = [str(p.get("location") or p.get("site") or "")]
+    fu = p.get("follow_up_date")
+    if fu:
+        detail.append(f"follow up {str(fu)[:10]}")
+    return {"project_id": p.get("id", ""), "label": p.get("name", ""),
+            "detail": " · ".join(d for d in detail if d)}
+
+
+def _search_sentence(n: int, filters: dict, ai_used: bool) -> str:
+    if not n:
+        return "Nothing on the board matches that."
+    what = "1 match" if n == 1 else f"{n} matches"
+    if not ai_used:
+        return f"Found {what} by name. Turn on Email Boss AI to ask in plain words."
+    return f"Found {what}."
 
 
 # ── weekly digest ────────────────────────────────────────────────────────────
@@ -537,6 +576,27 @@ def api_ai_weekly_digest():
     if not out:
         return error_response(502, llm.last_error or "no digest produced")
     val = out[0]
-    digest = val.get("digest") or val.get("text") if isinstance(val, dict) else str(val)
-    return jsonify({"ok": True, "digest": (digest or "").strip(), "stats": stats,
-                    "generated_at": datetime.now().isoformat(timespec="seconds")})
+    digest = (val.get("digest") or val.get("text")) if isinstance(val, dict) else str(val)
+    digest = (digest or "").strip()
+    return jsonify({"ok": True, "digest": digest, "text": digest, "items": _digest_items(stats, money),
+                    "stats": stats, "generated_at": datetime.now().isoformat(timespec="seconds")})
+
+
+_DIGEST_LABELS = (
+    ("new_projects", "New this week"), ("quotes_sent", "Waiting on an answer"), ("approvals", "Won this week"),
+    ("overdue_count", "Overdue"), ("stale_count", "Quiet for over a week"), ("total_pipeline", "Open quotes"),
+    ("won_ytd", "Won this year"), ("top_opportunity", "Biggest open quote"),
+)
+
+
+def _digest_items(stats: dict, money: bool) -> list:
+    """The numbers behind the digest as plain labelled rows."""
+    out = []
+    for key, label in _DIGEST_LABELS:
+        if key not in stats:
+            continue
+        if not money and key in ("total_pipeline", "won_ytd", "top_opportunity"):
+            continue
+        val = stats[key]
+        out.append({"label": f"{label}: {val:,.0f}" if isinstance(val, float) else f"{label}: {val}", "detail": ""})
+    return out

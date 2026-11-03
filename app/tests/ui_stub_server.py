@@ -206,7 +206,7 @@ TRIAGE = [
                                                                       "is_new_location": True},
      "triage_actions": [], "completion_signals": [], "auto_action": "Build and send the proposal",
      "auto_follow_up": d(1), "auto_date_type": "follow_up", "dollar_amount": None, "is_quote_request": 1,
-     "doc_links": [], "staged_at": ts(-1)},
+     "doc_links": [], "staged_at": ts(-1), "leave_reason": "no_project"},
     {"triage_id": "tri_003", "card_type": "acknowledgment", "status": "pending", "direction": "inbound",
      "from_email": "tom@birchdental.example", "from_name": "Tom Nguyen", "subject": "Renewal question",
      "body_preview": "Any update on the renewal?", "body_raw": "Any update on the renewal?", "received_at": ts(-5),
@@ -227,6 +227,8 @@ QUESTIONS = [
      "asked_by": "assistant", "status": "open", "created": ts(-1)},
 ]
 
+QUESTIONS_SEED = [dict(q) for q in QUESTIONS]
+
 ALERTS = [
     {"id": 1, "kind": "mail", "key": "mail_stale", "title": "No mail fetched in 6h", "detail": "IMAP watermark unchanged",
      "severity": "warn", "seen_count": 2, "status": "open"},
@@ -237,7 +239,8 @@ HEALTH = {
     "watchers": [], "watchers_down": [], "restart_needed": [], "alerts_open": 1, "alerts_hard": 0,
     "alerts": ALERTS, "last_triage": ts(-1), "triage": {"pending": 3},
     "mail": {"provider": "imap", "ok": True, "last_fetch": ts(-1), "error": None, "pending": 3},
-    "ai": {"provider": "anthropic", "ok": True, "today_cost_usd": 0.42, "budget_usd": 2.0, "budget_hit": False},
+    "ai": {"provider": "anthropic", "ok": True, "today_cost_usd": 0.42, "budget_usd": 2.0, "budget_hit": False,
+           "balance": None, "low_credits": False, "credits_exhausted": False},
     "license": {"status": "ok", "plan": "solo", "expires": d(300), "grace_days_left": None},
     "business_hours": PROFESSION["business_hours"], "project_count": 3, "pending_triage": 3,
 }
@@ -254,6 +257,7 @@ CONFIG = {
     "assistant": {"schedule_minutes": 60, "max_items": 10, "drafts_to": "provider"},
     "license": {"server_url": "https://license.example.com"},
     "features": {"money": True, "game_layer": True, "analytics": True},
+    "display": {"large_text": False, "light_theme": None}, "timezone": "",
     "setup_required": False, "version": "0.1.0", "business_hours": PROFESSION["business_hours"],
 }
 
@@ -416,8 +420,21 @@ def api_mail_state():
     return jsonify(MAIL_STATE)
 
 
-@app.route("/api/profession")
+@app.route("/api/profession", methods=["GET", "PUT"])
 def api_profession():
+    if request.method == "PUT":
+        b = request.get_json(force=True) or {}
+        over = b.get("overrides") or {}
+        CONFIG["profession"]["overrides"] = over
+        app.last_overrides = over
+        for k in ("fields",):
+            if k in over:
+                PROFESSION[k] = over[k]
+        if isinstance(over.get("features"), dict):
+            PROFESSION["features"].update(over["features"])
+        if isinstance(over.get("business_hours"), dict):
+            PROFESSION["business_hours"] = over["business_hours"]
+        return jsonify({"ok": True, "profession": PROFESSION})
     return jsonify(PROFESSION)
 
 
@@ -434,6 +451,11 @@ def api_professions():
 def api_config():
     if request.method == "PUT":
         b = request.get_json(force=True) or {}
+        for k in ("display", "ai", "features"):
+            if isinstance(b.get(k), dict):
+                CONFIG.setdefault(k, {}).update(b[k])
+        if "timezone" in b:
+            CONFIG["timezone"] = b["timezone"]
         if isinstance(b.get("mail"), dict):
             CONFIG["mail"].update(b["mail"])
             if "send_enabled" in b["mail"]:
@@ -599,13 +621,105 @@ def api_triage_revive(tid):
 @app.route("/api/questions", methods=["GET"])
 def api_questions():
     pid = request.args.get("project_id")
-    rows = [q for q in QUESTIONS if not pid or q["project_id"] == pid]
+    status = request.args.get("status")
+    rows = [q for q in QUESTIONS if (not pid or q["project_id"] == pid) and (not status or q["status"] == status)]
     return jsonify({"questions": rows, "count": len(rows)})
 
 
 @app.route("/api/questions/<qid>", methods=["POST", "DELETE"])
 def api_question(qid):
     return jsonify({"id": qid, "status": "answered"})
+
+
+@app.route("/api/questions/<qid>/answer", methods=["POST"])
+def api_question_answer(qid):
+    q = next((x for x in QUESTIONS if x["id"] == qid), None)
+    if not q:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    q["status"] = "answered"
+    q["answer"] = (request.get_json(force=True) or {}).get("answer")
+    did = f"draft_q{len(DRAFTS) + 1}"
+    DRAFTS.insert(0, {"id": did, "project_id": q["project_id"], "to": "priya@acme.example", "cc": "",
+                      "subject": "Re: Website refresh proposal", "body": "Hi Priya, yes, two weeks works.",
+                      "status": "draft", "created_by": "assistant", "created_at": ts(0)})
+    return jsonify({"ok": True, "drafted": True, "draft_id": did})
+
+
+DRAFTS = [
+    {"id": "draft_001", "project_id": "proj_002", "to": "tom@birchdental.example", "cc": "",
+     "subject": "Re: Renewal question", "body": "Hi Tom,\nThe renewal is on track. I will send the forms Friday.",
+     "status": "draft", "created_by": "assistant", "created_at": ts(-2)},
+]
+
+
+@app.route("/api/drafts", methods=["GET", "POST"])
+def api_drafts():
+    if request.method == "POST":
+        b = request.get_json(force=True) or {}
+        did = f"draft_{len(DRAFTS) + 100}"
+        DRAFTS.insert(0, dict(b, id=did, status="draft", created_at=ts(0)))
+        return jsonify({"ok": True, "id": did, "draft": DRAFTS[0]}), 201
+    rows = [x for x in DRAFTS if x.get("status") == "draft"]
+    return jsonify({"ok": True, "drafts": rows, "count": len(rows)})
+
+
+@app.route("/api/drafts/<did>", methods=["DELETE"])
+def api_draft_delete(did):
+    DRAFTS[:] = [x for x in DRAFTS if x["id"] != did]
+    return jsonify({"ok": True, "deleted": did, "removed": 1})
+
+
+@app.route("/api/triage/approve-all", methods=["POST"])
+def api_triage_approve_all():
+    matched = [t for t in TRIAGE if t.get("status") == "pending" and t.get("matched_project")]
+    skipped = [t for t in TRIAGE if t.get("status") == "pending" and not t.get("matched_project")]
+    for t in matched:
+        TRIAGE.remove(t)
+    return jsonify({"ok": True, "approved": len(matched), "skipped_unmatched": len(skipped), "failed": 0})
+
+
+@app.route("/api/ai/draft-reply", methods=["POST"])
+@app.route("/api/ai/draft-follow-up", methods=["POST"])
+def api_ai_drafts():
+    return jsonify({"ok": True, "draft": "Hi Priya,\n\nThanks for the update. Two weeks works for us."})
+
+
+@app.route("/api/ai/project-health", methods=["POST"])
+def api_ai_health():
+    return jsonify({"ok": True, "assessment": {"health": "on track", "recommendation": "Confirm the start date",
+                                               "reason": "Budget approved", "priority": 2}})
+
+
+@app.route("/api/ai/search", methods=["POST"])
+def api_ai_search():
+    q = ((request.get_json(force=True) or {}).get("query") or "").lower()
+    hits = [p for p in PROJECTS if any(w in p["name"].lower() for w in q.split())]
+    return jsonify({"ok": True, "query": q, "results": hits, "count": len(hits),
+                    "text": f"Found {len(hits)} match{'' if len(hits) == 1 else 'es'}.",
+                    "items": [{"project_id": p["id"], "label": p["name"], "detail": p["location"]} for p in hits]})
+
+
+@app.route("/api/ai/weekly-digest")
+def api_ai_digest():
+    return jsonify({"ok": True, "text": "A steady week. Two replies are waiting on you.", "digest": "A steady week.",
+                    "items": [{"label": "Overdue: 1", "detail": ""}]})
+
+
+@app.route("/api/ai/balance")
+def api_ai_balance():
+    return jsonify({"ok": True, "builtin": True, "balance": 240, "low": False, "credits_exhausted": False,
+                    "packs": [{"id": "price_small", "label": "500 credits ($5.00)", "credits": 500, "usd_cents": 500}]})
+
+
+@app.route("/api/ai/checkout", methods=["POST"])
+def api_ai_checkout():
+    return jsonify({"ok": True, "url": "about:blank"})
+
+
+@app.route("/api/license/trial", methods=["POST"])
+def api_license_trial():
+    app.last_trial = request.get_json(force=True) or {}
+    return jsonify({"ok": True, "status": {"status": "ok", "plan": "trial"}})
 
 
 @app.route("/api/alerts")
@@ -671,13 +785,13 @@ def api_mail_providers():
 @app.route("/api/ai/providers")
 def api_ai_providers():
     return jsonify({"ok": True, "providers": [{"id": p, "label": p} for p in ("none", "anthropic", "openai", "ollama")],
-                    "current": "anthropic", "key_present": True})
+                    "current": CONFIG["ai"]["provider"], "key_present": True})
 
 
 @app.route("/api/ai/usage")
 def api_ai_usage():
     return jsonify({"ok": True, "cost_usd": 0.42, "calls": 9, "by_task": {"triage.classify": 6, "reply.draft": 3},
-                    "budget_usd": 2.0, "budget_hit": False})
+                    "budget_usd": 2.0, "budget_hit": False, "month": {"calls": 31, "cost_usd": 1.2, "credits": 120}})
 
 
 @app.route("/api/ai/test", methods=["POST"])
@@ -733,9 +847,20 @@ def api_setup_probe():
                     "professions": [], "configured": False})
 
 
+@app.route("/api/mail/oauth/ready")
+def api_oauth_ready():
+    return jsonify({"ok": True, "gmail": False, "graph": False})
+
+
 @app.route("/api/mail/oauth/start", methods=["POST"])
 def api_oauth_start():
     return jsonify({"ok": True, "auth_url": "https://accounts.example.com/o/oauth2/auth?x=1", "state": "abc"})
+
+
+@app.route("/api/_force402")
+def api_force_402():
+    return jsonify({"error": "license_required", "license": {"status": "unlicensed", "read_only": True},
+                    "message": "License required for changes."}), 402
 
 
 @app.route("/api/<path:rest>", methods=["GET", "POST", "PUT", "DELETE"])

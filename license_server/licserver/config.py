@@ -43,6 +43,7 @@ class Settings:
     ai_min_credits: int = field(default_factory=lambda: int(os.environ.get("AI_MIN_CREDITS_PER_CALL", "1")))
     ai_trial_credits: int = field(default_factory=lambda: int(os.environ.get("AI_TRIAL_CREDITS", "300")))
     ai_rate_per_min: int = field(default_factory=lambda: int(os.environ.get("AI_RATE_PER_MIN", "60")))
+    ai_daily_usd_per_lid: float = field(default_factory=lambda: float(os.environ.get("AI_DAILY_USD_PER_LID", "5.00")))
     ai_max_tokens: int = field(default_factory=lambda: int(os.environ.get("AI_MAX_TOKENS", "4000")))
     ai_model_fast: str = field(default_factory=lambda: os.environ.get("AI_MODEL_FAST", "claude-haiku-4-5"))
     ai_model_smart: str = field(default_factory=lambda: os.environ.get("AI_MODEL_SMART", "claude-sonnet-4-5"))
