@@ -1,0 +1,13 @@
+{
+  "note": "Upper bounds for tests/bench on the windows-latest runner. Set from the first real run (measured x 1.5, rounded up), then frozen. A null metric is recorded but not enforced.",
+  "frozen": false,
+  "source_run": null,
+  "metrics": {
+    "cold_open_s": null,
+    "sync_full_s": null,
+    "sync_cycle_ms_p50": null,
+    "reconcile_ms": null,
+    "list_page_ms_p50": null,
+    "open_message_ms_p50": null
+  }
+}

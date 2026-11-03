@@ -44,6 +44,30 @@ SYSTEM_HIDDEN = {"CHAT", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMO
                  "CATEGORY_UPDATES", "CATEGORY_FORUMS", "UNREAD", "STARRED", "IMPORTANT"}
 DEFAULT_INITIAL_DAYS = 30
 PAGE_CAP = 500
+# Gmail history events the sync asks for (1.3 asked for messageAdded only,
+# so deletes and archive / label moves never reached the app).
+HISTORY_TYPES = ("messageAdded", "messageDeleted", "labelAdded", "labelRemoved")
+CAPTURE_LABELS = {"INBOX", "SENT"}
+
+
+def folder_for_labels(labels) -> str:
+    """Folder kind of a Gmail message from its full label set."""
+    labels = set(labels or ())
+    if "TRASH" in labels:
+        return "trash"
+    if "SPAM" in labels:
+        return "junk"
+    if "INBOX" in labels:
+        return "inbox"
+    if "SENT" in labels:
+        return "sent"
+    if "DRAFT" in labels:
+        return "drafts"
+    return "archive"
+
+
+def _is_not_found(e: Exception) -> bool:
+    return "-> 404" in str(e)
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -188,50 +212,96 @@ class GmailProvider(BaseProvider):
             return ConnResult(False, error=str(e))
 
     def fetch_new(self, state: ProviderState, limit: int = 200) -> Iterator[Message]:
+        """One capture cycle.
+
+        Sync truth (2.0 Phase 0): every id the server reports is written to
+        ``state["pending_ids"]`` BEFORE ``history_id`` moves, so a burst larger
+        than ``max_per_cycle`` drains over later cycles instead of being lost.
+        History asks for adds, deletes and label changes; deletes and label
+        changes go straight to the sync ledger. A fetch that fails goes to the
+        retry queue instead of being skipped forever."""
         n = 0
+        pending: list[str] = []
+        loaded = False
         try:
             cap = max(1, min(limit or self.max_per_cycle, self.max_per_cycle))
             last_hist = state.get("history_id")
             prof = self._get("/profile")
             self.user_email = prof.get("emailAddress", "")
             newest_hist = prof.get("historyId")
-            ids: list[str] = []
             if last_hist:
                 try:
-                    ids = self._history_ids(last_hist, cap)
+                    ids, hist_after = self._history_scan(last_hist)
                 except RuntimeError as e:
                     # 404 = historyId too old; fall back to the dated window.
                     self.note_warning(f"history window lost ({e}); resyncing by date")
-                    ids = self._list_ids(cap)
+                    ids, hist_after = self._list_ids(), newest_hist
             else:
-                ids = self._list_ids(cap)
-            seen = set(state.get("recent_ids") or [])
+                ids, hist_after = self._list_ids(), newest_hist
+            pending = list(state.get("pending_ids") or [])
+            loaded = True
+            queued = set(pending)
             for gid in ids:
-                if gid in seen:
+                if gid not in queued:
+                    queued.add(gid)
+                    pending.append(gid)
+            # The ids are durable now; only then may the cursor move.
+            state.set("pending_ids", pending)
+            state.set("history_id", hist_after or newest_hist or last_hist)
+            state.save()
+
+            for msg in self._drain_retries():
+                n += 1
+                yield msg
+
+            seen = set(state.get("recent_ids") or [])
+            sync = self.sync
+            done = 0
+            while pending and done < cap:
+                gid = pending[0]
+                if (sync is not None and sync.has(self.id, gid, live_only=False)) or gid in seen:
+                    pending.pop(0)
                     continue
+                done += 1
                 try:
                     msg = self._fetch_message(gid)
                 except Exception as e:
-                    self.note_warning(f"message {gid} failed ({type(e).__name__}); skipped")
+                    pending.pop(0)
+                    if _is_not_found(e):
+                        if sync is not None:
+                            sync.mark_removed(self.id, gid, "gone before fetch")
+                    else:
+                        self.fetch_failed(gid, "", e)
                     continue
                 if msg is None:
+                    pending.pop(0)
                     continue
                 n += 1
-                seen.add(gid)
                 yield msg
-            state.set("history_id", newest_hist or last_hist)
+                # Popped only after the consumer took it: a closed generator
+                # leaves the id queued for the next cycle.
+                pending.pop(0)
+                seen.add(gid)
+            if pending:
+                self.note_warning("more new messages than the per cycle cap; the rest are queued "
+                                  "and continue next cycle")
             state.set("recent_ids", list(seen)[-2000:])
-            state.save()
             self._record_fetch(n)
         except Exception as e:
             self._record_fetch(n, f"{type(e).__name__}: {e}")
+        finally:
+            if loaded:
+                state.set("pending_ids", pending)
+                state.save()
 
-    def _list_ids(self, cap: int) -> list[str]:
+    def _list_ids(self) -> list[str]:
+        """Every id in the first-sync window (no cap: the cap applies to
+        fetching, never to discovery)."""
         q = f"newer_than:{max(1, self.initial_days)}d (in:inbox OR in:sent)"
         out: list[str] = []
         token = None
-        while len(out) < cap:
-            params = {"q": q, "maxResults": min(PAGE_CAP, cap - len(out))}
+        while True:
+            params = {"q": q, "maxResults": PAGE_CAP}
             if token:
                 params["pageToken"] = token
             body = self._get("/messages", params)
@@ -241,28 +311,70 @@ class GmailProvider(BaseProvider):
                 break
         return list(reversed(out))   # oldest first
 
-    def _history_ids(self, start: str, cap: int) -> list[str]:
-        out: list[str] = []
-        seen = set()
+    def _history_scan(self, start: str) -> tuple[list[str], str | None]:
+        """Walk every history page since ``start``. Returns (ids to fetch,
+        the historyId the walk reached). Deletes and label changes are
+        applied to the sync ledger as they are read (idempotent on replay)."""
+        adds: dict[str, None] = {}
+        sync = self.sync
         token = None
+        reached = None
         while True:
-            params = {"startHistoryId": start, "historyTypes": "messageAdded",
+            params = {"startHistoryId": start, "historyTypes": list(HISTORY_TYPES),
                       "maxResults": PAGE_CAP}
             if token:
                 params["pageToken"] = token
             body = self._get("/history", params)
+            reached = body.get("historyId") or reached
             for h in body.get("history") or []:
                 for ma in h.get("messagesAdded") or []:
                     m = ma.get("message") or {}
                     labels = set(m.get("labelIds") or [])
-                    if m.get("id") and m["id"] not in seen and (
-                            not labels or labels & {"INBOX", "SENT"}):
-                        seen.add(m["id"])
-                        out.append(m["id"])
+                    if m.get("id") and (not labels or labels & CAPTURE_LABELS):
+                        adds[m["id"]] = None
+                for md in h.get("messagesDeleted") or []:
+                    gid = (md.get("message") or {}).get("id")
+                    if not gid:
+                        continue
+                    adds.pop(gid, None)
+                    if sync is not None:
+                        sync.mark_removed(self.id, gid, "deleted")
+                for key, added in (("labelsAdded", True), ("labelsRemoved", False)):
+                    for ev in h.get(key) or []:
+                        m = ev.get("message") or {}
+                        gid = m.get("id")
+                        delta = set(ev.get("labelIds") or [])
+                        if not gid or not delta:
+                            continue
+                        row = None
+                        if sync is not None:
+                            row = sync.apply_labels(self.id, gid,
+                                                    added=delta if added else (),
+                                                    removed=() if added else delta,
+                                                    folder_fn=folder_for_labels)
+                        if row is None and added and delta & CAPTURE_LABELS:
+                            # Moved into the inbox (or sent) from somewhere we
+                            # never captured: fetch it like a new message.
+                            adds[gid] = None
             token = body.get("nextPageToken")
-            if not token or len(out) >= cap:
+            if not token:
                 break
-        return out[:cap]
+        return list(adds), reached
+
+    def fetch_item(self, item_id: str, folder: str = "") -> Message | None:
+        try:
+            return self._fetch_message(item_id)
+        except Exception as e:
+            if _is_not_found(e):
+                return None
+            raise
+
+    def server_counts(self) -> dict:
+        out = {}
+        for label, kind in (("INBOX", "inbox"), ("SENT", "sent")):
+            body = self._get(f"/labels/{label}")
+            out[kind] = int(body.get("messagesTotal") or 0)
+        return out
 
     # ── payload parsing ──
     def _fetch_message(self, gid: str, any_folder: bool = False, fmt: str = "full") -> Message | None:
@@ -325,6 +437,9 @@ class GmailProvider(BaseProvider):
         )
         msg.flagged = "STARRED" in labels
         msg.labels = sorted(labels)
+        msg.sync_id = gid
+        msg.sync_folder = folder_for_labels(labels)
+        msg.sync_labels = sorted(labels)
         return msg
 
     def _body_from_walk(self, payload: dict, gid: str, atts: list[Attachment]) -> tuple[str, str]:

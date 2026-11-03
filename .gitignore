@@ -42,3 +42,4 @@ license_server/keys/*
 .idea/
 .DS_Store
 Thumbs.db
+app/bench.json

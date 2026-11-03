@@ -129,3 +129,11 @@ Google restricted-scope verification and security assessment (the AI relay makes
 ## 11. What the adversarial review changed
 
 Cut: scheduled send (violated "nothing sends"); office conversion and OCR; split inbox, VIP, coach tips, snippets, translate and the game layer moved to 2.x; multi-account UI deferred but the data model and secrets go per-account in Phase 1. Added: Phase 0 with the five sync defects and a measured baseline; install cutoff and backfill policy; server-search fallback and coverage footer; reconcile against server counts; retry queue; data lifecycle and encryption decided in Phase 1; rules cannot touch status/stage/money and never run on backfill; `mail_*` table names (the existing `contacts` table collided); HP kept until migrated; correspondence-to-thread backfill; `pa_folder` path; pytest in `make check`; Windows benchmark job; nine acceptance tests now written into phase exits. Corrected: Gmail API has no scheduled send; the `data-on-*` dispatcher was not the performance risk, the live-provider list and per-open refetch were; `b` is the one key for create event.
+
+### Phase 0 record
+
+- "The store" in the Phase 0 exit criteria is the sync ledger, `mail_cache/sync.sqlite` (`mail_sync_ledger`, `mail_retry_queue`, `mail_reconcile`): captured server ids with folder, labels, flags and Message-ID, no bodies. Phase 1 folds it into `mail_messages`; nothing in the board database changed.
+- The cap defect had a second site: the Gmail first sync (`_list_ids`) also stopped at `max_per_cycle` and dropped the rest of the window. Both paths now queue every discovered id in `state_gmail.json` before the cursor moves.
+- Graph delta re-delivers an item when its read or flag state changes; 1.3 captured it again as a new record. A ledger hit is now a flag update, not a second capture.
+- IMAP change propagation ships as the UID-window reconcile on every server (`UID SEARCH ALL` for expunges, `FLAGS` for the newest 2000 live UIDs). The CONDSTORE / QRESYNC fast path is an optimization, not a correctness fix, and moves to Phase 1 `mail/sync.py`.
+- The bench measures the app's own cost against an in-process fake server (no network). Desktop first-paint timing needs the Phase 2 `window.__eb_timing` hook.

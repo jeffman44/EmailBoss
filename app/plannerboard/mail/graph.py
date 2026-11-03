@@ -41,12 +41,22 @@ WELL_KNOWN = {"inbox": "inbox", "sentitems": "sent", "drafts": "drafts", "delete
               "junkemail": "junk", "archive": "archive"}
 SELECT = ("id,receivedDateTime,sentDateTime,hasAttachments,internetMessageId,subject,"
           "bodyPreview,importance,conversationId,isRead,isDraft,body,from,toRecipients,"
-          "ccRecipients,replyTo,internetMessageHeaders")
+          "ccRecipients,replyTo,internetMessageHeaders,flag")
 FOLDERS = (("inbox", "inbox"), ("sent", "sentitems"))
 
 
 def _login_base(tenant: str) -> str:
     return f"https://login.microsoftonline.com/{tenant or 'common'}/oauth2/v2.0"
+
+
+def _graph_flags(item: dict) -> list[str]:
+    """Graph read / flag state as IMAP-style flag names (ledger shape)."""
+    out = []
+    if item.get("isRead"):
+        out.append("\\Seen")
+    if ((item.get("flag") or {}).get("flagStatus") or "") == "flagged":
+        out.append("\\Flagged")
+    return out
 
 
 def _recips(lst) -> list[Address]:
@@ -188,10 +198,19 @@ class GraphProvider(BaseProvider):
             return ConnResult(False, error=str(e))
 
     def fetch_new(self, state: ProviderState, limit: int = 200) -> Iterator[Message]:
+        """One capture cycle: due retries first, then each folder's delta.
+
+        Sync truth (2.0 Phase 0): ``@removed`` entries mark the ledger row
+        removed (1.3 dropped them on the floor); an item the ledger already
+        holds is a change (read / flag), recorded without a second capture;
+        an item that fails to convert goes to the retry queue."""
         n = 0
         cap = max(1, min(limit or self.max_per_cycle, self.max_per_cycle))
         errors = []
         try:
+            for msg in self._drain_retries():
+                n += 1
+                yield msg
             for kind, folder_id in FOLDERS:
                 try:
                     for msg in self._folder_delta(kind, folder_id, state, cap):
@@ -203,6 +222,29 @@ class GraphProvider(BaseProvider):
             self._record_fetch(n, "; ".join(errors) or None)
         except Exception as e:
             self._record_fetch(n, f"{type(e).__name__}: {e}")
+
+    def _delta_item(self, item: dict, kind: str):
+        """One delta entry -> a Message to capture, or None when it was a
+        removal or a change to something already captured."""
+        iid = item.get("id") or ""
+        sync = self.sync
+        if "@removed" in item:
+            if iid and sync is not None:
+                reason = ((item.get("@removed") or {}).get("reason") or "deleted")
+                sync.mark_removed(self.id, iid, f"graph {reason}")
+                if self.retry is not None:
+                    self.retry.done(iid)
+            return None
+        if item.get("isDraft"):
+            return None
+        if iid and sync is not None and sync.has(self.id, iid):
+            sync.set_flags(self.id, iid, _graph_flags(item))
+            return None
+        try:
+            return self._to_message(item, kind)
+        except Exception as e:
+            self.fetch_failed(iid, kind, e)
+            return None
 
     def _folder_delta(self, kind: str, folder_id: str, state: ProviderState, cap: int):
         fs = state.folder(kind)
@@ -217,12 +259,8 @@ class GraphProvider(BaseProvider):
         while url and count < cap:
             page = self._call("GET", url)
             for item in page.get("value") or []:
-                if "@removed" in item or item.get("isDraft"):
-                    continue
-                try:
-                    msg = self._to_message(item, kind)
-                except Exception as e:
-                    self.note_warning(f"message {item.get('id', '')[:20]} failed ({type(e).__name__}); skipped")
+                msg = self._delta_item(item, kind)
+                if msg is None:
                     continue
                 count += 1
                 yield msg
@@ -237,6 +275,22 @@ class GraphProvider(BaseProvider):
             # Capped mid-page: resume from the nextLink next cycle.
             fs["delta_link"] = url
             self.note_warning(f"{kind}: more than {cap} new messages, continuing next cycle")
+
+    def fetch_item(self, item_id: str, folder: str = "") -> Message | None:
+        try:
+            item = self._call("GET", f"/me/messages/{item_id}?" + urllib.parse.urlencode({"$select": SELECT}))
+        except RuntimeError as e:
+            if "-> 404" in str(e):
+                return None
+            raise
+        return self._to_message(item, folder or "inbox")
+
+    def server_counts(self) -> dict:
+        out = {}
+        for kind, folder_id in FOLDERS:
+            body = self._call("GET", f"/me/mailFolders/{folder_id}?$select=totalItemCount")
+            out[kind] = int(body.get("totalItemCount") or 0)
+        return out
 
     def _attachments(self, item: dict) -> list[Attachment]:
         atts = item.get("attachments")
@@ -267,7 +321,7 @@ class GraphProvider(BaseProvider):
         imid = item.get("internetMessageId") or ""
         received = parse_iso(item.get("receivedDateTime") or item.get("sentDateTime")) \
             or datetime.now(timezone.utc)
-        return Message(
+        msg = Message(
             id=safe_id(imid or f"graph:{item.get('id', '')}", prefix="graph"),
             received_at=received,
             subject=item.get("subject") or "",
@@ -288,6 +342,10 @@ class GraphProvider(BaseProvider):
             provider=self.id,
             provider_ref=item.get("id") or "",
         )
+        msg.sync_id = item.get("id") or ""
+        msg.sync_folder = folder
+        msg.sync_flags = _graph_flags(item)
+        return msg
 
     # ── mail client ──
     CAPS = {"folders": True, "list": True, "read": True, "flags": True, "move": True,
