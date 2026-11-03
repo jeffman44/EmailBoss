@@ -108,11 +108,11 @@ def test_release_workflow_signs_and_uploads_manifest():
 def test_bundle_entry_imports_the_package_not_a_loose_script():
     """1.3.1 shipped with start.py as the PyInstaller entry; its relative
     imports fail in a frozen build ("no known parent package")."""
-    spec = (APP_DIR / "scripts" / "build_pyinstaller.spec").read_text()
+    spec = (APP / "scripts" / "build_pyinstaller.spec").read_text()
     assert 'ENTRY = SPEC_DIR / "launch.py"' in spec
-    launch = (APP_DIR / "scripts" / "launch.py").read_text()
+    launch = (APP / "scripts" / "launch.py").read_text()
     assert "from plannerboard.start import main" in launch
     import subprocess, sys
-    r = subprocess.run([sys.executable, str(APP_DIR / "scripts" / "launch.py"), "--version"],
-                       capture_output=True, text=True, cwd=str(APP_DIR))
+    r = subprocess.run([sys.executable, str(APP / "scripts" / "launch.py"), "--version"],
+                       capture_output=True, text=True, cwd=str(APP))
     assert "Email Boss" in (r.stdout + r.stderr)
