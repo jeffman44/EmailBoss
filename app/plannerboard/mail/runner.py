@@ -134,6 +134,9 @@ class ProviderThread:
                         labels=getattr(msg, "sync_labels", None) or getattr(msg, "labels", None),
                         flags=getattr(msg, "sync_flags", None),
                         message_id=msg.internet_message_id)
+            retry = getattr(self.provider, "retry", None)
+            if retry is not None:
+                retry.done(sid)
         except Exception as e:  # noqa: BLE001
             note = getattr(self.provider, "note_warning", None)
             if callable(note):

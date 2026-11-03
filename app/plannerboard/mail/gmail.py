@@ -23,7 +23,7 @@ from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from typing import Iterator
 
-from .base import BaseProvider, ConnResult, ProviderState, folder_dict, guess_folder_kind, summary_dict
+from .base import BaseProvider, SkipItem, ConnResult, ProviderState, folder_dict, guess_folder_kind, summary_dict
 from .message import (Address, Attachment, Message, safe_filename, safe_id,
                       thread_key_from_ids)
 from .oauth import PENDING, TokenCache, http_request
@@ -233,7 +233,11 @@ class GmailProvider(BaseProvider):
                 try:
                     ids, hist_after = self._history_scan(last_hist)
                 except RuntimeError as e:
-                    # 404 = historyId too old; fall back to the dated window.
+                    # Only a 404 means historyId is too old. Any other error
+                    # (5xx, 429, auth) re-raises so the cursor stays put and the
+                    # skipped deletes and label moves are read next cycle.
+                    if not _is_not_found(e):
+                        raise
                     self.note_warning(f"history window lost ({e}); resyncing by date")
                     ids, hist_after = self._list_ids(), newest_hist
             else:
@@ -363,11 +367,16 @@ class GmailProvider(BaseProvider):
 
     def fetch_item(self, item_id: str, folder: str = "") -> Message | None:
         try:
-            return self._fetch_message(item_id)
+            msg = self._fetch_message(item_id)
         except Exception as e:
             if _is_not_found(e):
                 return None
             raise
+        if msg is None:
+            # Exists, but left INBOX and SENT (archived, drafts, spam). A later
+            # labelAdded INBOX queues it again.
+            raise SkipItem(item_id)
+        return msg
 
     def server_counts(self) -> dict:
         out = {}

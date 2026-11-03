@@ -192,6 +192,12 @@ class MailProvider(Protocol):
                      reply_to: Message | None = None) -> dict: ...
 
 
+class SkipItem(Exception):
+    """fetch_item: the item exists but is not something the capture path
+    keeps (for example a Gmail message that left INBOX and SENT). The retry
+    is dropped without marking the item removed."""
+
+
 class BaseProvider:
     """Shared plumbing: a status dict every provider reports through health()."""
     id = "base"
@@ -258,18 +264,28 @@ class BaseProvider:
             return
         for row in self.retry.due(limit):
             iid, folder = row["item_id"], row.get("folder") or ""
+            if self.sync.has(self.id, iid):
+                self.retry.done(iid)          # captured meanwhile by the normal path
+                continue
             try:
                 msg = self.fetch_item(iid, folder)
             except NotImplementedError:
                 return
+            except SkipItem:
+                self.retry.done(iid)
+                continue
             except Exception as e:
                 self.fetch_failed(iid, folder, e)
                 continue
-            self.retry.done(iid)
             if msg is None:
+                self.retry.done(iid)
                 self.sync.mark_removed(self.id, iid, "gone on retry")
                 continue
+            # The row is cleared only after the consumer took the message (the
+            # runner clears it on a successful write); a closed generator or a
+            # crash here leaves it queued.
             yield msg
+            self.retry.done(iid)
 
     def sync_status(self) -> dict:
         """Retry queue and last reconcile, for health."""

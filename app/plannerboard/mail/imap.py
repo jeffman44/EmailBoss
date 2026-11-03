@@ -402,7 +402,11 @@ FLAG_WINDOW = 2000
 def _fetch_one(conn, uid):
     """(raw_bytes, flags) for one UID. BODY.PEEK never marks a message read."""
     typ, data = conn.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[])")
-    if typ != "OK" or not data:
+    if typ != "OK":
+        # A NO / BAD is a failed fetch (retried), never "no such message".
+        raise RuntimeError(f"UID FETCH {uid} -> {typ}: "
+                           f"{(data[0] if data else b'')!r}"[:200])
+    if not data:
         return None, []
     raw, flags = None, []
     for item in data:
@@ -557,6 +561,9 @@ class _ImapCapture(BaseProvider):
         if prior.get("folder") and prior["folder"] != folder_name:
             self.note_warning(f"folder renamed {prior['folder']!r} -> {folder_name!r}; watermark reset")
             last_uid = 0
+            # Sync ids carry no mailbox name: the new mailbox's UIDs must not
+            # match the old one's rows, even when UIDVALIDITY is the same.
+            self._retire_epoch(folder_kind, None)
         uids = _search_uids(conn, last_uid, self.settings["initial_days"])
         cap = max(1, min(int(limit or 0) or self.settings["max_per_cycle"], self.settings["max_per_cycle"]))
         more = len(uids) > cap
@@ -602,22 +609,22 @@ class _ImapCapture(BaseProvider):
         msg.sync_id, msg.sync_folder, msg.sync_flags = msg.provider_ref, folder_kind, list(flags or [])
         return msg
 
-    def _retire_epoch(self, folder_kind: str, uidvalidity: int) -> int:
+    def _retire_epoch(self, folder_kind: str, uidvalidity: int | None) -> int:
         """UIDVALIDITY changed: every UID of the old epoch is meaningless now.
         Mark those ledger rows removed and drop their queued retries, so the
         re-index that follows is the only copy the store counts."""
         sync = self.sync
         if sync is None:
             return 0
-        keep = f"{folder_kind}:{int(uidvalidity)}:"
+        keep = f"{folder_kind}:{int(uidvalidity)}:" if uidvalidity is not None else None
         n = 0
         for sid in sync.live_ids(self.id, prefix=f"{folder_kind}:"):
-            if not sid.startswith(keep):
-                sync.mark_removed(self.id, sid, "uidvalidity reset")
+            if keep is None or not sid.startswith(keep):
+                sync.mark_removed(self.id, sid, "uidvalidity reset" if keep else "folder changed")
                 n += 1
         if self.retry is not None:
             for sid in self.retry.pending_ids():
-                if sid.startswith(f"{folder_kind}:") and not sid.startswith(keep):
+                if sid.startswith(f"{folder_kind}:") and (keep is None or not sid.startswith(keep)):
                     self.retry.done(sid)
         return n
 

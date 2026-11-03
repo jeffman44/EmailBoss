@@ -158,7 +158,7 @@ class SyncDB:
         """Merge a label delta into a ledger row. Returns the new row, or None
         when the item is not in the ledger (the caller decides whether to fetch)."""
         row = self.get(provider, item_id)
-        if not row:
+        if not row or row["removed"]:
             return None
         labels = (set(row["labels"]) | set(added or ())) - set(removed or ())
         folder = folder_fn(labels) if folder_fn else row["folder"]
