@@ -45,6 +45,20 @@ def _runner():
     return ext.get("mail_runner") if isinstance(ext, dict) else getattr(ext, "mail_runner", None)
 
 
+def _persist_config(over: dict) -> None:
+    """Merge `over` into the live config and write it to disk (real Runtime), or
+    into the dict a test harness installed."""
+    ext = rt()
+    if isinstance(ext, dict):
+        ext["cfg"] = deep_merge(ext.get("cfg") or {}, over)
+        return
+    conf = getattr(ext, "config", None)
+    if conf is None:
+        return
+    conf.update(over)
+    conf.write()
+
+
 def _board_port(cfg: dict) -> int:
     try:
         return int(((cfg or {}).get("server") or {}).get("port") or 8080)
@@ -150,9 +164,18 @@ def api_mail_run():
     return jsonify({"ok": True, "results": results})
 
 
+@bp.route("/api/mail/oauth/ready", methods=["GET"])
+def api_mail_oauth_ready():
+    """Is built-in sign-in available (shipped client ids present)?"""
+    from ..mail.gmail import oauth_defaults
+    d = oauth_defaults()
+    return jsonify({"ok": True, "gmail": bool(d["gmail_default_client_id"] and d["gmail_default_client_secret"]),
+                    "graph": bool(d["graph_default_client_id"])})
+
+
 @bp.route("/api/mail/oauth/start", methods=["POST"])
 def api_mail_oauth_start():
-    """Body: {provider: gmail|graph, settings:{client_id, tenant?}}. Returns
+    """Body: {provider: gmail|graph, settings:{client_id?, tenant?}} (client_id/tenant may also be top-level; blank client_id uses the built-in one). Returns
     the URL to open in the browser; the loopback redirect lands on
     /api/mail/oauth/callback on the board port."""
     v = view()
@@ -161,7 +184,13 @@ def api_mail_oauth_start():
     if provider not in OAUTH_PROVIDERS:
         return error_response(400, "provider must be gmail or graph")
     cfg = v.get("cfg") or {}
-    settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+    settings = dict(data.get("settings")) if isinstance(data.get("settings"), dict) else {}
+    # The wizard posts client_id / tenant at the top level; accept both shapes.
+    for k in ("client_id", "tenant"):
+        if not settings.get(k) and data.get(k):
+            settings[k] = data[k]
+    settings = {k: (val.strip() if isinstance(val, str) else val) for k, val in settings.items()
+                if val not in (None, "")}
     port = int(data.get("port") or _board_port(cfg))
     redirect_uri = f"http://127.0.0.1:{port}/api/mail/oauth/callback"
     try:
@@ -171,6 +200,13 @@ def api_mail_oauth_start():
         return error_response(400, str(e))
     except Exception as e:
         return error_response(500, f"{type(e).__name__}: {e}")
+    # Persist the pending choice BEFORE the user leaves for the consent page,
+    # so the callback can rebuild the same provider from saved config.
+    persist = {k: val for k, val in settings.items() if k in ("client_id", "tenant")}
+    try:
+        _persist_config({"mail": {"provider": provider, provider: persist}})
+    except Exception as e:
+        return error_response(500, f"could not save mail settings: {type(e).__name__}: {e}")
     return jsonify({"ok": True, "provider": provider, "url": flow["url"], "state": flow["state"],
                     "redirect_uri": redirect_uri})
 

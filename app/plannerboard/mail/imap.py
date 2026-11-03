@@ -29,6 +29,7 @@ import imaplib
 import mimetypes
 import re
 import socket
+import ssl
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
@@ -42,7 +43,7 @@ from .message import (Address, Message, PA_REQUIRED_KEYS, PA_OPTIONAL_KEYS,
                       text_from_html, thread_key_from_ids, validate_record)
 
 DEFAULT_MAX_PER_CYCLE = 50
-DEFAULT_INITIAL_DAYS = 2
+DEFAULT_INITIAL_DAYS = 30
 
 # ── Provider presets (imap_capture 106-141) ─────────────────────────────────
 PRESETS = {
@@ -101,6 +102,7 @@ def settings_from_config(mail_cfg: dict | None) -> dict:
         "initial_days": int(raw.get("initial_days") or DEFAULT_INITIAL_DAYS),
         "max_per_cycle": int(raw.get("max_per_cycle") or DEFAULT_MAX_PER_CYCLE),
         "ssl": bool(raw.get("ssl", True)),
+        "allow_insecure": raw.get("allow_insecure", False) is True,
         "auth_mode": (raw.get("auth_mode") or "password").strip().lower(),
     }
     return out
@@ -359,6 +361,15 @@ def connect(settings: dict, password: str | None, timeout=45, oauth_token: str |
             conn = imaplib.IMAP4_SSL(host, port)
     else:
         conn = imaplib.IMAP4(host, port, timeout=timeout)
+        # Never LOGIN in the clear: upgrade with STARTTLS, or refuse unless the
+        # config explicitly says allow_insecure: true.
+        caps = {(c.decode() if isinstance(c, bytes) else str(c)).upper() for c in (getattr(conn, "capabilities", None) or ())}
+        if "STARTTLS" in caps:
+            conn.starttls(ssl_context=ssl.create_default_context())
+        elif settings.get("allow_insecure") is not True:
+            _close(conn)
+            raise ValueError("Email Boss will not send your password over an unencrypted connection. "
+                             "Turn on SSL for the incoming server (or set allow_insecure: true).")
     if (settings.get("auth_mode") or "password") == "xoauth2":
         if not oauth_token:
             raise ValueError("auth_mode is xoauth2 but no access token is available")
@@ -756,6 +767,14 @@ def parse_list_line(line: bytes) -> dict | None:
             "noselect": "\\noselect" in attrs.lower()}
 
 
+class MailRefused(RuntimeError):
+    """The server cannot do this safely (or the ref is stale). The API answers
+    409 with this message as-is, so keep it a plain sentence."""
+
+
+NO_TRASH_MSG = "This mail server has no Trash folder, so Email Boss will not delete"
+
+
 def _ref(folder: str, uidvalidity: int, uid: int) -> str:
     return f"{int(uidvalidity)}:{int(uid)}:{folder}"
 
@@ -820,6 +839,19 @@ class _ImapClient:
             uv = 0
         self._cfolder = (folder, readonly, uv)
         return uv
+
+    def _open_checked(self, conn, folder: str, uv_expected: int) -> int:
+        """Writable SELECT that always asks the server for the live
+        UIDVALIDITY and refuses (409) when the ref is from an older epoch."""
+        self._cfolder = None
+        uv = self._open(conn, folder, readonly=False)
+        if uv_expected and uv and uv != uv_expected:
+            raise MailRefused("This folder was rebuilt on the mail server. Reload the list and try again.")
+        return uv
+
+    @staticmethod
+    def _caps(conn) -> set:
+        return {(c.decode() if isinstance(c, bytes) else str(c)).upper() for c in (conn.capabilities or ())}
 
     def _resolve_ref(self, ref: str) -> tuple[str, int, int]:
         """(folder, uidvalidity, uid) from a client ref or a capture-path
@@ -961,7 +993,7 @@ class _ImapClient:
         with self._client() as conn:
             uv = self._open(conn, folder, readonly=True)
             if uv_expected and uv != uv_expected:
-                raise RuntimeError(f"folder {folder!r} was rebuilt (UIDVALIDITY changed); reload the list")
+                raise MailRefused("This folder was rebuilt on the mail server. Reload the list and try again.")
             raw, flags = _fetch_one(conn, uid)
             if not raw:
                 return None
@@ -974,9 +1006,9 @@ class _ImapClient:
 
     # ── flags / move / delete ──
     def set_flags(self, ref: str, read: bool | None = None, flagged: bool | None = None) -> bool:
-        folder, _uv, uid = self._resolve_ref(ref)
+        folder, uv_exp, uid = self._resolve_ref(ref)
         with self._client() as conn:
-            self._open(conn, folder, readonly=False)
+            self._open_checked(conn, folder, uv_exp)
             ok = True
             for value, flag in ((read, "\\Seen"), (flagged, "\\Flagged")):
                 if value is None:
@@ -986,26 +1018,32 @@ class _ImapClient:
             return ok
 
     def move_message(self, ref: str, folder_id: str) -> str | None:
-        folder, _uv, uid = self._resolve_ref(ref)
+        folder, uv_exp, uid = self._resolve_ref(ref)
         dest = folder_id
         if dest in FOLDER_KINDS_SET:
             resolved = self._folder_of_kind(dest)
             if not resolved:
+                if dest == "trash":
+                    raise MailRefused(NO_TRASH_MSG)
                 raise RuntimeError(f"this mailbox has no {dest} folder; pick a folder by name")
             dest = resolved
         with self._client() as conn:
-            self._open(conn, folder, readonly=False)
-            caps = {(c.decode() if isinstance(c, bytes) else str(c)).upper() for c in (conn.capabilities or ())}
+            self._open_checked(conn, folder, uv_exp)
+            caps = self._caps(conn)
             if "MOVE" in caps:
                 typ, data = conn.uid("MOVE", str(uid), _quote_folder(dest))
                 if typ != "OK":
                     raise RuntimeError(f"MOVE failed: {(data[0] if data else b'').decode('utf-8', 'replace')}")
             else:
+                # COPY + \\Deleted + EXPUNGE is only safe as UID EXPUNGE of this one
+                # message; a bare EXPUNGE would also remove anything else flagged.
+                if "UIDPLUS" not in caps:
+                    raise MailRefused("This mail server cannot move messages safely, so Email Boss will not move this one.")
                 typ, data = conn.uid("COPY", str(uid), _quote_folder(dest))
                 if typ != "OK":
                     raise RuntimeError(f"COPY failed: {(data[0] if data else b'').decode('utf-8', 'replace')}")
                 conn.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
-                conn.expunge()
+                conn.uid("EXPUNGE", str(uid))
             new_ref = None
             try:
                 blob = b" ".join(x for x in (conn.response("COPYUID")[1] or []) if isinstance(x, bytes))
@@ -1017,16 +1055,16 @@ class _ImapClient:
             return new_ref
 
     def delete_message(self, ref: str) -> bool:
-        folder, _uv, uid = self._resolve_ref(ref)
+        """Move to Trash. Never a permanent delete: no Trash folder (or already
+        in Trash) means a 409, not an EXPUNGE."""
+        folder, _uv, _uid = self._resolve_ref(ref)
         trash = self._folder_of_kind("trash")
-        if trash and trash != folder:
-            self.move_message(ref, trash)
-            return True
-        with self._client() as conn:
-            self._open(conn, folder, readonly=False)
-            typ, _ = conn.uid("STORE", str(uid), "+FLAGS", "(\\Deleted)")
-            conn.expunge()
-            return typ == "OK"
+        if not trash:
+            raise MailRefused(NO_TRASH_MSG)
+        if trash == folder:
+            raise MailRefused("This message is already in Trash. Email Boss will not delete it for good.")
+        self.move_message(ref, trash)
+        return True
 
     # ── drafts / send ──
     def _sender(self):

@@ -47,7 +47,7 @@ python -m pytest -q                      # all green before you start
 PB_LICENSE_DEV=1 python -m plannerboard --port 8080 --no-tray
 ```
 
-Open `http://127.0.0.1:8080`. The setup wizard runs until
+Open `http://127.0.0.1:8080`. The three-screen setup wizard (you and your email, your work, done) runs until
 `<data root>/plannerboard.json` exists. The data root is `$PB_DATA_ROOT` or
 `~/EmailBoss`; the database, config, mail cache, backups and logs all live
 there and never inside the install.

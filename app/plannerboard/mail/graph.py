@@ -58,6 +58,8 @@ def _recips(lst) -> list[Address]:
     return out
 
 
+DEFAULT_INITIAL_DAYS = 30
+
 class GraphProvider(BaseProvider):
     id = "graph"
     label = "Microsoft 365 / Outlook.com (Graph API)"
@@ -65,7 +67,7 @@ class GraphProvider(BaseProvider):
         {"key": "client_id", "label": "App (client) ID", "type": "text",
          "help": "An Azure app registration with a public client redirect on http://127.0.0.1."},
         {"key": "tenant", "label": "Tenant", "type": "text", "default": "common"},
-        {"key": "initial_days", "label": "Days of history on first sync", "type": "number", "default": 2},
+        {"key": "initial_days", "label": "Days of history on first sync", "type": "number", "default": DEFAULT_INITIAL_DAYS},
     ]
 
     def __init__(self, cfg: dict, cache_dir=None, http=http_request, token_cache: TokenCache | None = None):
@@ -74,7 +76,14 @@ class GraphProvider(BaseProvider):
         g = dict(mail_cfg.get("graph") or {})
         self.client_id = (g.get("client_id") or "").strip()
         self.tenant = (g.get("tenant") or "common").strip() or "common"
-        self.initial_days = int(g.get("initial_days") or 2)
+        self.builtin = False
+        if not self.client_id:
+            # Built-in public client (PKCE, no secret), tenant "common".
+            from .gmail import oauth_defaults
+            did = oauth_defaults()["graph_default_client_id"]
+            if did:
+                self.client_id, self.builtin = did, True
+        self.initial_days = int(g.get("initial_days") or DEFAULT_INITIAL_DAYS)
         self.max_per_cycle = int(g.get("max_per_cycle") or 100)
         self.cache_dir = cache_dir
         self.http = http

@@ -195,7 +195,7 @@
     },
     {
       "id": "sla",
-      "label": "SLA"
+      "label": "Reply by"
     },
     {
       "id": "quote",
@@ -213,7 +213,7 @@
     }
   ],
   "business_hours": {
-    "tz": "America/New_York",
+    "tz": "",
     "start": 8,
     "end": 17,
     "days": [
@@ -611,7 +611,7 @@
         },
         {
           "id": "sla",
-          "label": "SLA",
+          "label": "Reply by",
           "match": {
             "date_type": "sla"
           }

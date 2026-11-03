@@ -1,7 +1,7 @@
 from plannerboard import profession, workflows as wfm
 
 EXPECTED = {"general", "hvac_contractor", "construction_gc", "property_management", "legal", "real_estate",
-            "insurance_agency", "consulting", "it_msp", "recruiting"}
+            "insurance_agency", "consulting", "it_msp", "recruiting", "trades", "events", "nonprofit"}
 
 
 def test_all_templates_ship_and_validate():
@@ -19,7 +19,8 @@ def test_all_templates_ship_and_validate():
                 assert st["role"] in wfm.ROLES, (tid, wf["id"], st["id"])
             assert wfm.entry_stage(wdoc, wf["id"]) in [s["id"] for s in wf["stages"]]
         assert doc["triage"]["classifications"]
-        assert doc["business_hours"]["tz"]
+        assert doc["business_hours"]["tz"] == ""      # "" = use the config / OS timezone
+        assert doc["features"].keys() >= {"money", "game_layer", "analytics"}
         assert doc["prompt_profile"]["industry"]
         assert doc["entity"]["project"] and doc["entity"]["client"]
 

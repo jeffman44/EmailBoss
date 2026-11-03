@@ -37,8 +37,12 @@ def api_create_subtask(proj_id):
         metadata.setdefault("origin_source", source)
         source = "system"
     date_type = data.get("date_type") or ("sla" if data.get("sla_hours") else "follow_up")
+    follow_up_date = data.get("follow_up_date")
+    if not follow_up_date and date_type == "follow_up":
+        # Default to today's LOCAL date (config timezone), never UTC.
+        follow_up_date = db.hours.today()
     st_id = db.add_subtask(
-        proj_id, text, date_type=date_type, follow_up_date=data.get("follow_up_date"),
+        proj_id, text, date_type=date_type, follow_up_date=follow_up_date,
         sla_hours=data.get("sla_hours"), priority=data.get("priority") or 0, source=source,
         category=data.get("category") or "", created=data.get("created"), sla_type=data.get("sla_type"),
         sla_created=data.get("sla_created"), metadata=metadata,

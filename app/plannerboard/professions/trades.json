@@ -1,0 +1,523 @@
+{
+  "id": "trades",
+  "label": "Trades and Repairs",
+  "description": "Plumbing, electrical, handyman: repairs, estimates and regular maintenance, in plain words.",
+  "icon": "🔧",
+  "entity": {
+    "project": "Job",
+    "projects": "Jobs",
+    "client": "Customer",
+    "location": "Address",
+    "contact": "Contact",
+    "quote": "Estimate"
+  },
+  "work_types": [
+    {
+      "id": "repair",
+      "label": "Repair",
+      "short": "FIX",
+      "color": "#4fc3f7",
+      "workflow_id": "repair"
+    },
+    {
+      "id": "estimate",
+      "label": "Estimate",
+      "short": "EST",
+      "color": "#f0b429",
+      "workflow_id": "estimate"
+    },
+    {
+      "id": "maintenance",
+      "label": "Maintenance",
+      "short": "MNT",
+      "color": "#7bd88f",
+      "workflow_id": "maintenance"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "address",
+      "label": "Address",
+      "type": "text",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "job_no",
+      "label": "Job #",
+      "type": "text",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "job_date",
+      "label": "Job date",
+      "type": "date",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Estimate",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Invoiced",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    }
+  ],
+  "id_patterns": [
+    {
+      "key": "job_no",
+      "label": "Job #",
+      "regex": "\\b(?:Job|WO|Invoice)\\s*#?\\s*:?\\s*(\\d{3,8})\\b",
+      "unique_match": true
+    }
+  ],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "Reply by"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "leak",
+      "install",
+      "replace",
+      "repair",
+      "estimate",
+      "invoice",
+      "service call"
+    ],
+    "acronyms": [],
+    "scope_phrases": [
+      "parts and labor",
+      "service call fee"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "plumbing, electrical and repair trades",
+    "role_noun": "tradesperson"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "job_no"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": false,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "repair",
+        "label": "Repair",
+        "icon": "🔧",
+        "color": "#4fc3f7",
+        "stages": [
+          {
+            "id": "new",
+            "label": "New",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Reply to the customer",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "scheduled",
+            "label": "Scheduled",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Confirm the visit with the customer",
+              "date_type": "follow_up",
+              "days": 1
+            }
+          },
+          {
+            "id": "waiting_parts",
+            "label": "Waiting on parts",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "done_unpaid",
+            "label": "Done, not paid",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Send the invoice",
+              "date_type": "follow_up",
+              "days": 2
+            }
+          },
+          {
+            "id": "cold",
+            "label": "Dormant",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Paid",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "new",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "estimate",
+        "label": "Estimate",
+        "icon": "📝",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "estimate_needed",
+            "label": "Estimate needed",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Send the estimate",
+              "date_type": "sla",
+              "sla_hours": 8
+            }
+          },
+          {
+            "id": "estimate_sent",
+            "label": "Estimate sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up on the estimate",
+              "date_type": "follow_up",
+              "days": 4
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "accepted",
+            "label": "Accepted",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Schedule the job",
+              "date_type": "follow_up",
+              "days": 2
+            }
+          },
+          {
+            "id": "cold",
+            "label": "Dormant",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "estimate_needed",
+        "won_transition": {
+          "from": "estimate_sent",
+          "to": "accepted"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "maintenance",
+        "label": "Maintenance",
+        "icon": "🛠️",
+        "color": "#7bd88f",
+        "stages": [
+          {
+            "id": "due",
+            "label": "Due",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Book the visit",
+              "date_type": "follow_up",
+              "days": 3
+            }
+          },
+          {
+            "id": "booked",
+            "label": "Booked",
+            "role": "in_progress",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "due",
+        "won_transition": null,
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "new",
+            "estimate_needed",
+            "due",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "Reply by",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

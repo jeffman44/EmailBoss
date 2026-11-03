@@ -31,7 +31,13 @@ def test_full_flow_from_setup_to_assistant(data_root):
     rt = app.extensions["pb"]
 
     # 1. first run: wizard, then setup with the full body
-    assert b"Setup" in c.get("/").data
+    page = c.get("/").data
+    assert b"Setup" in page
+    setup_page = c.get("/setup").data if c.get("/setup").status_code == 200 else page
+    for blob in (page, setup_page):
+        assert b"developer mode" not in blob.lower()
+    assert b"Sign in with Google" in setup_page or b"Sign in with Google" in page
+    assert b"dev_skip" not in setup_page
     r = c.post("/api/setup", json={
         "user": {"name": "Pat Example", "email": "pat@example.com", "company": "Example Co", "role": "Owner"},
         "profession": "general", "paths": {"data_root": str(data_root)},

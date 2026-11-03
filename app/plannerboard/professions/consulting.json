@@ -66,7 +66,7 @@
     },
     {
       "key": "quote_amount",
-      "label": "Quoted",
+      "label": "Proposal",
       "type": "money",
       "show_on": [
         "card",
@@ -131,7 +131,7 @@
     },
     {
       "id": "sla",
-      "label": "SLA"
+      "label": "Reply by"
     },
     {
       "id": "quote",
@@ -140,7 +140,7 @@
   ],
   "teams": [],
   "business_hours": {
-    "tz": "America/New_York",
+    "tz": "",
     "start": 8,
     "end": 17,
     "days": [
@@ -228,8 +228,8 @@
     "quote_amount"
   ],
   "features": {
-    "money": true,
-    "game_layer": true,
+    "money": false,
+    "game_layer": false,
     "analytics": true
   },
   "workflows": {
@@ -435,7 +435,7 @@
         },
         {
           "id": "sla",
-          "label": "SLA",
+          "label": "Reply by",
           "match": {
             "date_type": "sla"
           }

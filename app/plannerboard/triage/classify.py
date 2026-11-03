@@ -47,6 +47,8 @@ FAMILY_FALLBACK = {
 
 _REQUEST_RE = re.compile(r"\b(quote|pricing|price|estimate|proposal|how much|rfp|rfq|bid|can you (?:help|send|provide|look)|"
                          r"please (?:send|provide|advise|quote)|request(?:ing)?|need(?:s)? (?:a|an|your)|would like to)\b", re.I)
+_BID_RE = re.compile(r"\b(invitation to bid|invite[sd]? (?:you )?to bid|request for (?:bids?|quotations?|quotes?)|bids? (?:are )?due|itb|rfq|ifb)\b", re.I)
+_PROPOSAL_REQ_RE = re.compile(r"\b(request for proposals?|rfp|please (?:send|submit|provide) (?:a |your )?proposal|proposal request)\b", re.I)
 _APPROVAL_RE = re.compile(r"\b(approved|go ahead|please proceed|move forward|green light|signed|accept(?:ed)? (?:the|your))\b", re.I)
 _VENDOR_RE = re.compile(r"\b(order|shipment|shipped|delivered|tracking|invoice|backorder|lead time|availability|packing slip|"
                         r"quote attached|our quote|pricing attached)\b", re.I)
@@ -114,6 +116,12 @@ def rules_classify(email_obj: dict, profession: dict | None, cfg: dict | None) -
         return out("internal", _QUESTION_RE.search(body) is not None, 1, "Review and respond internally")
     if signals.get("approval") or _APPROVAL_RE.search(text):
         return out("approval", True, 1, "Confirm the go-ahead and start the next step")
+    if "bid_invitation" in labels and _BID_RE.search(text):
+        return {"classification": "bid_invitation", "needs_reply": True, "follow_up_days": 2,
+                "auto_action": "Decide whether to bid and reply before the due date", "confidence_note": "rules"}
+    if "proposal_request" in labels and _PROPOSAL_REQ_RE.search(text):
+        return {"classification": "proposal_request", "needs_reply": True, "follow_up_days": 2,
+                "auto_action": "Send the proposal or ask what is needed", "confidence_note": "rules"}
     if _REQUEST_RE.search(text):
         return out("request", True, 2, "Respond with the requested information or a proposal")
     if _SCHED_RE.search(text):

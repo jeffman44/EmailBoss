@@ -204,18 +204,31 @@ def test_clock_rollback_does_not_extend_grace(issuer, meta, clock):
 
 
 def test_activate_heartbeat_deactivate_with_fake_transport(issuer, meta, clock):
+    import hashlib
+    import hmac
+    import time as _time
     fp = machine_fingerprint()
     calls = []
+
+    def _check_proof(body, path):
+        assert "key" not in body and abs(body["ts"] - _time.time()) < 5
+        device_key = hashlib.sha256(("5e" * 32).encode()).hexdigest().encode()
+        msg = f"lic_test1|{fp}|{body['ts']}|{path}".encode()
+        assert body["proof"] == hmac.new(device_key, msg, hashlib.sha256).hexdigest()
 
     def transport(url, body, timeout):
         calls.append((url, body))
         if url.endswith("/v1/activate"):
             assert body["key"] and body["fingerprint"] == fp and body["app_version"] == "1.2.3"
-            return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30))}
+            return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30)),
+                         "device_secret": "5e" * 32}
         if url.endswith("/v1/heartbeat"):
-            assert body == {"lid": "lic_test1", "fingerprint": fp, "app_version": "1.2.3"}
+            assert {k: body[k] for k in ("lid", "fingerprint", "app_version")} == \
+                {"lid": "lic_test1", "fingerprint": fp, "app_version": "1.2.3"}
+            _check_proof(body, "/v1/heartbeat")
             return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30))}
         if url.endswith("/v1/deactivate"):
+            _check_proof(body, "/v1/deactivate")
             return 200, {"ok": True, "released": True}
         raise AssertionError(url)
 
@@ -258,6 +271,32 @@ def test_activate_heartbeat_deactivate_with_fake_transport(issuer, meta, clock):
     assert c.deactivate()["ok"] is True
     assert c.status(use_cache=False)["status"] == "unlicensed"
     assert meta.get("license.key") == "" and meta.get("license.activation") == ""
+    assert meta.get("license.device_secret") == ""
+
+
+def test_sign_request_shape_and_legacy_upgrade(issuer, meta, clock):
+    import hashlib
+    import hmac
+    fp = machine_fingerprint()
+    sent = []
+
+    def transport(url, body, timeout):
+        sent.append((url, body))
+        assert url.endswith("/v1/heartbeat") and body["key"]          # legacy: key once, no proof
+        return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30)),
+                     "device_secret": "ab" * 32}
+
+    c = make_client(meta, clock, transport=transport)
+    meta.set("license.key", issuer.key())
+    meta.set("license.activation", issuer.activation(fp, clock() + timedelta(days=30)))
+    out = c.sign_request("/v1/ai/complete")
+    assert len(sent) == 1 and meta.get("license.device_secret") == "ab" * 32
+    key = hashlib.sha256(("ab" * 32).encode()).hexdigest().encode()
+    assert out["proof"] == hmac.new(key, f"lic_test1|{fp}|{out['ts']}|/v1/ai/complete".encode(),
+                                    hashlib.sha256).hexdigest()
+    c.sign_request("/v1/ai/balance")
+    assert len(sent) == 1                                              # no second upgrade
+
 
 
 def test_activate_rejects_bad_key_before_network(issuer, meta, clock):
@@ -388,3 +427,41 @@ def test_release_channel_rejects_dev_signed_keys(monkeypatch):
     token = Issuer().key()
     with pytest.raises(LicenseError):
         lc.verify_token(token, lc.load_public_key(lc.DEFAULT_PUBLIC_KEY_PEM))
+
+
+def test_start_trial_stores_key_and_activation(issuer, meta, clock):
+    fp = machine_fingerprint()
+    key = issuer.key(plan="trial", seats=1, expires=_iso(T0 + timedelta(days=14)))
+
+    def transport(url, body, timeout):
+        assert url.endswith("/v1/trial")
+        assert body == {"email": "sam@example.test", "fingerprint": fp, "app_version": "1.2.3"}
+        return 200, {"ok": True, "key": key,
+                     "activation": issuer.activation(fp, clock() + timedelta(days=30), plan="trial")}
+
+    c = make_client(meta, clock, transport=transport)
+    res = c.start_trial("sam@example.test")
+    assert res["key"] == key and res["activation"]["fingerprint"] == fp
+    assert meta.get("license.key") == key and meta.get("license.activation")
+    st = c.status(use_cache=False)
+    assert st["status"] == "ok" and st["trial"] is True and st["days_left"] == 14
+
+
+def test_start_trial_server_error_surfaces(issuer, meta, clock):
+    def transport(url, body, timeout):
+        return 409, {"detail": {"code": "trial_used", "message": "This email has already had a free trial."}}
+
+    c = make_client(meta, clock, transport=transport)
+    with pytest.raises(LicenseError) as ei:
+        c.start_trial("sam@example.test")
+    assert ei.value.code == "trial_used" and ei.value.http_status == 409
+    assert not meta.get("license.key")
+    with pytest.raises(LicenseError):
+        c.start_trial("not-an-email")
+
+
+def test_status_not_trial_for_paid(issuer, meta, clock):
+    c = make_client(meta, clock)
+    meta.set("license.key", issuer.key())
+    st = c.status(use_cache=False)
+    assert st["trial"] is False and st["days_left"] == 0

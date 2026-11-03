@@ -21,9 +21,13 @@ Status never changes automatically except through these cascades, each of
 which is triggered by the user's own click.
 """
 
+import csv
+import io
+import re
 import sqlite3
+from datetime import date
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 from .. import ladder
 from .. import workflows as wfm
@@ -91,6 +95,122 @@ def api_create_project():
     proj = db.get_project(pid)
     db.append_event("project_created", {"project_id": pid, "name": proj.get("name", "")})
     return jsonify({"ok": True, "project": proj}), 201
+
+
+_CSV_ALIASES = {
+    "name": ("name", "project", "title", "job", "matter", "deal", "ticket", "account", "subject"),
+    "client": ("client", "customer", "company", "organization", "organisation", "tenant", "insured", "person"),
+    "email": ("contactemail", "email", "emailaddress", "contact", "clientemail", "customeremail"),
+    "stage": ("stage", "status", "state"),
+    "due": ("duedate", "due", "deadline", "date", "followupdate", "followup"),
+    "notes": ("notes", "note", "comments", "comment", "description", "details"),
+}
+MAX_IMPORT_ROWS = 2000
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _csv_key(h):
+    return re.sub(r"[^a-z0-9]", "", (h or "").lower())
+
+
+def _canon_row(raw):
+    """Map one input row onto name/client/email/stage/due/notes."""
+    by_key = {_csv_key(k): (v if v is not None else "") for k, v in (raw or {}).items() if k}
+    out = {}
+    for field, aliases in _CSV_ALIASES.items():
+        for a in aliases:
+            if by_key.get(a) not in (None, ""):
+                out[field] = str(by_key[a]).strip()
+                break
+    return out
+
+
+def _match_stage(doc, text):
+    """(workflow_id, stage_id) for a stage typed by a person, else (None, None)."""
+    want = re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    if not want:
+        return None, None
+    for wf in doc.get("workflows") or []:
+        for st in wf.get("stages") or []:
+            if want in (re.sub(r"[^a-z0-9]", "", str(st.get("id", "")).lower()),
+                        re.sub(r"[^a-z0-9]", "", str(st.get("label", "")).lower())):
+                return wf.get("id"), st.get("id")
+    return None, None
+
+
+@bp.route("/api/projects/import-csv", methods=["POST"])
+def api_import_projects_csv():
+    """"Add many from a spreadsheet". Accepts multipart (`file` = a .csv) or
+    JSON {rows: [{...}]} or {csv: "text"}. Columns (any common spelling):
+    name, client, contact email, stage, due date, notes. Existing project with
+    the same name and client is skipped. Returns {ok, total, created, skipped,
+    errors: [{row, error}], projects: [ids]}. Money is never imported."""
+    from ..triage.deadlines import parse_date_text
+    db = store()
+    rows = None
+    if request.files.get("file"):
+        raw = request.files["file"].read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+        rows = list(csv.DictReader(io.StringIO(text)))
+    else:
+        data = body()
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data.get("rows"), list):
+            rows = data["rows"]
+        elif isinstance(data.get("csv"), str):
+            rows = list(csv.DictReader(io.StringIO(data["csv"])))
+    if rows is None:
+        return error_response(400, "send a CSV file, or JSON with rows")
+    if len(rows) > MAX_IMPORT_ROWS:
+        return error_response(400, f"too many rows (max {MAX_IMPORT_ROWS})")
+    doc = db.wf_doc()
+    default_wid = wfm.default_workflow_id(doc)
+    existing = {((p.get("name") or "").strip().lower(), (p.get("client") or "").strip().lower())
+                for p in db.all_projects(include_archived=True)} if hasattr(db, "all_projects") else set()
+    created, skipped, errors, ids = 0, 0, [], []
+    today = date.fromisoformat(db.hours.today())
+    for i, raw in enumerate(rows, start=2):   # row 1 is the header
+        try:
+            r = _canon_row(raw if isinstance(raw, dict) else {})
+            name = r.get("name") or ""
+            if not name:
+                errors.append({"row": i, "error": "no name"})
+                continue
+            client = r.get("client", "")
+            if (name.lower(), client.lower()) in existing:
+                skipped += 1
+                continue
+            wid, status = _match_stage(doc, r.get("stage"))
+            if not wid:
+                wid = default_wid
+                status = wfm.entry_stage(doc, wid)
+            email = r.get("email", "")
+            contacts = [{"name": "", "email": email, "role": ""}] if _EMAIL_RE.match(email) else []
+            due = parse_date_text(r.get("due", ""), today) if r.get("due") else ""
+            kd = {"client": client} if client else {}
+            notes = [{"text": r["notes"], "time": db._note_time("import")}] if r.get("notes") else None
+            pid = db.create_project(name, workflow_id=wid, status=status, contacts=contacts or None,
+                                    key_details=kd, source="import", notes=notes,
+                                    follow_up_date=due or None)
+            if due:
+                db.add_subtask(pid, "Due", date_type="deadline", follow_up_date=due, source="manual")
+            if status == wfm.entry_stage(doc, wid):
+                try:
+                    ladder.ensure_entry_stage_task(db, pid)
+                except Exception:
+                    pass
+            existing.add((name.lower(), client.lower()))
+            created += 1
+            ids.append(pid)
+        except Exception as e:  # one bad row never sinks the batch
+            errors.append({"row": i, "error": f"{type(e).__name__}: {e}"[:200]})
+    db.append_event("import_csv", {"created": created, "skipped": skipped, "errors": len(errors)})
+    return jsonify({"ok": True, "total": len(rows), "created": created, "skipped": skipped,
+                    "errors": errors, "projects": ids}), 200
 
 
 @bp.route("/api/projects/<proj_id>", methods=["PUT"])

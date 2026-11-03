@@ -132,3 +132,46 @@
   .mail-list { max-height: 40vh; border-right: 0; border-bottom: 1px solid #1f1f23; }
   .mail-read { min-height: 50vh; }
 }
+
+/* toasts with an Undo button */
+.mail-toasts { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 100002; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.mail-toast {
+  display: flex; align-items: center; gap: 12px; background: #1b1b20; border: 1px solid #3a3a42; color: #f5f3ed;
+  border-radius: 6px; padding: 9px 12px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+}
+.mail-toast-btn { background: none; border: 0; color: #8fe3cd; font-weight: 600; cursor: pointer; font-size: 13px; padding: 0 4px; }
+.mail-toast-btn:hover { text-decoration: underline; }
+.mail-toast-x { background: none; border: 0; color: #6b6966; cursor: pointer; font-size: 16px; line-height: 1; }
+
+/* reading pane: hidden remote images */
+.mail-img-bar {
+  align-items: center; gap: 8px; padding: 6px 16px; background: #1d1a10; border-bottom: 1px solid #3a3320;
+  color: #f0b429; font-size: 12px;
+}
+
+/* composer notices (amber for Reply-To, neutral otherwise) */
+.mc-rt, .mc-notice {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 12px; font-size: 12px;
+  border-bottom: 1px solid #16161a; color: #b8b4ac; background: #141416;
+}
+.mc-rt { background: #2a2208; color: #f0b429; border-bottom-color: #4a3a10; }
+.mc-notice .mc-link { background: none; border: 0; color: #8fe3cd; cursor: pointer; font-size: 12px; text-decoration: underline; }
+.mc-foot .mc-link { background: none; border: 0; color: #8fe3cd; cursor: pointer; font-size: 11px; text-decoration: underline; }
+
+/* Drafts: the board outbox group */
+.mail-group {
+  padding: 6px 12px; font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: .6px;
+  text-transform: uppercase; color: #6b6966; background: #0c0c0e; border-top: 1px solid #1f1f23; border-bottom: 1px solid #1f1f23;
+}
+.mail-row.local .mr-actions { grid-column: 1 / -1; display: flex; gap: 6px; margin-top: 4px; }
+
+/* keyboard cheat sheet */
+.mail-keys-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 100001; display: none; align-items: center; justify-content: center; }
+.mail-keys-overlay.open { display: flex; }
+.mail-keys-card { background: #0f0f11; border: 1px solid #2a2a30; border-radius: 8px; padding: 16px 20px; min-width: 300px; color: #e0ddd5; }
+.mail-keys-card h3 { margin: 0 0 10px 0; font-size: 13px; font-weight: 600; }
+.mail-keys-row { display: flex; gap: 14px; align-items: center; padding: 3px 0; font-size: 12px; }
+.mail-keys-row kbd {
+  min-width: 52px; text-align: center; background: #1b1b20; border: 1px solid #3a3a42; border-radius: 4px;
+  padding: 2px 6px; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #f5f3ed;
+}

@@ -18,6 +18,47 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 
 
+_SYS_TZ = None
+
+
+def system_timezone_name():
+    """IANA name of the OS timezone (no tzlocal). TZ env, /etc/timezone, the
+    /etc/localtime link, then the zone abbreviation if it happens to be a valid
+    key; UTC when nothing resolves. Cached."""
+    global _SYS_TZ
+    if _SYS_TZ is not None:
+        return _SYS_TZ
+
+    def ok(n):
+        if not n or ZoneInfo is None:
+            return False
+        try:
+            ZoneInfo(n)
+            return True
+        except Exception:
+            return False
+
+    import os
+    cands = [os.environ.get("TZ", "").lstrip(":")]
+    try:
+        with open("/etc/timezone", encoding="utf-8") as fh:
+            cands.append(fh.read().strip())
+    except OSError:
+        pass
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "zoneinfo/" in link:
+            cands.append(link.split("zoneinfo/", 1)[1])
+    except OSError:
+        pass
+    try:
+        cands.append(datetime.now().astimezone().tzinfo.tzname(None) or "")
+    except Exception:
+        pass
+    _SYS_TZ = next((c for c in cands if ok(c)), "UTC")
+    return _SYS_TZ
+
+
 def _zone(name):
     if ZoneInfo is not None and name:
         try:
@@ -29,7 +70,9 @@ def _zone(name):
 
 class BusinessHours:
     def __init__(self, tz="UTC", start=8, end=17, days=(0, 1, 2, 3, 4)):
-        self.tz_name = tz or "UTC"
+        # "" means "use the configured / OS timezone" (the config timezone is
+        # merged in by from_profession); UTC only when nothing resolves.
+        self.tz_name = tz or system_timezone_name()
         self.tz = _zone(self.tz_name)
         self.start = int(start)
         self.end = int(end)
@@ -41,8 +84,10 @@ class BusinessHours:
 
     @classmethod
     def from_profession(cls, prof):
+        """Zone order: business_hours.tz, then prof["timezone"] (the app copies
+        config.timezone there), then the OS zone."""
         bh = (prof or {}).get("business_hours") or {}
-        return cls(tz=bh.get("tz") or "UTC", start=bh.get("start", 8),
+        return cls(tz=bh.get("tz") or (prof or {}).get("timezone") or "", start=bh.get("start", 8),
                    end=bh.get("end", 17), days=bh.get("days") or (0, 1, 2, 3, 4))
 
     @property

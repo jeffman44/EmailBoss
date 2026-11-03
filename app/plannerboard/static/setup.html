@@ -3,666 +3,567 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0d0d0f">
-<meta name="color-scheme" content="dark">
-<title>Email Boss Setup</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<meta name="theme-color" content="#f7f4ee">
+<meta name="color-scheme" content="light">
+<title>Email Boss setup</title>
 <style>
-  /* Same visual vocabulary as board.html: dark, monospace, game HUD. */
+  /* Self-contained light theme. 15 px base, nothing under 13 px. */
   :root {
-    --bg: #0d0d0f; --panel: #141416; --line: #1f1f23;
-    --ink: #e0ddd5; --dim: #9b9790; --faint: #6b6966;
-    --accent: #4fc3f7; --good: #97dda5; --warn: #e8a33d; --bad: #e06c6c;
+    --bg: #f7f4ee; --panel: #ffffff; --line: #d9d3c7;
+    --ink: #1f2933; --dim: #4b5563; --faint: #5f6b7a;
+    --accent: #1f6feb; --accent-ink: #ffffff; --good: #1a7f37; --warn: #9a6700; --bad: #b42318;
+    --sel: #e8f0fe;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 13px; line-height: 1.5;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; }
-  h1 { font-size: 22px; letter-spacing: 1px; margin: 0 0 4px; }
-  .sub { color: var(--faint); font-size: 11px; margin-bottom: 20px; }
-  .steps { display: flex; gap: 4px; margin-bottom: 22px; flex-wrap: wrap; }
-  .step-pill {
-    font-size: 10px; letter-spacing: .6px; text-transform: uppercase; padding: 6px 10px;
-    border-radius: 999px; border: 1px solid var(--line); color: var(--faint); cursor: pointer;
-    background: transparent; font-family: inherit; min-height: 32px;
+  .wrap { max-width: 780px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  h2 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: var(--dim); margin-bottom: 18px; }
+  .dots { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+  .dot { font-size: 14px; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); color: var(--faint); background: var(--panel); }
+  .dot.cur { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .dot.done { color: var(--good); border-color: var(--good); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px; margin-bottom: 16px; }
+  .card[hidden], [hidden] { display: none !important; }
+  label { display: block; font-weight: 600; margin: 14px 0 4px; }
+  input[type=text], input[type=email], input[type=number], input[type=password], input[type=url], select {
+    width: 100%; background: #fff; border: 1px solid #aeb6c2; color: var(--ink); border-radius: 8px;
+    padding: 10px 12px; min-height: 46px; font: inherit;
   }
-  .step-pill.done { color: var(--good); border-color: #26351a; }
-  .step-pill.cur { color: var(--accent); border-color: var(--accent); }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-    padding: 18px 20px; margin-bottom: 16px;
-  }
-  .card[hidden] { display: none; }
-  .card-title {
-    font-size: 10px; color: var(--faint); text-transform: uppercase;
-    letter-spacing: .8px; margin-bottom: 12px;
-  }
-  label { display: block; font-size: 11px; color: var(--dim); margin: 12px 0 4px; }
-  label:first-of-type { margin-top: 0; }
-  input[type=text], input[type=email], input[type=number], input[type=password], input[type=url],
-  select, textarea {
-    width: 100%; background: #0d0d0f; border: 1px solid var(--line);
-    color: var(--ink); border-radius: 4px; padding: 8px 10px; min-height: 40px;
-    font-family: inherit; font-size: 13px;
-  }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
-  .hint { font-size: 10px; color: var(--faint); margin-top: 4px; }
+  input:focus, select:focus, button:focus-visible, .choice:focus-visible { outline: 3px solid #9ec1ff; outline-offset: 1px; }
+  .hint { font-size: 14px; color: var(--faint); margin-top: 4px; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  .grid3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
-  .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
-  .preset {
-    background: #0d0d0f; border: 1px solid var(--line); border-radius: 6px;
-    padding: 14px; cursor: pointer; transition: border-color .15s; min-height: 44px;
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; margin-top: 8px; }
+  .choice {
+    background: #fff; border: 2px solid var(--line); border-radius: 12px; padding: 16px; cursor: pointer;
+    min-height: 64px; text-align: left; font: inherit; color: var(--ink);
   }
-  .preset:hover { border-color: #33333a; }
-  .preset.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
-  .preset.off { opacity: .45; cursor: not-allowed; }
-  .preset h3 { margin: 0 0 6px; font-size: 13px; }
-  .preset p { margin: 0; font-size: 10px; color: var(--faint); line-height: 1.45; }
-  .preset .icon { font-size: 18px; margin-right: 6px; vertical-align: middle; }
-  .stages { margin-top: 8px; font-size: 10px; color: var(--dim); }
-  .badge {
-    display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 3px;
-    background: #2e2a16; color: #ddcf97; margin-left: 6px; vertical-align: middle;
-  }
-  .toggle { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
-  .toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
+  .choice:hover { border-color: #8aa4cf; }
+  .choice.sel { border-color: var(--accent); background: var(--sel); }
+  .choice b { display: block; font-size: 17px; }
+  .choice span { display: block; font-size: 14px; color: var(--dim); margin-top: 2px; }
   button.go {
-    background: var(--accent); color: #06232e; border: none; border-radius: 5px;
-    padding: 12px 26px; font-family: inherit; font-weight: 700; font-size: 13px;
-    letter-spacing: .5px; cursor: pointer; min-height: 44px;
+    background: var(--accent); color: var(--accent-ink); border: none; border-radius: 10px;
+    padding: 14px 30px; font: inherit; font-weight: 700; font-size: 18px; cursor: pointer; min-height: 52px;
   }
-  button.go[disabled] { opacity: .45; cursor: not-allowed; }
+  button.go[disabled] { opacity: .5; cursor: not-allowed; }
   button.ghost {
-    background: transparent; color: var(--dim); border: 1px solid var(--line);
-    border-radius: 5px; padding: 7px 14px; font-family: inherit; font-size: 11px;
-    cursor: pointer; min-height: 40px;
+    background: #fff; color: var(--ink); border: 1px solid #aeb6c2; border-radius: 8px;
+    padding: 9px 16px; font: inherit; cursor: pointer; min-height: 44px;
   }
-  button.ghost:hover { color: var(--ink); border-color: #33333a; }
+  button.ghost:hover { border-color: var(--accent); }
+  button.link { background: none; border: none; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; padding: 6px 0; min-height: 36px; }
   .nav { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
-  .msg { margin-top: 14px; font-size: 12px; }
-  .msg.ok { color: var(--good); }
-  .msg.err { color: var(--bad); }
-  .summary { font-size: 11px; color: var(--dim); display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
-  .summary b { color: var(--ink); font-weight: 600; }
-  code { color: var(--dim); }
-  @media (max-width: 820px) {
-    .wrap { padding: 20px 16px 60px; }
-    .row { grid-template-columns: 1fr; }
-    h1 { font-size: 18px; }
-  }
+  .msg { margin-top: 12px; }
+  .msg.ok { color: var(--good); } .msg.err { color: var(--bad); }
+  ol.guide { margin: 8px 0 0; padding-left: 24px; } ol.guide li { margin: 4px 0; }
+  .box { background: #faf8f3; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-top: 12px; }
+  .three { list-style: none; padding: 0; margin: 12px 0 18px; }
+  .three li { padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 17px; }
+  .toggle { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .toggle input { width: 20px; height: 20px; accent-color: var(--accent); }
+  code { background: #eef1f5; padding: 1px 5px; border-radius: 4px; }
+  @media (max-width: 640px) { .row { grid-template-columns: 1fr; } .wrap { padding: 20px 14px 60px; } }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>PLANNER BOARD SETUP</h1>
-  <div class="sub">Seven short steps. Everything here can be changed later by re-opening <code>/setup</code>
-    or from Settings on the board.</div>
+  <h1>Email Boss setup</h1>
+  <div class="sub">Three short screens. You can change everything later in Settings.</div>
+  <div class="dots" id="dots"></div>
 
-  <div class="steps" id="steps"></div>
-
-  <!-- 1 YOU -->
+  <!-- 1 YOU AND YOUR EMAIL -->
   <div class="card" data-step="you">
-    <div class="card-title">1 / You</div>
+    <h2>You and your email</h2>
     <div class="row">
-      <div>
-        <label>Display name</label>
-        <input type="text" id="name" placeholder="Jane Smith" autocomplete="off">
-      </div>
-      <div>
-        <label>Work email</label>
-        <input type="email" id="email" placeholder="jane@yourcompany.com" autocomplete="off">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label>Company (optional)</label>
-        <input type="text" id="company" placeholder="Your company" autocomplete="off">
-      </div>
-      <div>
-        <label>Your role (optional)</label>
-        <input type="text" id="role" placeholder="e.g. Account Manager" autocomplete="off">
-      </div>
-    </div>
-    <label>Other name spellings (optional)</label>
-    <input type="text" id="aliases" placeholder="jsmith, Smith Jane" autocomplete="off">
-    <div class="hint">Comma-separated. Used only to recognise your own outbound mail: display names vary
-      ("Smith, Jane"), and a missed spelling makes your sent replies look like someone else's.</div>
-    <label>Internal email domains (optional)</label>
-    <input type="text" id="internal_domains" placeholder="yourcompany.com" autocomplete="off">
-    <div class="hint">Mail from these domains is treated as internal, not as a client.</div>
-  </div>
-
-  <!-- 2 PROFESSION -->
-  <div class="card" data-step="profession" hidden>
-    <div class="card-title">2 / Profession</div>
-    <div class="grid3" id="professions"><div class="hint">Loading templates...</div></div>
-    <div class="hint" style="margin-top:10px">The template sets the vocabulary (what a "project" is called), the
-      fields on each card, the stages and the header tabs. All of it is editable afterwards in Settings.</div>
-  </div>
-
-  <!-- 3 DATA FOLDER -->
-  <div class="card" data-step="data" hidden>
-    <div class="card-title">3 / Data folder</div>
-    <label>Data folder</label>
-    <input type="text" id="data_root" autocomplete="off">
-    <div class="hint">Database, project files, backups and the mail cache. Use a LOCAL disk, not a synced
-      or network folder.</div>
-    <div style="margin-top:10px"><button class="ghost" onclick="probePaths()">CHECK FOLDER</button>
-      <span id="pathmsg" class="hint"></span></div>
-  </div>
-
-  <!-- 4 MAIL -->
-  <div class="card" data-step="mail" hidden>
-    <div class="card-title">4 / Mail provider</div>
-    <div class="grid2">
-      <div class="preset" id="src-none" onclick="pickSource('none')">
-        <h3>None for now</h3>
-        <p>Run the board by hand. Add mail later from Settings.</p>
-      </div>
-      <div class="preset" id="src-pa_folder" onclick="pickSource('pa_folder')">
-        <h3>Drop folder (Power Automate)</h3>
-        <p>Flows in your Microsoft 365 tenant drop messages as files into the data folder.
-          Nothing connects to the mailbox from here.</p>
-      </div>
-      <div class="preset sel" id="src-imap" onclick="pickSource('imap')">
-        <h3>IMAP</h3>
-        <p>Gmail, Outlook.com, iCloud, Yahoo, Fastmail or any IMAP server.
-          Read-only; an app password is all it needs.</p>
-      </div>
-      <div class="preset" id="src-gmail" onclick="pickSource('gmail')">
-        <h3>Gmail API</h3>
-        <p>Sign in with Google. Reads inbox and sent, writes drafts.</p>
-      </div>
-      <div class="preset" id="src-graph" onclick="pickSource('graph')">
-        <h3>Microsoft 365 (Graph)</h3>
-        <p>Sign in with Microsoft. Reads inbox and sent items, writes drafts.</p>
-      </div>
+      <div><label for="name">Your name</label>
+        <input type="text" id="name" placeholder="Jane Smith" autocomplete="name"></div>
+      <div><label for="email">Your email address</label>
+        <input type="email" id="email" placeholder="jane@example.com" autocomplete="email"></div>
     </div>
 
-    <div id="pa-block" class="hint" style="margin-top:12px" hidden>
-      Point your flows at <code><span id="pa-path">[data folder]/mail_cache</span>/{inbox, sent, attachments}</code>.
-      Create the folders first; flows fail quietly against a missing folder.
-    </div>
+    <label>Which email do you use?</label>
+    <div class="cards" id="providers"></div>
 
-    <div id="imap-block" style="margin-top:12px">
-      <label>Preset</label>
-      <select id="imap_preset" onchange="applyPreset()"></select>
-      <div class="hint" id="pwhint"></div>
-      <div class="row" style="margin-top:12px">
-        <div>
-          <label>Mailbox address</label>
-          <input type="email" id="imap_user" placeholder="you@gmail.com" autocomplete="off">
-        </div>
-        <div>
-          <label>App password</label>
-          <input type="password" id="imap_password" autocomplete="new-password">
-          <div class="hint">Stored in the OS keyring, never in a file. Leave blank to keep the one already saved.</div>
-        </div>
+    <div id="mailbox" class="box" hidden>
+      <div id="oauth-block" hidden>
+        <button class="go" id="oauth-btn" onclick="oauthStart()">Sign in with Google</button>
+        <div class="msg" id="oauthmsg"></div>
+        <div class="hint">A new tab opens. Choose your account, press Allow, then come back to this page.</div>
+        <button class="link" onclick="setMethod('password')">Use an app password instead</button>
       </div>
-      <div style="margin-top:10px">
-        <button class="ghost" onclick="toggleAdvanced()">SERVER SETTINGS</button>
-        <button class="ghost" onclick="testMail()">TEST CONNECTION</button>
-        <span id="mailmsg" class="hint"></span>
+
+      <div id="pw-block" hidden>
+        <div id="m365-note" class="hint" hidden style="font-size:15px;color:var(--ink)">
+          Work or school account: ask whoever manages your email to allow app passwords, or use Sign in with Microsoft.</div>
+        <b>How to get an app password</b>
+        <div class="hint">An app password is a one-time password just for Email Boss. Your normal password stays private.</div>
+        <ol class="guide" id="guide"></ol>
+        <label for="imap_password">App password</label>
+        <input type="password" id="imap_password" autocomplete="new-password">
+        <div class="hint">Kept safely on this computer. Never shown again.</div>
+        <div style="margin-top:12px"><button class="ghost" onclick="testMail()">Test</button></div>
+        <div class="msg" id="mailmsg"></div>
+        <button class="link" id="back-oauth" onclick="setMethod('oauth')" hidden>Use the sign-in button instead</button>
       </div>
-      <div id="imap-adv" hidden style="margin-top:12px">
+
+      <button class="link" onclick="toggle('imap-adv')">Advanced</button>
+      <div id="imap-adv" hidden>
         <div class="row">
-          <div><label>Server</label><input type="text" id="imap_host" autocomplete="off"></div>
-          <div><label>Port</label><input type="number" id="imap_port" value="993"></div>
+          <div><label for="imap_host">Mail server</label><input type="text" id="imap_host" autocomplete="off"></div>
+          <div><label for="imap_port">Port</label><input type="number" id="imap_port" value="993"></div>
         </div>
-        <div class="row" style="margin-top:10px">
-          <div><label>Inbox folder</label><input type="text" id="imap_inbox" autocomplete="off"></div>
-          <div><label>Sent folder</label><input type="text" id="imap_sent" autocomplete="off">
-            <div class="hint">Gmail calls it <code>[Gmail]/Sent Mail</code>, not "Sent". A wrong name here means
-              your own replies never get captured.</div></div>
+        <div class="row">
+          <div><label for="imap_user">Mailbox name</label><input type="text" id="imap_user" autocomplete="off">
+            <div class="hint">Usually the same as your email address.</div></div>
+          <div><label for="poll_min">Check for mail every (minutes)</label><input type="number" id="poll_min" value="5" min="1" max="120"></div>
         </div>
-        <label>Check every (minutes)</label>
-        <input type="number" id="poll_min" value="5" min="1" max="120">
+        <div class="row">
+          <div><label for="imap_inbox">Inbox folder name</label><input type="text" id="imap_inbox" autocomplete="off"></div>
+          <div><label for="imap_sent">Sent folder name</label><input type="text" id="imap_sent" autocomplete="off">
+            <div class="hint">Gmail calls it <code>[Gmail]/Sent Mail</code>.</div></div>
+        </div>
+        <div class="row">
+          <div><label for="oauth_client_id">Your own sign-in app id (optional)</label>
+            <input type="text" id="oauth_client_id" autocomplete="off"></div>
+          <div><label for="oauth_tenant">Microsoft tenant (optional)</label>
+            <input type="text" id="oauth_tenant" value="common" autocomplete="off"></div>
+        </div>
       </div>
-      <div class="hint" style="margin-top:12px">Read-only: the board opens the two folders, copies what is new and
-        never marks anything read, moves anything or sends anything.</div>
     </div>
 
-    <div id="gmail-block" hidden style="margin-top:12px">
-      <label>OAuth client id (optional, from your Google Cloud project)</label>
-      <input type="text" id="gmail_client_id" placeholder="xxxx.apps.googleusercontent.com" autocomplete="off">
-      <div style="margin-top:10px">
-        <button class="ghost" onclick="oauthStart('gmail')">SIGN IN WITH GOOGLE</button>
-        <span id="gmailmsg" class="hint"></span>
-      </div>
-      <div class="hint" style="margin-top:8px">Tokens land in the OS keyring. The sign-in opens in a new tab and returns
-        to this board when it finishes.</div>
-    </div>
+    <div class="hint" style="margin-top:16px;font-size:15px">
+      Your time zone: <b id="tzname"></b>. <button class="link" onclick="changeTz()">Change</button></div>
+    <div id="tzbox" hidden><input type="text" id="tzinput" placeholder="America/Denver" autocomplete="off"></div>
+    <div class="msg err" id="err-you"></div>
+  </div>
 
-    <div id="graph-block" hidden style="margin-top:12px">
+  <!-- 2 YOUR WORK -->
+  <div class="card" data-step="work" hidden>
+    <h2>What kind of work do you do?</h2>
+    <div class="hint">Pick the nearest. You can rename anything later.</div>
+    <div class="cards" id="professions"><div class="hint">Loading...</div></div>
+    <div class="msg err" id="err-work"></div>
+  </div>
+
+  <!-- 3 DONE -->
+  <div class="card" data-step="done" hidden>
+    <h2>You are ready</h2>
+    <ul class="three">
+      <li>Your mail stays on this computer.</li>
+      <li>Email Boss AI is on, with 300 free credits; buy more inside the app.</li>
+      <li>Your free 14-day trial starts now; no card needed.</li>
+    </ul>
+    <button class="go" id="save" onclick="save()">Open Email Boss</button>
+    <div class="msg" id="msg"></div>
+
+    <div style="margin-top:18px"><button class="link" onclick="toggle('adv')">Advanced</button></div>
+    <div id="adv" hidden class="box">
+      <label for="data_root">Data folder</label>
+      <div class="hint" id="data_default"></div>
+      <input type="text" id="data_root" autocomplete="off" placeholder="leave blank to use the default">
+      <div class="hint">Use a folder on this computer, not a synced or network folder.</div>
+
+      <label>AI</label>
+      <div class="toggle"><input type="radio" name="aimode" id="ai_emailboss" checked onchange="aiModeChanged()"><span>Email Boss AI (recommended)</span></div>
+      <div class="toggle"><input type="radio" name="aimode" id="ai_own" onchange="aiModeChanged()"><span>Use my own key</span></div>
+      <div class="toggle"><input type="radio" name="aimode" id="ai_off" onchange="aiModeChanged()"><span>Turn AI off</span></div>
+      <div id="ai-own-block" hidden>
+        <div class="row">
+          <div><label for="ai_provider">Provider</label>
+            <select id="ai_provider" onchange="aiProviderChanged()">
+              <option value="anthropic">Anthropic</option>
+              <option value="openai">OpenAI or compatible</option>
+              <option value="ollama">Ollama (on this computer)</option>
+            </select></div>
+          <div id="ai-key-wrap"><label for="ai_api_key">Key</label>
+            <input type="password" id="ai_api_key" autocomplete="new-password"></div>
+        </div>
+        <div class="row">
+          <div><label for="ai_model">Model</label><input type="text" id="ai_model" autocomplete="off"></div>
+          <div><label for="ai_base_url">Web address (optional)</label><input type="url" id="ai_base_url" autocomplete="off"></div>
+        </div>
+        <div style="margin-top:10px"><button class="ghost" onclick="testAI()">Test</button></div>
+        <div class="msg" id="aimsg"></div>
+      </div>
+
+      <label for="license_key">License key</label>
+      <input type="text" id="license_key" autocomplete="off" spellcheck="false" placeholder="paste it here if you already have one">
+
+      <div class="toggle"><input type="checkbox" id="use_pa" onchange="paChanged()">
+        <span>Get my mail from a Power Automate drop folder instead</span></div>
+      <div class="hint" id="pa-hint" hidden>Your flows write files to <code id="pa-path"></code>. Create the folders first.</div>
+
       <div class="row">
-        <div><label>App (client) id (optional)</label>
-          <input type="text" id="graph_client_id" placeholder="00000000-0000-..." autocomplete="off"></div>
-        <div><label>Tenant</label>
-          <input type="text" id="graph_tenant" value="common" autocomplete="off"></div>
-      </div>
-      <div style="margin-top:10px">
-        <button class="ghost" onclick="oauthStart('graph')">SIGN IN WITH MICROSOFT</button>
-        <span id="graphmsg" class="hint"></span>
-      </div>
-      <div class="hint" style="margin-top:8px">Tokens land in the OS keyring. Drafts the assistant writes are created
-        in your Drafts folder; the assistant never sends. You can send from the board's MAIL view once you turn
-        "Allow sending" on in Settings &rsaquo; Mail.</div>
-    </div>
-  </div>
-
-  <!-- 5 AI -->
-  <div class="card" data-step="ai" hidden>
-    <div class="card-title">5 / AI</div>
-    <div class="grid2">
-      <div class="preset sel" id="ai-none" onclick="pickAI('none')">
-        <h3>None</h3><p>Rules-only triage. Cards show the sender's own words verbatim.</p>
-      </div>
-      <div class="preset" id="ai-anthropic" onclick="pickAI('anthropic')">
-        <h3>Anthropic</h3><p>Paste an API key. Classification, summaries, draft replies and the assistant pass.</p>
-      </div>
-      <div class="preset" id="ai-openai" onclick="pickAI('openai')">
-        <h3>OpenAI-compatible</h3><p>OpenAI, Groq, Together, LM Studio: any Chat Completions endpoint.</p>
-      </div>
-      <div class="preset" id="ai-ollama" onclick="pickAI('ollama')">
-        <h3>Ollama (local)</h3><p>Entirely on this machine. <span id="ollamastate"></span></p>
+        <div><label for="bind">Let other computers connect (address)</label>
+          <input type="text" id="bind" value="127.0.0.1" autocomplete="off">
+          <div class="hint">Leave as 127.0.0.1 for this computer only. Anything else makes a security token.</div></div>
+        <div><label for="port">Port</label><input type="number" id="port" value="8080"></div>
       </div>
     </div>
-    <div id="ai-block" hidden style="margin-top:12px">
-      <div class="row">
-        <div id="ai-key-wrap">
-          <label>API key</label>
-          <input type="password" id="ai_api_key" autocomplete="new-password" placeholder="posted once, kept in the keyring">
-          <div class="hint">Leave blank to keep the one already saved.</div>
-        </div>
-        <div>
-          <label>Model</label>
-          <input type="text" id="ai_model" autocomplete="off">
-        </div>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <div>
-          <label>Base URL (optional)</label>
-          <input type="url" id="ai_base_url" autocomplete="off" placeholder="https://api.example.com/v1">
-        </div>
-        <div>
-          <label>Daily budget (USD)</label>
-          <input type="number" id="ai_budget" value="2" min="0" step="0.5">
-        </div>
-      </div>
-      <div class="toggle"><input type="checkbox" id="ai_assistant"><span>Run the assistant pass on a schedule (drafts only, never sends)</span></div>
-      <div style="margin-top:10px">
-        <button class="ghost" onclick="testAI()">TEST</button>
-        <span id="aimsg" class="hint"></span>
-      </div>
-    </div>
-  </div>
-
-  <!-- 6 LICENSE -->
-  <div class="card" data-step="license" hidden>
-    <div class="card-title">6 / License</div>
-    <label>License key</label>
-    <input type="text" id="license_key" autocomplete="off" spellcheck="false" placeholder="paste the key from your license email">
-    <div class="hint">Activated against the license server on first start. 14 days of offline grace.</div>
-    <div class="toggle"><input type="checkbox" id="dev_skip"><span>Skip for now (developer mode, visible banner)</span></div>
-  </div>
-
-  <!-- 7 CREATE -->
-  <div class="card" data-step="create" hidden>
-    <div class="card-title">7 / Create</div>
-    <div class="summary" id="summary"></div>
-    <div style="margin-top:16px">
-      <button class="go" id="save" onclick="save()">CREATE MY BOARD</button>
-    </div>
-    <div id="msg" class="msg"></div>
   </div>
 
   <div class="nav">
-    <button class="ghost" id="back" onclick="step(-1)">BACK</button>
-    <button class="ghost" id="next" onclick="step(1)">NEXT</button>
+    <button class="ghost" id="back" onclick="step(-1)">Back</button>
+    <button class="go" id="next" onclick="step(1)">Next</button>
   </div>
 </div>
 
 <script>
-const STEPS = ['you', 'profession', 'data', 'mail', 'ai', 'license', 'create'];
-const LABELS = { you: 'You', profession: 'Profession', data: 'Data folder', mail: 'Mail', ai: 'AI', license: 'License', create: 'Create' };
+const STEPS = ['you', 'work', 'done'];
+const LABELS = { you: 'You and your email', work: 'Your work', done: 'Done' };
 let cur = 0;
 let PROFESSIONS = [];
-let selectedProfession = 'general';
+let selectedProfession = '';
 let IMAP_PRESETS = [];
-let mailProvider = 'imap';
-let aiProvider = 'none';
+let provider = '';            // gmail | outlook | m365 | yahoo | icloud | other
+let method = 'password';      // oauth | password
+let READY = { gmail: false, graph: false };
+let oauthStarted = false;
 let CFG = null;
-const AI_DEFAULT_MODEL = { anthropic: 'claude-sonnet-4-5', openai: 'gpt-4o-mini', ollama: 'llama3.1', none: '' };
-const AI_DEFAULT_URL = { anthropic: '', openai: 'https://api.openai.com/v1', ollama: 'http://localhost:11434', none: '' };
+let TZ = '';
+
+const PROVIDERS = [
+  { id: 'gmail', label: 'Gmail', note: 'Ends in gmail.com', preset: 'gmail', oauth: 'gmail' },
+  { id: 'outlook', label: 'Outlook or Microsoft 365', note: 'Outlook.com, Hotmail, or work email', preset: 'outlook', oauth: 'graph' },
+  { id: 'yahoo', label: 'Yahoo', note: 'Ends in yahoo.com', preset: 'yahoo' },
+  { id: 'icloud', label: 'iCloud', note: 'Ends in icloud.com or me.com', preset: 'icloud' },
+  { id: 'other', label: 'Something else', note: 'Any other email service', preset: 'custom' },
+];
+const GUIDES = {
+  gmail: ['Open your Google Account (myaccount.google.com) and choose <b>Security</b>.',
+    'Make sure <b>2-Step Verification</b> is on. Turn it on if it is not.',
+    'Search for <b>App passwords</b> and open it.',
+    'Name it <b>Email Boss</b> and press Create.',
+    'Copy the 16 letters Google shows you and paste them below.'],
+  outlook: ['Sign in at account.microsoft.com and choose <b>Security</b>.',
+    'Open <b>Advanced security options</b>.',
+    'Make sure two-step verification is on, then choose <b>Create a new app password</b>.',
+    'Copy the password it shows and paste it below.'],
+  yahoo: ['Sign in to Yahoo and open <b>Account Info</b>, then <b>Account Security</b>.',
+    'Choose <b>Generate app password</b>.',
+    'Name it <b>Email Boss</b> and press Generate.',
+    'Copy the password and paste it below.'],
+  icloud: ['Go to <b>appleid.apple.com</b> and sign in.',
+    'Open <b>Sign-In and Security</b>, then <b>App-Specific Passwords</b>.',
+    'Press the plus button and name it <b>Email Boss</b>.',
+    'Copy the password and paste it below.'],
+  other: ['Sign in to your email service on the web and look in its security settings for <b>App passwords</b>, or ask whoever runs your email.',
+    'Create one named <b>Email Boss</b> and paste it below.',
+    'Open Advanced and enter the mail server name your email service gave you.'],
+};
+const PROF_TEXT = {
+  general: ['Something else', 'A bit of everything'],
+  trades: ['Trades and home services', 'Plumber, electrician, painter, landscaper'],
+  hvac_contractor: ['Heating and cooling contractor', 'Service calls, quotes, maintenance plans'],
+  construction_gc: ['Building contractor', 'Bids, change orders, subcontractors'],
+  events: ['Events and photography', 'Weddings, shoots, parties'],
+  nonprofit: ['Nonprofit or club', 'Donors, volunteers, grants'],
+  legal: ['Law practice', 'Clients, matters, deadlines'],
+  real_estate: ['Real estate', 'Buyers, sellers, showings'],
+  property_management: ['Property management', 'Tenants, repairs, owners'],
+  insurance_agency: ['Insurance agency', 'Policies, renewals, claims'],
+  consulting: ['Consulting', 'Clients, proposals, projects'],
+  recruiting: ['Recruiting', 'Candidates, openings, interviews'],
+  it_msp: ['Computer support', 'Help desk, small business IT'],
+};
+const AI_DEFAULT_MODEL = { anthropic: 'claude-sonnet-4-5', openai: 'gpt-4o-mini', ollama: 'llama3.1' };
+const AI_DEFAULT_URL = { anthropic: '', openai: 'https://api.openai.com/v1', ollama: 'http://localhost:11434' };
 
 const $ = id => document.getElementById(id);
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function toggle(id) { $(id).hidden = !$(id).hidden; }
 
 const PB_TOKEN = (document.querySelector('meta[name="pb-token"]') || {}).content || '';
 async function api(url, opts) {
-  opts = opts || {};
-  opts.headers = Object.assign({}, opts.headers || {});
+  opts = Object.assign({}, opts || {});
+  opts.credentials = 'same-origin';
+  opts.headers = Object.assign({ 'X-Requested-With': 'EmailBoss' }, opts.headers || {});
   if (PB_TOKEN) opts.headers['Authorization'] = 'Bearer ' + PB_TOKEN;
-  if (opts.body && !opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
+  const m = (opts.method || 'GET').toUpperCase();
+  if (m !== 'GET') opts.headers['Content-Type'] = 'application/json';
   return fetch(url, opts);
 }
+async function jget(url) { try { const r = await api(url); return r.ok ? await r.json() : null; } catch (e) { return null; } }
 
-function renderSteps() {
-  $('steps').innerHTML = STEPS.map((s, i) =>
-    `<button class="step-pill ${i < cur ? 'done' : ''} ${i === cur ? 'cur' : ''}" onclick="goto(${i})">${i + 1} ${esc(LABELS[s])}</button>`).join('');
+// ── steps ─────────────────────────────────────────────────────────────────
+function render() {
+  $('dots').innerHTML = STEPS.map((s, i) =>
+    `<span class="dot ${i < cur ? 'done' : ''} ${i === cur ? 'cur' : ''}">${i + 1}. ${esc(LABELS[s])}</span>`).join('');
   document.querySelectorAll('.card[data-step]').forEach(c => { c.hidden = c.dataset.step !== STEPS[cur]; });
   $('back').style.visibility = cur === 0 ? 'hidden' : 'visible';
-  $('next').style.visibility = cur === STEPS.length - 1 ? 'hidden' : 'visible';
-  if (STEPS[cur] === 'create') renderSummary();
-  if (STEPS[cur] === 'mail') $('pa-path').textContent = ($('data_root').value.trim() || '[data folder]') + '/mail_cache';
+  $('next').style.display = cur === STEPS.length - 1 ? 'none' : '';
+  if (STEPS[cur] === 'done') $('pa-path').textContent = ($('data_root').value.trim() || 'your Email Boss folder') + '/mail_cache';
   window.scrollTo(0, 0);
 }
-function validateStep(i) {
+function validate(i) {
   const s = STEPS[i];
   if (s === 'you') {
-    if (!$('name').value.trim() || $('email').value.indexOf('@') < 0) return 'A display name and a valid email are required.';
+    if (!$('name').value.trim()) return 'Please type your name.';
+    if ($('email').value.indexOf('@') < 1) return 'Please type your email address, like jane@example.com.';
+    if (!provider) return 'Please choose which email you use.';
+    if (method === 'oauth' && oauthKind() && !oauthStarted && !$('use_pa').checked) return 'Press the sign-in button to connect your email, or choose "Use an app password instead".';
   }
-  if (s === 'mail' && mailProvider === 'imap') {
-    if (!$('imap_user').value.trim() || !$('imap_host').value.trim()) return 'IMAP needs a mailbox address and a server.';
-  }
-  if (s === 'license') {
-    if (!$('license_key').value.trim() && !$('dev_skip').checked) return 'Paste a license key, or tick "Skip for now".';
-  }
+  if (s === 'work' && !selectedProfession) return 'Please pick the kind of work you do. Pick the nearest.';
   return '';
 }
-function goto(i) {
-  if (i > cur) {
-    for (let k = cur; k < i; k++) {
-      const err = validateStep(k);
-      if (err) { cur = k; renderSteps(); flash(err); return; }
-    }
+function step(d) {
+  const target = Math.max(0, Math.min(STEPS.length - 1, cur + d));
+  if (d > 0) {
+    const err = validate(cur);
+    if (err) { $('err-' + STEPS[cur]).textContent = err; return; }
+    $('err-' + STEPS[cur]).textContent = '';
   }
-  cur = Math.max(0, Math.min(STEPS.length - 1, i));
-  renderSteps();
-}
-function step(d) { goto(cur + d); }
-function flash(text) {
-  const m = $('msg'); m.className = 'msg err'; m.textContent = text;
-  const card = document.querySelector('.card[data-step="' + STEPS[cur] + '"]');
-  let h = card.querySelector('.step-err');
-  if (!h) { h = document.createElement('div'); h.className = 'msg err step-err'; card.appendChild(h); }
-  h.textContent = text;
-  setTimeout(() => { if (h.parentNode) h.remove(); }, 4000);
+  cur = target; render();
 }
 
-async function boot() {
-  try {
-    const c = await (await api('/api/config')).json();
-    CFG = c;
-    const u = c.user || {};
-    if (u.name) $('name').value = u.name;
-    if (u.email) $('email').value = u.email;
-    if (u.company) $('company').value = u.company;
-    if (u.role) $('role').value = u.role;
-    if (Array.isArray(u.aliases) && u.aliases.length) $('aliases').value = u.aliases.join(', ');
-    if (Array.isArray(u.internal_domains) && u.internal_domains.length) $('internal_domains').value = u.internal_domains.join(', ');
-    if (c.profession && c.profession.template) selectedProfession = c.profession.template;
-    if (c.paths && c.paths.data_root) $('data_root').value = c.paths.data_root;
-    const m = c.mail || {};
-    if (m.provider) mailProvider = m.provider;
-    if (m.poll_seconds) $('poll_min').value = Math.max(1, Math.round(m.poll_seconds / 60));
-    const im = m.imap || {};
-    if (im.user) $('imap_user').value = im.user;
-    if (im.host) $('imap_host').value = im.host;
-    if (im.port) $('imap_port').value = im.port;
-    if (im.inbox) $('imap_inbox').value = im.inbox;
-    if (im.sent) $('imap_sent').value = im.sent;
-    if (m.gmail && m.gmail.client_id) $('gmail_client_id').value = m.gmail.client_id;
-    if (m.graph && m.graph.client_id) $('graph_client_id').value = m.graph.client_id;
-    if (m.graph && m.graph.tenant) $('graph_tenant').value = m.graph.tenant;
-    const ai = c.ai || {};
-    if (ai.provider) aiProvider = ai.provider;
-    if (ai.model) $('ai_model').value = ai.model;
-    if (ai.base_url) $('ai_base_url').value = ai.base_url;
-    if (ai.daily_budget_usd != null) $('ai_budget').value = ai.daily_budget_usd;
-    if (ai.features && ai.features.assistant) $('ai_assistant').checked = true;
-    if (c.license && c.license.key) $('license_key').value = c.license.key;
-  } catch (e) {}
-  try {
-    const p = await (await api('/api/setup/probe')).json();
-    $('ollamastate').textContent = p.ollama ? 'Detected on this machine.' : 'Not detected on this machine.';
-    if (p.suggest && !$('data_root').value) $('data_root').value = p.suggest.data_root || '';
-    if (p.ai && p.ai.key_present) $('ai_api_key').placeholder = 'a key is already saved; leave blank to keep it';
-    if (p.keyring_available === false) {
-      $('pwhint').textContent = 'No credential store on this machine: secrets will have to come from the PB_IMAP_PASSWORD / PB_AI_API_KEY environment variables.';
-    }
-  } catch (e) {}
-  try {
-    const r = await api('/api/mail/providers');
-    const j = r.ok ? await r.json() : {};
-    const imap = (j.providers || []).find(x => x.id === 'imap');
-    IMAP_PRESETS = (imap && imap.presets) || j.imap_presets || [];
-  } catch (e) {}
-  if (!IMAP_PRESETS.length) {
-    IMAP_PRESETS = [
-      { id: 'gmail', label: 'Gmail / Google Workspace (IMAP)', host: 'imap.gmail.com', port: 993, inbox_folder: 'INBOX', sent_folder: '[Gmail]/Sent Mail',
-        app_password_hint: 'Google account > Security > 2-Step Verification > App passwords (a 16-character password, not your normal one).' },
-      { id: 'outlook', label: 'Outlook.com / Hotmail / Microsoft 365 (IMAP)', host: 'outlook.office365.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent',
-        app_password_hint: 'Microsoft account > Security > Advanced security options > App passwords.' },
-      { id: 'icloud', label: 'iCloud Mail', host: 'imap.mail.me.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent Messages',
-        app_password_hint: 'appleid.apple.com > Sign-In and Security > App-Specific Passwords.' },
-      { id: 'yahoo', label: 'Yahoo Mail', host: 'imap.mail.yahoo.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent',
-        app_password_hint: 'Yahoo account > Security > Generate app password.' },
-      { id: 'fastmail', label: 'Fastmail', host: 'imap.fastmail.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent',
-        app_password_hint: 'Fastmail > Settings > Privacy & Security > New app password.' },
-      { id: 'custom', label: 'Other IMAP server', host: '', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent', app_password_hint: '' },
-    ];
-  }
-  $('imap_preset').innerHTML = IMAP_PRESETS.map(x => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join('');
-  const curPreset = (CFG && CFG.mail && CFG.mail.imap && CFG.mail.imap.preset) || '';
-  if (curPreset && IMAP_PRESETS.some(x => x.id === curPreset)) $('imap_preset').value = curPreset;
-  applyPreset();
-  pickSource(mailProvider);
-  pickAI(aiProvider, true);
-  try {
-    const j = await (await api('/api/professions')).json();
-    PROFESSIONS = j.professions || [];
-    if (!PROFESSIONS.some(p => p.id === selectedProfession)) selectedProfession = (PROFESSIONS[0] || {}).id || 'general';
-    renderProfessions();
-  } catch (e) {
-    $('professions').innerHTML = '<div class="hint" style="color:var(--bad)">Could not load templates. Is the server running?</div>';
-  }
-  renderSteps();
+// ── screen 1 ──────────────────────────────────────────────────────────────
+function renderProviders() {
+  $('providers').innerHTML = PROVIDERS.map(p =>
+    `<button type="button" class="choice ${p.id === provider ? 'sel' : ''}" onclick="pickProvider('${p.id}')"><b>${esc(p.label)}</b><span>${esc(p.note)}</span></button>`).join('');
 }
-
-function renderProfessions() {
-  $('professions').innerHTML = PROFESSIONS.map(p => `
-    <div class="preset ${p.id === selectedProfession ? 'sel' : ''} ${p.error ? 'off' : ''}" onclick="${p.error ? '' : `pickProfession('${esc(p.id)}')`}">
-      <h3>${p.icon ? `<span class="icon">${esc(p.icon)}</span>` : ''}${esc(p.label)}</h3>
-      <p>${esc(p.description || '')}</p>
-    </div>`).join('');
+function provMeta() { return PROVIDERS.find(p => p.id === provider) || null; }
+function oauthKind() { const m = provMeta(); return m && m.oauth && READY[m.oauth] ? m.oauth : ''; }
+function pickProvider(id) {
+  provider = id; oauthStarted = false;
+  $('oauthmsg').textContent = '';
+  renderProviders();
+  $('mailbox').hidden = false;
+  applyPreset(true);
+  setMethod(oauthKind() ? 'oauth' : 'password');
+  const em = $('email').value.trim();
+  if (em && !$('imap_user').value.trim()) $('imap_user').value = em;
 }
-function pickProfession(id) { selectedProfession = id; renderProfessions(); }
-
-// ── Mail ─────────────────────────────────────────────────────────────────
-function pickSource(id) {
-  mailProvider = ['none', 'pa_folder', 'imap', 'gmail', 'graph'].includes(id) ? id : 'none';
-  ['none', 'pa_folder', 'imap', 'gmail', 'graph'].forEach(k => {
-    const el = $('src-' + k); if (el) el.classList.toggle('sel', mailProvider === k);
-  });
-  $('pa-block').hidden = mailProvider !== 'pa_folder';
-  $('imap-block').hidden = mailProvider !== 'imap';
-  $('gmail-block').hidden = mailProvider !== 'gmail';
-  $('graph-block').hidden = mailProvider !== 'graph';
+function setMethod(m) {
+  method = (m === 'oauth' && oauthKind()) ? 'oauth' : 'password';
+  $('oauth-block').hidden = method !== 'oauth';
+  $('pw-block').hidden = method !== 'password';
+  $('back-oauth').hidden = !oauthKind();
+  $('m365-note').hidden = provider !== 'outlook';
+  $('oauth-btn').textContent = oauthKind() === 'graph' ? 'Sign in with Microsoft' : 'Sign in with Google';
+  $('guide').innerHTML = (GUIDES[provider] || []).map(t => `<li>${t}</li>`).join('');
 }
-function currentPreset() { return IMAP_PRESETS.find(p => p.id === $('imap_preset').value) || null; }
-// Fill the server fields from the preset. Only overwrites a field the user has
-// not changed away from another preset's value.
+function currentPreset() { const m = provMeta(); return IMAP_PRESETS.find(p => m && p.id === m.preset) || null; }
 function applyPreset() {
-  const p = currentPreset();
-  if (!p) return;
-  if (!$('pwhint').textContent || !$('pwhint').textContent.startsWith('No credential')) $('pwhint').textContent = p.app_password_hint || '';
-  const pool = { imap_host: IMAP_PRESETS.map(x => x.host), imap_inbox: IMAP_PRESETS.map(x => x.inbox_folder), imap_sent: IMAP_PRESETS.map(x => x.sent_folder) };
-  const set = (el, val) => { const curv = $(el).value.trim(); if (!curv || pool[el].indexOf(curv) > -1) $(el).value = val || ''; };
-  set('imap_host', p.host); set('imap_inbox', p.inbox_folder); set('imap_sent', p.sent_folder);
-  if (!$('imap_port').value) $('imap_port').value = p.port || 993;
+  const p = currentPreset(); if (!p) return;
+  $('imap_host').value = p.host || '';
+  $('imap_port').value = p.port || 993;
+  $('imap_inbox').value = p.inbox_folder || 'INBOX';
+  $('imap_sent').value = p.sent_folder || 'Sent';
 }
-function toggleAdvanced() { $('imap-adv').hidden = !$('imap-adv').hidden; }
+function changeTz() { $('tzbox').hidden = false; $('tzinput').value = TZ; $('tzinput').focus(); }
+function getTz() { return ($('tzinput').value || TZ || '').trim(); }
+
+function imapUser() { return $('imap_user').value.trim() || $('email').value.trim(); }
 function mailBody() {
-  const m = { provider: mailProvider, poll_seconds: Math.max(60, (parseInt($('poll_min').value, 10) || 5) * 60) };
-  if (mailProvider === 'imap') {
-    m.imap = { preset: $('imap_preset').value, host: $('imap_host').value.trim(), port: parseInt($('imap_port').value, 10) || 993,
-               user: $('imap_user').value.trim(), inbox: $('imap_inbox').value.trim() || 'INBOX', sent: $('imap_sent').value.trim() || 'Sent' };
+  const poll = Math.max(60, (parseInt($('poll_min').value, 10) || 5) * 60);
+  if ($('use_pa').checked) return { provider: 'pa_folder', poll_seconds: poll };
+  if (method === 'oauth' && oauthKind()) {
+    const k = oauthKind(), s = {};
+    const cid = $('oauth_client_id').value.trim(); if (cid) s.client_id = cid;
+    if (k === 'graph') s.tenant = $('oauth_tenant').value.trim() || 'common';
+    const m = { provider: k, poll_seconds: poll }; m[k] = s; return m;
   }
-  if (mailProvider === 'gmail') m.gmail = { client_id: $('gmail_client_id').value.trim(), client_secret_ref: 'keyring' };
-  if (mailProvider === 'graph') m.graph = { client_id: $('graph_client_id').value.trim(), tenant: $('graph_tenant').value.trim() || 'common' };
-  return m;
+  const p = currentPreset();
+  return { provider: 'imap', poll_seconds: poll,
+    imap: { preset: p ? p.id : 'custom', host: $('imap_host').value.trim(), port: parseInt($('imap_port').value, 10) || 993,
+            user: imapUser(), inbox: $('imap_inbox').value.trim() || 'INBOX', sent: $('imap_sent').value.trim() || 'Sent' } };
+}
+
+function friendlyMailError(raw, status) {
+  const t = String(raw || '').toLowerCase();
+  if (/authenticationfailed|invalid credentials|login failed|auth.*fail|\[auth|535|username and password|bad credentials|password/.test(t)) {
+    if (/application-specific|app.?specific|two.?step|2-?step|2fa|web login required|webalert/.test(t))
+      return 'Your email needs 2-Step Verification turned on before it will give out app passwords. Turn it on, make an app password, and try again.';
+    return 'That password was not accepted. Use the app password from the steps above, not your normal password. Check for typos or extra spaces.';
+  }
+  if (/application-specific|app.?specific|two.?step|2-?step|web login required|webalert/.test(t))
+    return 'Your email needs 2-Step Verification turned on before it will give out app passwords. Turn it on, make an app password, and try again.';
+  if (/imap.*(disabled|not enabled)|disabled.*imap|imap access|not enabled for imap/.test(t))
+    return 'Your email service has outside access switched off. In your email settings, turn on IMAP access, then try again.';
+  if (/getaddrinfo|name or service|network is unreachable|timed out|timeout|connection refused|no route|offline|failed to fetch|networkerror/.test(t))
+    return 'Email Boss could not reach the internet. Check that this computer is online, then try again.';
+  if (/folder|mailbox|nonexistent|no such/.test(t))
+    return 'Signed in, but a mail folder was not found. Open Advanced and check the Inbox and Sent folder names.';
+  return 'The test did not work' + (status ? ' (code ' + status + ')' : '') + '. Check the app password and try again. If it keeps failing, open Advanced and check the mail server.';
 }
 async function testMail() {
-  const msg = $('mailmsg'); msg.style.color = ''; msg.textContent = 'connecting...';
+  const msg = $('mailmsg'); msg.className = 'msg'; msg.textContent = 'Testing...';
+  if (!$('imap_password').value) { msg.className = 'msg err'; msg.textContent = 'Paste your app password first.'; return; }
   try {
     const body = mailBody();
-    if (mailProvider === 'imap' && $('imap_password').value) body.imap_password = $('imap_password').value;
+    body.imap_password = $('imap_password').value;
     const r = await api('/api/mail/test', { method: 'POST', body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.ok) {
-      const f = j.folders || {};
-      msg.style.color = 'var(--good)';
-      msg.textContent = 'connected' + (f.inbox ? ': inbox ' + ((f.inbox || {}).messages ?? '?') + ' messages, sent ' + ((f.sent || {}).messages ?? '?') : (j.detail ? ': ' + j.detail : ''));
-      return;
-    }
-    msg.style.color = 'var(--bad)';
+    if (r.ok && j.ok) { msg.className = 'msg ok'; msg.textContent = 'Connected. Your email works.'; return; }
     let why = j.error || j.detail || '';
-    for (const k of ['inbox', 'sent']) {
-      const f = (j.folders || {})[k];
-      if (f && f.ok === false) {
-        why = (why ? why + ' / ' : '') + k + ' folder "' + f.folder + '": ' + (f.error || 'not found');
-        if (f.available && f.available.length) why += '. Try one of: ' + f.available.slice(0, 8).join(', ');
-      }
-    }
-    msg.textContent = why || ('connection failed (HTTP ' + r.status + ')');
-  } catch (e) { msg.style.color = 'var(--bad)'; msg.textContent = String(e); }
+    for (const k of ['inbox', 'sent']) { const f = (j.folders || {})[k]; if (f && f.ok === false) why += ' folder ' + (f.error || 'not found'); }
+    msg.className = 'msg err'; msg.textContent = friendlyMailError(why, r.status);
+  } catch (e) { msg.className = 'msg err'; msg.textContent = friendlyMailError(String(e)); }
 }
-async function oauthStart(kind) {
-  const msg = $(kind + 'msg'); msg.style.color = ''; msg.textContent = 'starting sign-in...';
+async function oauthStart() {
+  const kind = oauthKind(); if (!kind) return;
+  const msg = $('oauthmsg'); msg.className = 'msg'; msg.textContent = 'Starting sign-in...';
   try {
-    const body = { provider: kind };
-    if (kind === 'gmail') body.client_id = $('gmail_client_id').value.trim();
-    if (kind === 'graph') { body.client_id = $('graph_client_id').value.trim(); body.tenant = $('graph_tenant').value.trim() || 'common'; }
-    const r = await api('/api/mail/oauth/start', { method: 'POST', body: JSON.stringify(body) });
+    const settings = {};
+    const cid = $('oauth_client_id').value.trim(); if (cid) settings.client_id = cid;
+    if (kind === 'graph') settings.tenant = $('oauth_tenant').value.trim() || 'common';
+    const r = await api('/api/mail/oauth/start', { method: 'POST', body: JSON.stringify({ provider: kind, settings }) });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j.ok) { msg.style.color = 'var(--bad)'; msg.textContent = j.error || ('HTTP ' + r.status); return; }
-    const url = j.auth_url || j.url;
-    if (j.user_code) {
-      msg.style.color = 'var(--good)';
-      msg.innerHTML = 'Go to <a href="' + esc(j.verification_uri || url) + '" target="_blank" rel="noopener" style="color:var(--accent)">' + esc(j.verification_uri || url) + '</a> and enter code <b>' + esc(j.user_code) + '</b>.';
-      return;
-    }
-    if (url) { window.open(url, '_blank', 'noopener'); msg.style.color = 'var(--good)'; msg.textContent = 'sign-in opened in a new tab; finish it there, then continue.'; }
-    else { msg.textContent = 'started.'; }
-  } catch (e) { msg.style.color = 'var(--bad)'; msg.textContent = String(e); }
+    if (!r.ok || j.ok === false) { msg.className = 'msg err'; msg.textContent = 'Sign-in could not start. You can use an app password instead.'; return; }
+    const url = j.url || j.auth_url;
+    if (url) { window.open(url, '_blank', 'noopener'); oauthStarted = true; msg.className = 'msg ok'; msg.textContent = 'Sign-in opened in a new tab. When it says you are connected, come back here and press Next.'; }
+    else { msg.className = 'msg err'; msg.textContent = 'Sign-in could not start. You can use an app password instead.'; }
+  } catch (e) { msg.className = 'msg err'; msg.textContent = 'Could not reach Email Boss. Try again.'; }
 }
 
-// ── AI ──────────────────────────────────────────────────────────────────
-function pickAI(id, keepFields) {
-  aiProvider = ['none', 'anthropic', 'openai', 'ollama'].includes(id) ? id : 'none';
-  ['none', 'anthropic', 'openai', 'ollama'].forEach(k => { const el = $('ai-' + k); if (el) el.classList.toggle('sel', aiProvider === k); });
-  $('ai-block').hidden = aiProvider === 'none';
-  $('ai-key-wrap').style.visibility = aiProvider === 'ollama' ? 'hidden' : 'visible';
-  if (!keepFields || !$('ai_model').value) $('ai_model').value = AI_DEFAULT_MODEL[aiProvider] || '';
-  if (!keepFields || !$('ai_base_url').value) $('ai_base_url').value = AI_DEFAULT_URL[aiProvider] || '';
-  $('ai_base_url').placeholder = aiProvider === 'openai' ? 'https://api.openai.com/v1 (or Groq / Together / LM Studio)' : aiProvider === 'ollama' ? 'http://localhost:11434' : 'leave blank for the default';
+// ── screen 2 ──────────────────────────────────────────────────────────────
+function renderProfessions() {
+  const order = Object.keys(PROF_TEXT);
+  const list = PROFESSIONS.filter(p => !p.error).slice().sort((a, b) => {
+    const ia = order.indexOf(a.id), ib = order.indexOf(b.id);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  $('professions').innerHTML = list.map(p => {
+    const t = PROF_TEXT[p.id] || [p.label, p.description || ''];
+    return `<button type="button" class="choice ${p.id === selectedProfession ? 'sel' : ''}" onclick="pickProfession('${esc(p.id)}')"><b>${esc(t[0])}</b><span>${esc(t[1])}</span></button>`;
+  }).join('');
 }
+function pickProfession(id) { selectedProfession = id; $('err-work').textContent = ''; renderProfessions(); }
+
+// ── screen 3 ──────────────────────────────────────────────────────────────
+function aiMode() { return $('ai_own').checked ? 'own' : ($('ai_off').checked ? 'none' : 'emailboss'); }
+function aiModeChanged() { $('ai-own-block').hidden = aiMode() !== 'own'; if (aiMode() === 'own') aiProviderChanged(true); }
+function aiProviderChanged(keep) {
+  const p = $('ai_provider').value;
+  if (!keep || !$('ai_model').value) $('ai_model').value = AI_DEFAULT_MODEL[p] || '';
+  if (!keep || !$('ai_base_url').value) $('ai_base_url').value = AI_DEFAULT_URL[p] || '';
+  $('ai-key-wrap').style.visibility = p === 'ollama' ? 'hidden' : 'visible';
+}
+function paChanged() { $('pa-hint').hidden = !$('use_pa').checked; }
 function aiBody() {
-  const a = { provider: aiProvider, model: $('ai_model').value.trim(), base_url: $('ai_base_url').value.trim(),
-              daily_budget_usd: parseFloat($('ai_budget').value) || 0,
-              features: { assistant: $('ai_assistant').checked } };
-  if ($('ai_api_key').value && aiProvider !== 'ollama') a.api_key = $('ai_api_key').value;
+  const m = aiMode();
+  if (m === 'none') return { provider: 'none' };
+  if (m === 'emailboss') return { provider: 'emailboss' };
+  const p = $('ai_provider').value;
+  const a = { provider: p, model: $('ai_model').value.trim(), base_url: $('ai_base_url').value.trim() };
+  if ($('ai_api_key').value && p !== 'ollama') a.api_key = $('ai_api_key').value;
   return a;
 }
 async function testAI() {
-  const msg = $('aimsg'); msg.style.color = ''; msg.textContent = 'testing...';
+  const msg = $('aimsg'); msg.className = 'msg'; msg.textContent = 'Testing...';
   try {
     const r = await api('/api/ai/test', { method: 'POST', body: JSON.stringify(aiBody()) });
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.ok) { msg.style.color = 'var(--good)'; msg.textContent = 'OK' + (j.model ? ': ' + j.model : '') + (j.latency_ms ? ' (' + j.latency_ms + ' ms)' : ''); }
-    else { msg.style.color = 'var(--bad)'; msg.textContent = j.error || ('HTTP ' + r.status); }
-  } catch (e) { msg.style.color = 'var(--bad)'; msg.textContent = String(e); }
+    if (r.ok && j.ok) { msg.className = 'msg ok'; msg.textContent = 'AI works.'; }
+    else { msg.className = 'msg err'; msg.textContent = 'The AI test did not work. Check the key and the model name.'; }
+  } catch (e) { msg.className = 'msg err'; msg.textContent = 'Could not reach Email Boss. Try again.'; }
 }
 
-async function probePaths() {
-  const v = $('data_root').value.trim();
-  if (!v) { $('pathmsg').textContent = 'enter a folder first'; return; }
-  try {
-    const r = await (await api('/api/setup/probe?path=' + encodeURIComponent(v))).json();
-    const p = r.path || {};
-    $('pathmsg').textContent = p.error ? ('check failed: ' + p.error) : (p.exists ? (p.is_dir ? 'exists' : 'exists but is not a folder') : 'will be created');
-  } catch (e) { $('pathmsg').textContent = 'check failed'; }
-}
-
-function renderSummary() {
-  const prof = PROFESSIONS.find(p => p.id === selectedProfession) || { label: selectedProfession };
-  const rows = [
-    ['You', `<b>${esc($('name').value)}</b> ${esc($('email').value)}${$('company').value ? ' / ' + esc($('company').value) : ''}`],
-    ['Profession', `<b>${esc(prof.label || prof.id)}</b>`],
-    ['Data folder', `<b>${esc($('data_root').value || '(default)')}</b>`],
-    ['Mail', `<b>${esc(mailProvider)}</b>${mailProvider === 'imap' ? ' ' + esc($('imap_user').value) + ' @ ' + esc($('imap_host').value) : ''}`],
-    ['AI', `<b>${esc(aiProvider)}</b>${aiProvider !== 'none' ? ' ' + esc($('ai_model').value) : ''}`],
-    ['License', $('dev_skip').checked ? '<b>developer mode</b> (no key)' : `<b>${esc($('license_key').value.slice(0, 12))}...</b>`],
-  ];
-  $('summary').innerHTML = rows.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('');
-}
-
-// POST /api/setup (api/setup.py + config.build_document): user{}, profession,
-// paths{}, mail{} (+ imap_password rides once), ai{} (+ api_key rides once),
-// license{}, features{}, force.
+// POST /api/setup body, compatible with api/setup.py + config.build_document.
 function buildBody() {
+  const tz = getTz();
+  const bind = $('bind').value.trim() || '127.0.0.1';
   const body = {
-    user: {
-      name: $('name').value.trim(), email: $('email').value.trim(),
-      aliases: $('aliases').value, company: $('company').value.trim(), role: $('role').value.trim(),
-      internal_domains: $('internal_domains').value,
-    },
+    user: { name: $('name').value.trim(), email: $('email').value.trim() },
     profession: selectedProfession,
-    paths: { data_root: $('data_root').value.trim() },
+    paths: {},
+    server: { bind: bind, port: parseInt($('port').value, 10) || 8080 },
     mail: mailBody(),
     ai: aiBody(),
-    license: { key: $('dev_skip').checked ? '' : $('license_key').value.trim() },
+    license: { key: $('license_key').value.trim() },
     features: { money: true, game_layer: true, analytics: true },
     force: true,
   };
-  if (mailProvider === 'imap' && $('imap_password').value) body.mail.imap_password = $('imap_password').value;
+  if ($('data_root').value.trim()) body.paths.data_root = $('data_root').value.trim();
+  if (tz) { body.timezone = tz; body.business_hours = { tz: tz }; body.config = { timezone: tz }; }
+  if (body.mail.provider === 'imap' && $('imap_password').value) body.mail.imap_password = $('imap_password').value;
   return body;
 }
 
 async function save() {
-  for (let k = 0; k < STEPS.length; k++) { const err = validateStep(k); if (err) { goto(k); flash(err); return; } }
+  for (let k = 0; k < 2; k++) { const err = validate(k); if (err) { cur = k; render(); $('err-' + STEPS[k]).textContent = err; return; } }
   const body = buildBody();
   $('save').disabled = true;
-  $('msg').className = 'msg'; $('msg').textContent = 'Writing...';
+  const msg = $('msg'); msg.className = 'msg'; msg.textContent = 'Setting things up...';
+  let j;
   try {
     const r = await api('/api/setup', { method: 'POST', body: JSON.stringify(body) });
-    const j = await r.json().catch(() => ({}));
+    j = await r.json().catch(() => ({}));
     if (!r.ok) {
-      $('msg').className = 'msg err';
-      $('msg').textContent = j.error || ('HTTP ' + r.status);
-      $('save').disabled = false;
-      return;
+      msg.className = 'msg err';
+      msg.textContent = r.status === 400 && j.error ? j.error : 'Setup did not finish (code ' + r.status + '). Please try again.';
+      $('save').disabled = false; return;
     }
-    $('msg').className = 'msg ok';
-    $('msg').innerHTML = 'Saved to <code>' + esc(j.config_path) + '</code>.<br>'
-      + (j.problems && j.problems.length ? '<span style="color:var(--warn)">' + j.problems.map(esc).join('<br>') + '</span><br>' : '')
-      + (j.secrets_stored && j.secrets_stored.length ? 'Secrets stored in the keyring: ' + esc(j.secrets_stored.join(', ')) + '.<br>' : '')
-      + (j.api_token ? 'API token (the board is bound off loopback): <code>' + esc(j.api_token) + '</code><br>' : '')
-      + (j.restart_required
-          ? '<b>Restart the board now</b>: the data folder, port or bind are read once at start-up.'
-          : '<a href="/" style="color:var(--accent)">Open the board</a>.');
-    $('imap_password').value = ''; $('ai_api_key').value = '';
-    if (!j.restart_required) setTimeout(() => { location.href = '/'; }, 2500);
-  } catch (e) {
-    $('msg').className = 'msg err'; $('msg').textContent = String(e); $('save').disabled = false;
+  } catch (e) { msg.className = 'msg err'; msg.textContent = 'Could not reach Email Boss. Try again.'; $('save').disabled = false; return; }
+  $('imap_password').value = ''; $('ai_api_key').value = '';
+
+  // Best effort: store the time zone (older servers ignore it in /api/setup).
+  const tz = getTz();
+  if (tz) { try { await api('/api/config', { method: 'PUT', body: JSON.stringify({ timezone: tz, business_hours: { tz: tz } }) }); } catch (e) {} }
+  // Free trial; if it fails the board shows the license banner.
+  try { await api('/api/license/trial', { method: 'POST', body: JSON.stringify({ email: body.user.email }) }); } catch (e) {}
+
+  const extra = (j.api_token ? '<br>Your security token: <code>' + esc(j.api_token) + '</code>' : '');
+  if (j.restart_required) {
+    let restarted = false;
+    try { const r = await api('/api/restart', { method: 'POST', body: '{}' }); restarted = r.ok; } catch (e) {}
+    msg.className = 'msg ok';
+    msg.innerHTML = restarted
+      ? 'Almost done. Email Boss is restarting. This page will open it in a few seconds.' + extra
+      : '<b>Close and reopen Email Boss</b> to finish. Your choices are saved.' + extra;
+    if (restarted) setTimeout(function wait() {
+      api('/api/health').then(r => { if (r.ok) location.href = '/'; else setTimeout(wait, 1500); }).catch(() => setTimeout(wait, 1500));
+    }, 3000);
+    return;
   }
+  msg.className = 'msg ok'; msg.innerHTML = 'All set.' + extra;
+  setTimeout(() => { location.href = '/'; }, j.api_token ? 6000 : 600);
 }
 
+async function boot() {
+  try { TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { TZ = ''; }
+  $('tzname').textContent = TZ || 'not detected';
+  if (!TZ) changeTz();
+  CFG = await jget('/api/config');
+  if (CFG) {
+    const u = CFG.user || {};
+    if (u.name) $('name').value = u.name;
+    if (u.email) $('email').value = u.email;
+    if (CFG.paths && CFG.paths.data_root) $('data_root').value = CFG.paths.data_root;
+    if (CFG.server && CFG.server.bind) $('bind').value = CFG.server.bind;
+    if (CFG.server && CFG.server.port) $('port').value = CFG.server.port;
+    if (CFG.profession && CFG.profession.template && CFG.configured) selectedProfession = CFG.profession.template;
+  }
+  const probe = await jget('/api/setup/probe');
+  if (probe && probe.suggest && probe.suggest.data_root) $('data_default').textContent = 'Default: ' + probe.suggest.data_root;
+  const rd = await jget('/api/mail/oauth/ready');
+  if (rd) READY = { gmail: !!rd.gmail, graph: !!rd.graph };
+  const mp = await jget('/api/mail/providers');
+  const imap = mp && (mp.providers || []).find(x => x.id === 'imap');
+  IMAP_PRESETS = (imap && imap.presets) || (mp && mp.imap_presets) || [];
+  if (!IMAP_PRESETS.length) {
+    IMAP_PRESETS = [
+      { id: 'gmail', host: 'imap.gmail.com', port: 993, inbox_folder: 'INBOX', sent_folder: '[Gmail]/Sent Mail' },
+      { id: 'outlook', host: 'outlook.office365.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent' },
+      { id: 'icloud', host: 'imap.mail.me.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent Messages' },
+      { id: 'yahoo', host: 'imap.mail.yahoo.com', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent' },
+      { id: 'custom', host: '', port: 993, inbox_folder: 'INBOX', sent_folder: 'Sent' },
+    ];
+  }
+  const pj = await jget('/api/professions');
+  PROFESSIONS = (pj && pj.professions) || [];
+  if (!PROFESSIONS.length) $('professions').innerHTML = '<div class="msg err">Could not load the list. Is Email Boss running?</div>';
+  else renderProfessions();
+  renderProviders();
+  aiProviderChanged(false);
+  render();
+}
 boot();
 </script>
 </body>

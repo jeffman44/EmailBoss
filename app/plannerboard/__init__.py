@@ -74,7 +74,8 @@ class Runtime:
 
     def _raw_profession(self):
         return _profession.effective(self.config.profession_template, self.config.profession_overrides,
-                                     user=self.config.doc.get("user"), features=self.config.features)
+                                     user=self.config.doc.get("user"), features=self.config.features,
+                                     timezone=self.config.doc.get("timezone"))
 
     def profession(self):
         with self._lock:
@@ -335,6 +336,13 @@ def create_app(config_path=None, config=None, testing=None):
         print(f"[mail] layer not installed: {type(e).__name__}: {e}")
 
     _api_package().register_blueprints(app)
+
+    # Background threads must not write while the license is read-only.
+    try:
+        from .triage.license_gate import set_license_provider
+        set_license_provider(lambda: getattr(rt, "license", None))
+    except Exception:
+        pass
 
     import secrets as _secrets
     rt.session_token = _secrets.token_urlsafe(32)

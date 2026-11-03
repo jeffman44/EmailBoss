@@ -95,7 +95,7 @@
     },
     {
       "key": "quote_amount",
-      "label": "Quoted",
+      "label": "Fee quoted",
       "type": "money",
       "show_on": [
         "card",
@@ -108,7 +108,7 @@
     },
     {
       "key": "approved_amount",
-      "label": "Approved",
+      "label": "Fee agreed",
       "type": "money",
       "show_on": [
         "drawer",
@@ -138,12 +138,12 @@
     },
     {
       "id": "sla",
-      "label": "SLA"
+      "label": "Reply by"
     }
   ],
   "teams": [],
   "business_hours": {
-    "tz": "America/New_York",
+    "tz": "",
     "start": 8,
     "end": 17,
     "days": [
@@ -232,8 +232,8 @@
     "title"
   ],
   "features": {
-    "money": true,
-    "game_layer": true,
+    "money": false,
+    "game_layer": false,
     "analytics": true
   },
   "workflows": {
@@ -516,7 +516,7 @@
         },
         {
           "id": "sla",
-          "label": "SLA",
+          "label": "Reply by",
           "match": {
             "date_type": "sla"
           }

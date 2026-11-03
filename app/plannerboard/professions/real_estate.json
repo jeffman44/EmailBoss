@@ -49,21 +49,20 @@
       "source": "key_details"
     },
     {
-      "key": "list_price",
-      "label": "List price",
-      "type": "money",
+      "key": "closing_date",
+      "label": "Closing date",
+      "type": "date",
       "show_on": [
         "card",
-        "drawer",
-        "list"
+        "drawer"
       ],
       "searchable": false,
       "group": "Details",
       "source": "key_details"
     },
     {
-      "key": "closing_date",
-      "label": "Closing date",
+      "key": "showing_date",
+      "label": "Showing scheduled",
       "type": "date",
       "show_on": [
         "card",
@@ -97,7 +96,7 @@
     },
     {
       "key": "quote_amount",
-      "label": "Quoted",
+      "label": "List price",
       "type": "money",
       "show_on": [
         "card",
@@ -110,7 +109,7 @@
     },
     {
       "key": "approved_amount",
-      "label": "Approved",
+      "label": "Commission",
       "type": "money",
       "show_on": [
         "drawer",
@@ -140,7 +139,7 @@
     },
     {
       "id": "sla",
-      "label": "SLA"
+      "label": "Reply by"
     },
     {
       "id": "quote",
@@ -149,7 +148,7 @@
   ],
   "teams": [],
   "business_hours": {
-    "tz": "America/New_York",
+    "tz": "",
     "start": 8,
     "end": 17,
     "days": [
@@ -239,8 +238,8 @@
     "closing_date"
   ],
   "features": {
-    "money": true,
-    "game_layer": true,
+    "money": false,
+    "game_layer": false,
     "analytics": true
   },
   "workflows": {
@@ -312,6 +311,12 @@
             }
           },
           {
+            "id": "showing_scheduled",
+            "label": "Showing scheduled",
+            "role": "in_progress",
+            "column": true
+          },
+          {
             "id": "under_contract",
             "label": "Under Contract",
             "role": "in_progress",
@@ -381,6 +386,12 @@
               "date_type": "follow_up",
               "days": 3
             }
+          },
+          {
+            "id": "showing_scheduled",
+            "label": "Showing scheduled",
+            "role": "in_progress",
+            "column": true
           },
           {
             "id": "offer_out",
@@ -543,7 +554,7 @@
         },
         {
           "id": "sla",
-          "label": "SLA",
+          "label": "Reply by",
           "match": {
             "date_type": "sla"
           }

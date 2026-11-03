@@ -127,6 +127,42 @@ def api_approve_triage(triage_id):
     return jsonify(result)
 
 
+@bp.route("/api/triage/approve-all", methods=["POST"])
+def api_approve_all_triage():
+    """Approve every pending card that already names an existing project.
+    Unmatched cards are skipped (never guessed). Body (optional): {ids: [...]}
+    limits the batch. Returns {ok, approved, skipped_unmatched, failed,
+    failures: [{id, error}], remaining}."""
+    db = store()
+    data = body()
+    only = set(data.get("ids") or []) if isinstance(data.get("ids"), list) else None
+    r = rt()
+    approved = skipped = failed = 0
+    failures = []
+    for card in db.list_triage("pending"):
+        tid = card.get("triage_id")
+        if only is not None and tid not in only:
+            continue
+        pid = (card.get("matched_project") or "").strip()
+        if not pid or not db.project_exists(pid):
+            skipped += 1
+            continue
+        try:
+            result = db.approve_triage(tid, pid, actor="user")
+            if isinstance(result, dict) and not result.get("already_approved"):
+                try:
+                    from ..triage.pipeline import after_approve
+                    after_approve(db, r.config.doc, r.profession(), db.get_triage_card(tid) or {}, pid)
+                except Exception:
+                    pass
+            approved += 1
+        except Exception as e:
+            failed += 1
+            failures.append({"id": tid, "error": f"{type(e).__name__}: {e}"[:200]})
+    return jsonify({"ok": failed == 0, "approved": approved, "skipped_unmatched": skipped, "failed": failed,
+                    "failures": failures, "remaining": db.count_pending_triage()})
+
+
 @bp.route("/api/triage/<triage_id>", methods=["DELETE"])
 def api_delete_triage(triage_id):
     """Dismiss WITHOUT throwing away correspondence on an already-routed thread."""

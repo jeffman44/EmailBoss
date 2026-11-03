@@ -9,11 +9,11 @@ from email import policy
 
 import pytest
 
-from plannerboard.mail import compose, secrets, smtp as smtpmod
+from plannerboard.mail import compose, imap as imapmod, secrets, smtp as smtpmod
 from plannerboard.mail.base import guess_folder_kind, message_dict, summary_dict
 from plannerboard.mail.gmail import GmailProvider
 from plannerboard.mail.graph import GraphProvider
-from plannerboard.mail.imap import ImapProvider, parse_list_line
+from plannerboard.mail.imap import ImapProvider, MailRefused, parse_list_line
 from plannerboard.mail.message import Address, Attachment, Message
 from tests.test_mail_providers import FakeHttp, _b64url
 
@@ -52,7 +52,57 @@ def test_compose_subjects_and_recipients():
     assert [a.email for a in cc] == ["ops@northwind.example", "cc@northwind.example"]
     m2 = _msg(reply_to=[Address("replies@northwind.example")])
     to, _ = compose.reply_recipients(m2, "sam@acme.example", reply_all=False)
+    assert to[0].email == "dana@northwind.example"                       # From is the default target
+    assert [a.email for a in compose.reply_to_differs(m2)] == ["replies@northwind.example"]
+    to, _ = compose.reply_recipients(m2, "sam@acme.example", reply_all=False, use_reply_to=True)
     assert to[0].email == "replies@northwind.example"
+    assert compose.reply_to_differs(_msg(reply_to=[Address("dana@northwind.example")])) == []
+    # aliases are excluded from reply-all, not just the primary address
+    m3 = _msg(to=[Address("sam@acme.example"), Address("sam.alias@acme.example"), Address("ops@northwind.example")])
+    _to, cc = compose.reply_recipients(m3, "sam@acme.example", reply_all=True, aliases=["Sam.Alias@acme.example"])
+    assert [a.email for a in cc] == ["ops@northwind.example", "cc@northwind.example"]
+
+
+@pytest.mark.parametrize("payload", [
+    '<img src=x onerror=alert(1)>',
+    '<svg onload=alert(1)><circle/></svg>',
+    '<a href="javascript:alert(1)">x</a>',
+    '<a href=" jav&#x09;ascript:alert(1)">x</a>',
+    '<scr<script>ipt>alert(1)</scr</script>ipt>',
+    '<iframe src="//evil.example"></iframe>',
+    '<form action="//evil.example"><input name=a></form>',
+    '<object data="x"></object><embed src="x"><base href="//evil.example"><meta http-equiv=refresh content="0;url=//e">',
+    '<link rel=stylesheet href="//evil.example/x.css"><style>@import "//evil.example"</style>',
+    '<div style="background:url(//evil.example/x)" onclick="alert(1)">x</div>',
+    '<a href="data:text/html;base64,PHNjcmlwdD4=">x</a>',
+    '<p onmouseover=alert(1)>hover</p>',
+])
+def test_sanitize_html_classic_payloads(payload):
+    out = compose.sanitize_html(payload).lower()
+    for bad in ("<script", "<svg", "<iframe", "<form", "<object", "<embed", "<base", "<meta", "<link", "<style",
+                "onerror", "onload", "onclick", "onmouseover", "javascript:", "data:text", "url(", "@import", "evil.example/x"):
+        assert bad not in out, (bad, out)
+    # every tag that survives is on the allowlist
+    for tag in re.findall(r"</?([a-z0-9]+)", out):
+        assert tag in compose.ALLOWED_TAGS, (tag, out)
+
+
+def test_sanitize_html_keeps_safe_markup_and_blocks_remote():
+    src = ('<div style="color:red"><p>Hi <b>there</b> <a href="https://ok.example/a?b=1&amp;c=2">link</a></p>'
+           '<img src="https://track.example/p.gif" width="1" height="1"><img src="cid:logo1"><ul><li>one</li></ul></div>')
+    out = compose.sanitize_html(src)
+    assert '<a href="https://ok.example/a?b=1&amp;c=2" rel="noopener noreferrer">link</a>' in out
+    assert 'style="color:red"' in out and "<li>one</li>" in out and 'src="cid:logo1"' in out
+    assert 'src="https://track.example/p.gif"' in out
+    blocked, n = compose.sanitize_html_info(src, block_remote=True)
+    assert n == 1 and "track.example" in blocked and ' src="https://track.example' not in blocked
+    assert 'data-pb-src="https://track.example/p.gif"' in blocked and "data:image/gif" in blocked
+
+
+def test_quote_reply_sanitizes_the_original():
+    m = _msg(body='<p>hi</p><img src=x onerror=alert(1)><script>alert(2)</script><img src="https://t.example/p.png">')
+    q = compose.quote_reply(m, block_remote=True)
+    assert "onerror" not in q and "<script" not in q and "https://t.example" in q and ' src="https://t.example' not in q
 
 
 def test_build_message_threads_and_parts():
@@ -221,10 +271,21 @@ class FakeIMAP:
             self.folders[dest]["msgs"][nu] = item
             self._resp["COPYUID"] = [f"COPYUID {self.folders[dest]['uv']} {u} {nu}".encode()]
             return "OK", [b""]
+        if cmd == "COPY":
+            u, dest = int(args[0]), args[1].strip('"')
+            nu = self.next_uid = self.next_uid + 1
+            self.folders[dest]["msgs"][nu] = [f["msgs"][u][0], list(f["msgs"][u][1])]
+            self._resp["COPYUID"] = [f"COPYUID {self.folders[dest]['uv']} {u} {nu}".encode()]
+            return "OK", [b""]
+        if cmd == "EXPUNGE":
+            u = int(args[0])
+            if "\\Deleted" in f["msgs"].get(u, [None, []])[1]:
+                f["msgs"].pop(u)
+            return "OK", [b""]
         raise AssertionError(f"unexpected {cmd}")
 
     def expunge(self):
-        return "OK", [b""]
+        raise AssertionError("bare EXPUNGE must never be used")
 
     def append(self, folder, flags, date, raw):
         name = folder.strip('"')
@@ -308,6 +369,64 @@ def test_imap_move_delete_draft_send(imap_prov):
 
     assert p.delete_message("7:42:INBOX") is True
     assert 42 not in p.fake.folders["INBOX"]["msgs"] and len(p.fake.folders["Trash"]["msgs"]) == 1
+
+
+def test_imap_delete_and_move_safety(imap_prov):
+    p = imap_prov
+    # COPY fallback (no MOVE): UID EXPUNGE of the one uid, never a bare EXPUNGE
+    p.fake.capabilities = ("IMAP4REV1", "UIDPLUS")
+    p.fake.folders["INBOX"]["msgs"][43][1].append("\\Deleted")           # someone else's pending delete
+    p.fake.folders["INBOX"]["msgs"][44] = [RAW2, []]
+    ref = p.move_message("7:44:INBOX", "Sent")
+    assert ref and ref.endswith(":Sent")
+    assert 44 not in p.fake.folders["INBOX"]["msgs"] and 43 in p.fake.folders["INBOX"]["msgs"]
+    assert ("EXPUNGE", "44") in p.fake.log
+    # no UIDPLUS and no MOVE: refuse rather than a bare EXPUNGE
+    p.fake.capabilities = ("IMAP4REV1",)
+    with pytest.raises(MailRefused):
+        p.move_message("7:42:INBOX", "Sent")
+    assert 42 in p.fake.folders["INBOX"]["msgs"]
+    p.fake.capabilities = ("IMAP4REV1", "MOVE", "UIDPLUS")
+    # stale UIDVALIDITY on flags / move / delete
+    for call in (lambda: p.set_flags("6:42:INBOX", read=True), lambda: p.move_message("6:42:INBOX", "Sent"),
+                 lambda: p.delete_message("6:42:INBOX")):
+        with pytest.raises(MailRefused):
+            call()
+    # no Trash folder: delete refused, nothing expunged
+    del p.fake.folders["Trash"]
+    p._kind_cache = None
+    p.fake.list = lambda: ("OK", [b'(\\HasNoChildren) "/" INBOX', b'(\\HasNoChildren \\Sent) "/" Sent'])
+    with pytest.raises(MailRefused) as ei:
+        p.delete_message("7:42:INBOX")
+    assert "no Trash folder" in str(ei.value) and 42 in p.fake.folders["INBOX"]["msgs"]
+
+
+def test_cleartext_login_refused_unless_allowed():
+    st = imapmod.settings_from_config({"imap": {"host": "imap.x.example", "user": "u", "ssl": False}})
+    assert st["allow_insecure"] is False
+
+    class Plain:
+        capabilities = ("IMAP4REV1",)
+        logged = False
+        def login(self, u, p): Plain.logged = True
+        def logout(self): pass
+
+    orig = imapmod.imaplib.IMAP4
+    imapmod.imaplib.IMAP4 = lambda *a, **k: Plain()
+    try:
+        with pytest.raises(ValueError, match="unencrypted"):
+            imapmod.connect(st, "pw")
+        assert Plain.logged is False
+        imapmod.connect(dict(st, allow_insecure=True), "pw")
+        assert Plain.logged is True
+    finally:
+        imapmod.imaplib.IMAP4 = orig
+    s_plain = smtpmod.smtp_settings({"smtp": {"host": "smtp.x.example", "starttls": False, "ssl": False}}, {"user": "u"})
+    with pytest.raises(ValueError, match="unencrypted"):
+        smtpmod.send(s_plain, "u@x.example", ["a@b.c"], b"raw", password="pw", smtp_factory=lambda *a: FakeSMTP())
+    fake = FakeSMTP()
+    smtpmod.send(dict(s_plain, allow_insecure=True), "u@x.example", ["a@b.c"], b"raw", password="pw", smtp_factory=lambda *a: fake)
+    assert ("login", "u", "pw") in fake.log
 
 
 # ── Gmail / Graph client methods ────────────────────────────────────────────
@@ -524,3 +643,70 @@ def test_client_api_no_provider(tmp_path):
     # the drop-folder provider has no client capabilities -> 501
     app.extensions["pb"]["cfg"] = {"mail": {"provider": "pa_folder"}, "paths": {"data_root": str(tmp_path)}}
     assert c.get("/api/mail/client/folders").status_code == 501
+
+
+RAW_EVIL = (b"From: Eve <eve@evil.example>\r\nReply-To: Eve Replies <replies@evil.example>\r\n"
+            b"To: sam@acme.example, SAM.ALIAS@acme.example, a@x.example, b@x.example, c@x.example\r\n"
+            b"Subject: Hello\r\nDate: Thu, 02 Oct 2026 10:00:00 -0600\r\nMessage-ID: <i9@mail.example>\r\n"
+            b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/html\r\n\r\n"
+            b"<p>hi</p><img src=x onerror=alert(1)><script>alert(1)</script><img src='https://t.example/p.png'>\r\n"
+            b"--B\r\nContent-Type: text/html; name=a.html\r\nContent-Disposition: attachment; filename=\"a.html\"\r\n\r\n<script>alert(1)</script>\r\n"
+            b"--B\r\nContent-Type: image/png; name=pic.png\r\nContent-Disposition: inline; filename=\"pic.png\"\r\nContent-ID: <p1>\r\n\r\nPNG\r\n"
+            b"--B\r\nContent-Type: application/pdf; name=r.pdf\r\nContent-Disposition: attachment; filename=\"r.pdf\"\r\n\r\n%PDF-1\r\n"
+            b"--B\r\nContent-Type: application/pdf; name=r.pdf\r\nContent-Disposition: attachment; filename=\"r.pdf\"\r\n\r\n%PDF-2\r\n--B--\r\n")
+
+
+def test_client_api_security_and_plain_errors(client_app):
+    app, store, cfg, prov = client_app
+    cfg["user"]["aliases"] = ["sam.alias@acme.example"]
+    prov.fake.folders["INBOX"]["msgs"][50] = [RAW_EVIL, []]
+    c = app.test_client()
+    ref = "7:50:INBOX"
+    m = c.get("/api/mail/client/message?ref=" + ref.replace(":", "%3A")).get_json()
+    assert all("ref=7%3A50%3AINBOX&index=" in a["url"] for a in m["attachments"])
+    names = [a["name"] for a in m["attachments"]]
+    idx = {n: i for i, n in enumerate(names)}
+    # unsafe type: forced download + sandbox CSP + nosniff
+    h = c.get(f"/api/mail/client/attachment?ref={ref}&index={idx['a.html']}")
+    assert h.headers["Content-Security-Policy"] == "sandbox" and h.headers["X-Content-Type-Options"] == "nosniff"
+    assert h.headers["Content-Disposition"].startswith("attachment") and h.mimetype == "application/octet-stream"
+    # inline image stays inline; pdf is allowed
+    i = c.get(f"/api/mail/client/attachment?ref={ref}&index={idx['pic.png']}")
+    assert i.headers["Content-Disposition"].startswith("inline") and i.mimetype == "image/png"
+    assert i.headers["Content-Security-Policy"] == "sandbox"
+    # reply-all: aliases excluded, Reply-To shown as an alternative, quote sanitized with remote blocked
+    comp = c.post("/api/mail/client/compose", json={"ref": ref, "mode": "reply_all"}).get_json()
+    assert comp["to"] == "Eve <eve@evil.example>" and "sam.alias" not in comp["cc"].lower() and "sam@acme" not in comp["cc"]
+    assert comp["recipient_count"] == 4 and "replies@evil.example" in comp["reply_to_alt"] and comp["use_reply_to"] is False
+    assert "onerror" not in comp["body_html"] and "<script" not in comp["body_html"]
+    assert comp["remote_blocked"] is True and ' src="https://t.example' not in comp["body_html"]
+    swap = c.post("/api/mail/client/compose", json={"ref": ref, "mode": "reply", "use_reply_to": True, "load_images": True}).get_json()
+    assert "replies@evil.example" in swap["to"] and 'src="https://t.example/p.png"' in swap["body_html"]
+    # filing dedupes same-named attachments
+    fl = c.post("/api/mail/client/file", json={"ref": ref, "project_id": "P1"}).get_json()
+    assert fl["ok"]
+    files = [pth.replace("\\", "/").rsplit("/", 1)[-1] for pth in store.correspondence[-1]["attachments"]]
+    assert len(files) == 3
+    assert len(set(f.lower() for f in files)) == len(files)
+    # plain-language errors
+    r = c.post("/api/mail/client/send", json={"to": "x@y.z", "subject": "s"})
+    assert r.status_code == 403 and "mail.send_enabled" not in r.get_json()["error"] and "Settings > Mail" in r.get_json()["error"]
+    assert "ref required" not in c.post("/api/mail/client/flags", json={}).get_json()["error"]
+    # stale UIDVALIDITY and missing Trash answer 409 with a sentence
+    r = c.post("/api/mail/client/move", json={"ref": "6:42:INBOX", "folder": "Sent"})
+    assert r.status_code == 409 and "rebuilt" in r.get_json()["error"]
+    r = c.post("/api/mail/client/flags", json={"ref": "6:42:INBOX", "read": True})
+    assert r.status_code == 409
+    del prov.fake.folders["Trash"]
+    prov._kind_cache = None
+    prov.fake.list = lambda: ("OK", [b'(\\HasNoChildren) "/" INBOX', b'(\\HasNoChildren \\Sent) "/" Sent'])
+    r = c.post("/api/mail/client/delete", json={"ref": "7:42:INBOX"})
+    assert r.status_code == 409 and r.get_json()["error"].startswith("This mail server has no Trash folder, so Email Boss will not delete")
+    r = c.post("/api/mail/client/move", json={"ref": "7:42:INBOX", "folder": "trash"})
+    assert r.status_code == 409 and 42 in prov.fake.folders["INBOX"]["msgs"]
+
+
+def test_unique_names_and_safe_names():
+    from plannerboard.api import mail_client_api as api
+    assert api._unique_names(["a.pdf", "A.pdf", "a.pdf", "../../etc/passwd", "x\\y\\z.txt"]) == \
+        ["a.pdf", "A (1).pdf", "a (2).pdf", "passwd", "z.txt"]

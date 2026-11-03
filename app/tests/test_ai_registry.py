@@ -106,7 +106,7 @@ def test_text_prompt_max_words_and_json_text_fallback():
                             "Task: search.parse": 'Here you go: {"name_contains": "lobby", "overdue_only": false, "sort_by": "urgency"}'})
     llm, _ = _llm(prov)
     value, _ = llm.run("digest.weekly", {"stats_block": "- a: 1"})
-    assert len(value.split()) == 160
+    assert len(value.split()) == 220
     value, _ = llm.run("search.parse", {"query": "lobby"})
     assert value["name_contains"] == "lobby"
 

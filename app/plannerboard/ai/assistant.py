@@ -13,12 +13,14 @@ a generic port of the reference install's assistant-mode skill rules:
     acted | drafted | question_posted | subtask_added | deferred.
     A pending triage card that cannot be resolved is `deferred` with a
     reason code (multi_project | no_project | needs_human), per card.
-  * One open question per project.
+  * Several questions may be open on a project; an answered question is read
+    on the next pass for that project and becomes the `direction_note` of a draft.
   * Customer-facing text may only carry fields in the profession's
     `customer_visible_fields` list; every other project value is scrubbed.
 """
 from __future__ import annotations
 
+import html as _html
 import json
 import os
 import re
@@ -29,6 +31,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ..triage.license_gate import is_read_only
 from .guards import (clean_body, ground_text, residual_content,
                      strip_noise_lines, strip_signature_from_draft)
 
@@ -45,6 +48,7 @@ REASON_NONE = "no_project"
 REASON_HUMAN = "needs_human"
 
 RERANK_MIN_CONFIDENCE = 0.85
+MAX_OPEN_QUESTIONS = 5        # per project; one per task, never a wall of them
 DEFAULT_VISIBLE_FIELDS = ["name", "scope", "location", "site", "status_label"]
 MONEY_FIELDS = ("quote_amount", "approved_amount", "amount", "cost", "margin", "price")
 
@@ -85,6 +89,31 @@ def _parse_dt(val: Any) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def _renewal_date(kd: dict, today: date) -> date | None:
+    """key_details.renewal_date, else the next yearly anniversary of
+    key_details.effective_date. None when neither is a usable date."""
+    d = _parse_dt(kd.get("renewal_date"))
+    if d:
+        return d.date()
+    eff = _parse_dt(kd.get("effective_date"))
+    if not eff:
+        return None
+    eff = eff.date()
+    if eff > today:
+        try:
+            return eff.replace(year=eff.year + 1)
+        except ValueError:
+            return eff + timedelta(days=365)
+    for yr in (today.year, today.year + 1):
+        try:
+            cand = eff.replace(year=yr)
+        except ValueError:
+            cand = date(yr, 3, 1)
+        if cand >= today - timedelta(days=14):
+            return cand
+    return None
 
 
 def _age_text(ts: Any) -> str:
@@ -180,6 +209,7 @@ class AssistantPass:
         self.counts = {o: 0 for o in OUTCOMES}
         self.triage_counts = {"approved": 0, "dismissed": 0, "created": 0, "left": {}}
         self.escalations: list[str] = []
+        self.last_draft_ref = ""
 
     # ------------------------------------------------------------------
     # entry point
@@ -196,6 +226,10 @@ class AssistantPass:
             self._walk_board(max_items)
         except Exception as e:
             self.escalations.append(f"board walk failed: {e}")
+        try:
+            self._renewal_sweep()
+        except Exception as e:
+            self.escalations.append(f"renewal sweep failed: {e}")
         summary = {
             "run_id": self.run_id,
             "started": started,
@@ -287,10 +321,11 @@ class AssistantPass:
             cidx = self.store.contact_index() or {}
         except Exception:
             cidx = {}
-        for addr in [from_email] + [str(a).lower() for a in (card.get("to") or []) + (card.get("cc") or [])]:
-            for pid in cidx.get(addr, []):
-                if pid in active_ids:
-                    contact_hits.add(pid)
+        # The SENDER only: To/Cc addresses are attacker-controlled (anyone can
+        # copy a known contact onto a message), so they never route a card.
+        for pid in cidx.get(from_email, []):
+            if pid in active_ids:
+                contact_hits.add(pid)
 
         strong = id_hits | match_hits
         candidates = strong | contact_hits
@@ -299,14 +334,20 @@ class AssistantPass:
             self._approve(card, pid, "card's own match confirmed, no competing project")
             return
         if candidates:
-            # Ambiguous, or a contact-only match: the model may tie-break, with
-            # a high bar, among the existing candidates only.
-            choice = self._rerank(card, sorted(candidates))
-            if choice:
-                self._approve(card, choice["project_id"], f"rerank {choice['confidence']:.2f}: {choice.get('evidence', '')}"[:200])
+            # A contact-only match is never approved, by rule or by the model:
+            # a thread or id/match hit is required.
+            if strong:
+                # Ambiguous: the model may tie-break, with a high bar, but only
+                # onto a project that has a thread/id/match hit.
+                choice = self._rerank(card, sorted(candidates), allowed=strong)
+                if choice:
+                    self._approve(card, choice["project_id"], f"rerank {choice['confidence']:.2f}: {choice.get('evidence', '')}"[:200])
+                    return
+                self._leave(tid, item, REASON_MULTI if len(candidates) > 1 else REASON_HUMAN,
+                            "candidates: " + ", ".join(sorted(candidates)))
                 return
-            reason = REASON_MULTI if len(candidates) > 1 else REASON_HUMAN
-            self._leave(tid, item, reason, "candidates: " + ", ".join(sorted(candidates)))
+            self._leave(tid, item, REASON_HUMAN,
+                        "sender is a known contact only; needs a thread or reference match: " + ", ".join(sorted(contact_hits)))
             return
 
         # No candidate: mint only when allowed and the email carries enough.
@@ -336,6 +377,13 @@ class AssistantPass:
 
     def _leave(self, tid: Any, item: str, reason: str, detail: str) -> None:
         self.triage_counts["left"][reason] = self.triage_counts["left"].get(reason, 0) + 1
+        # Show the reason on the card (the board reads `leave_reason`).
+        upd = getattr(self.store, "update_triage_card", None)
+        if callable(upd) and tid:
+            try:
+                upd(tid, leave_reason=reason)
+            except Exception:
+                pass
         self._record("", item, "triage", OUTCOME_DEFERRED, result=f"left: {reason}", evidence=detail,
                      reason=reason)
 
@@ -404,7 +452,7 @@ class AssistantPass:
         })
         return out[0] if out else None
 
-    def _rerank(self, card: dict, candidates: list[str]) -> dict | None:
+    def _rerank(self, card: dict, candidates: list[str], allowed: set | None = None) -> dict | None:
         if self.llm is None:
             return None
         rows = []
@@ -427,7 +475,8 @@ class AssistantPass:
             conf = float(res.get("confidence") or 0)
         except (TypeError, ValueError):
             conf = 0.0
-        if pid in candidates and conf >= RERANK_MIN_CONFIDENCE and not res.get("ambiguous"):
+        if pid in candidates and (allowed is None or pid in allowed) \
+                and conf >= RERANK_MIN_CONFIDENCE and not res.get("ambiguous"):
             return {"project_id": pid, "confidence": conf, "evidence": res.get("evidence", "")}
         return None
 
@@ -475,6 +524,10 @@ class AssistantPass:
             if (t.get("date_type") == "deadline") and t.get("follow_up_date") \
                     and str(t["follow_up_date"])[:10] < date.today().isoformat():
                 self.escalations.append(f"{pid}: deadline passed on '{t.get('text', '')}' ({t['follow_up_date']})")
+        answers = self._unread_answers(pid)
+        if answers and pending:
+            if self._work_answers(p, pending, answers, health):
+                return
         if not pending:
             self._record(pid, p.get("name", ""), "project", OUTCOME_DEFERRED,
                          result="no pending task", reason="idle", health=health)
@@ -505,16 +558,129 @@ class AssistantPass:
         })
         return out[0] if out else None
 
+    # -- answered questions ---------------------------------------------------
+    def _unread_answers(self, pid: str) -> list[dict]:
+        fn = getattr(self.store, "unconsumed_answers", None)
+        if not callable(fn):
+            return []
+        try:
+            return list(fn(pid) or [])
+        except Exception:
+            return []
+
+    def _sender_known(self, p: dict, inbound: dict) -> bool:
+        addr = (inbound.get("from_email") or "").strip().lower()
+        if not addr:
+            return False
+        for c in p.get("contacts") or []:
+            e = c.get("email") if isinstance(c, dict) else c
+            if e and str(e).strip().lower() == addr:
+                return True
+        try:
+            return p.get("id") in (self.store.contact_index() or {}).get(addr, [])
+        except Exception:
+            return False
+
+    def _work_answers(self, p: dict, pending: list[dict], answers: list[dict], health: dict | None) -> bool:
+        """Act on answers the user gave to this project's questions: the answer
+        is the `direction_note` of a draft written now. Never changes status."""
+        pid = p.get("id", "")
+        note = "; ".join(f"{(a.get('question') or '')[:120]} -> {(a.get('answer') or '')[:300]}" for a in answers)
+        first = answers[0]
+        task = next((t for t in pending if (t.get("text") or "") == (first.get("unblocks") or "")), None)
+        if task is None:
+            task = next((t for t in pending if _RESPOND_RE.search(t.get("text") or "")), None) \
+                or hottest_task(p, self.profession) or {"text": first.get("unblocks") or "Respond"}
+        text = (task.get("text") or "").strip()
+        ref = ""
+        if _FOLLOWUP_RE.search(text):
+            ref = self._draft_followup(p, task, health)
+        elif _RESPOND_RE.search(text) or not pending:
+            ref = self._work_respond(p, task, health, direction_note=note)
+        else:
+            self.store.add_note(pid, f"Direction from you on '{text[:50]}': {note[:300]}", source="assistant")
+            self._record(pid, text, "task", OUTCOME_ACTED, result="answer noted on the project",
+                         evidence=note[:160], subtask_id=task.get("id"), health=health)
+            ref = "noted"
+        self.last_draft_ref = ref if ref and ref not in ("noted", "exists") else self.last_draft_ref
+        if ref or self.llm is not None:
+            # Consumed once acted on. With no model the answer waits for one.
+            for a in answers:
+                try:
+                    self.store.mark_question_consumed(a["id"])
+                except Exception:
+                    pass
+        return True
+
+    def respond_for_project(self, pid: str) -> dict:
+        """Synchronous, one project: act on its unread answers now. Used by
+        POST /api/questions/<id>/answer. Bounded: one project, one draft."""
+        self.last_draft_ref = ""
+        p = self.store.get_project(pid)
+        if not p:
+            return {"drafted": False, "draft_id": None, "error": "project not found"}
+        answers = self._unread_answers(pid)
+        if not answers:
+            return {"drafted": False, "draft_id": None}
+        pending = [t for t in (p.get("subtasks") or self.store.open_subtasks(pid) or [])
+                   if (t.get("status") or "pending") == "pending"]
+        try:
+            self._work_answers(p, pending, answers, None)
+        except Exception as e:
+            return {"drafted": False, "draft_id": None, "error": f"{type(e).__name__}: {e}"[:160]}
+        ref = self.last_draft_ref or ""
+        return {"drafted": bool(ref), "draft_id": ref or None}
+
+    # -- renewals ------------------------------------------------------------
+    def _renewal_sweep(self) -> None:
+        """A project with a renewal date (or an effective date that recurs
+        yearly) gets its Renewal task armed 30 days before. Arms the task only;
+        the project's status is never moved."""
+        wfs = {}
+        for wf in ((self.profession.get("workflows") or {}).get("workflows")) or []:
+            for st in wf.get("stages") or []:
+                if st.get("id") == "renewal":
+                    wfs[wf.get("id")] = (st.get("owning_task") or {}).get("text") or "Prepare renewal"
+        if not wfs:
+            return
+        today = date.today()
+        for p in self.store.active_projects() or []:
+            text = wfs.get(p.get("workflow_id"))
+            if not text:
+                continue
+            kd = p.get("key_details") or {}
+            due = _renewal_date(kd, today)
+            if not due or not (-14 <= (due - today).days <= 30):
+                continue
+            pid = p.get("id", "")
+            if any((t.get("text") or "") == text and (t.get("status") or "pending") == "pending"
+                   for t in (p.get("subtasks") or [])):
+                continue
+            key = f"renewal_armed:{pid}:{due.isoformat()}"
+            if self.store.meta_get(key):
+                continue
+            sid = self.store.add_subtask(pid, text, date_type="follow_up", follow_up_date=today.isoformat(),
+                                         source="assistant", category="renewal")
+            self.store.meta_set(key, today.isoformat())
+            self._record(pid, text, "renewal", OUTCOME_SUBTASK,
+                         result=f"armed renewal task {sid}; renews {due.isoformat()}",
+                         evidence=f"{(due - today).days} days out")
+
     # -- respond-type tasks ------------------------------------------------
-    def _work_respond(self, p: dict, task: dict, health: dict | None) -> None:
+    def _work_respond(self, p: dict, task: dict, health: dict | None, direction_note: str = "") -> str:
+        """Returns the draft ref when a draft was written, else ''."""
         pid = p.get("id", "")
         inbound = self._find_inbound(p, task)
         if not inbound:
             self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
                          result="no inbound text on the project to classify", reason="no_inbound_text",
                          subtask_id=task.get("id"), health=health)
-            return
-        decision = self._no_reply_decision(p, task, inbound)
+            return ""
+        if direction_note:
+            # The user answered a question about this: draft now, no re-asking.
+            decision = {"decision": "draft", "reason": "user direction", "direction_note": direction_note}
+        else:
+            decision = self._no_reply_decision(p, task, inbound)
         if decision["decision"] == "clear":
             n = self.store.complete_subtasks_matching(pid, task.get("text", "")[:40], completed_by="assistant")
             self.store.add_note(pid, f"Assistant: no reply needed on '{inbound.get('subject', '')[:60]}' ({decision['reason']})", source="assistant")
@@ -522,13 +688,20 @@ class AssistantPass:
             self._record(pid, task.get("text", ""), "respond", OUTCOME_ACTED,
                          result=f"cleared {n} task(s): {decision['reason']}", evidence=inbound.get("subject", ""),
                          subtask_id=task.get("id"), health=health)
-            return
+            return ""
+        if decision["decision"] == "draft" and not direction_note and not self._sender_known(p, inbound):
+            # Anyone can email a project's thread text; only a known contact's
+            # message gets an automatic draft. Anything else is the user's call.
+            decision = {"decision": "ask", "reason": "sender is not one of this project's contacts",
+                        "question_for_user": f"{inbound.get('from_email') or 'An unknown sender'} is not a contact on this "
+                                             f"project. How should '{(inbound.get('subject') or '')[:60]}' be handled?",
+                        "directions": ["Reply to them", "Add them as a contact, then reply", "Ignore this message"]}
         if decision["decision"] == "draft":
-            if self._draft_exists(pid, inbound):
+            if not direction_note and self._draft_exists(pid, inbound):
                 self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
                              result="unsent draft already exists for this thread", reason="draft_exists",
                              subtask_id=task.get("id"), health=health)
-                return
+                return ""
             body = self._draft_reply(p, inbound, decision)
             if body:
                 ref = self._create_draft(p, inbound, body)
@@ -537,11 +710,17 @@ class AssistantPass:
                              result=f"draft {ref} to {inbound.get('from_email', '')}; task stays open",
                              evidence=decision["reason"], draft_v0=body, subtask_id=task.get("id"), health=health,
                              recipient=inbound.get("from_email", ""), subject="RE: " + (inbound.get("subject") or ""))
-                return
+                return ref
+            if direction_note:
+                self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
+                             result="no draft written for the answer (no model or nothing shareable)",
+                             reason="no_draft", subtask_id=task.get("id"), health=health)
+                return ""
             decision = {"decision": "ask", "reason": "draft could not be written from shareable facts",
                         "question_for_user": decision.get("question_for_user") or "", "directions": decision.get("directions") or []}
         # ask
         self._post_question(p, task, inbound, decision, health)
+        return ""
 
     def _no_reply_decision(self, p: dict, task: dict, inbound: dict) -> dict:
         subject = inbound.get("subject") or ""
@@ -609,13 +788,14 @@ class AssistantPass:
         text, _stripped = self.enforce_visible_fields(text, p)
         return text.strip()
 
-    def _create_draft(self, p: dict, inbound: dict, body: str) -> str:
+    def _create_draft(self, p: dict, inbound: dict, body: str, subject_override: str = "") -> str:
         to = [inbound.get("from_email")] if inbound.get("from_email") else []
-        subject = "RE: " + (inbound.get("subject") or "")
+        subject = subject_override or "RE: " + (inbound.get("subject") or "")
         if self.drafts_to == "provider" and self.mail is not None and hasattr(self.mail, "create_draft"):
             try:
+                # Model output is untrusted text: escape before the HTML conversion.
                 ref = self.mail.create_draft(inbound.get("message") or None, to, [], subject,
-                                             body.replace("\n", "<br>"))
+                                             _html.escape(body).replace("\n", "<br>"))
                 if ref:
                     return f"provider:{ref}"
             except Exception:
@@ -642,9 +822,11 @@ class AssistantPass:
 
     def _post_question(self, p: dict, task: dict, inbound: dict | None, decision: dict, health: dict | None) -> None:
         pid = p.get("id", "")
-        if self.store.open_questions(pid):
+        unblocks = task.get("text", "")
+        open_q = self.store.open_questions(pid) or []
+        if any((q.get("unblocks") or "") == unblocks for q in open_q) or len(open_q) >= MAX_OPEN_QUESTIONS:
             self._record(pid, task.get("text", ""), "respond", OUTCOME_DEFERRED,
-                         result="a question is already open on this project", reason="question_open",
+                         result="a question is already open on this task", reason="question_open",
                          subtask_id=task.get("id"), health=health)
             return
         q = decision.get("question_for_user") or decision.get("question") or \
@@ -672,10 +854,120 @@ class AssistantPass:
                          result=f"reply received {inbound.get('received_at', '')}; cleared {n}", subtask_id=task.get("id"),
                          health=health)
             return
-        # Follow-up nudges to a client are not autonomous; they wait for the user.
-        self._record(pid, task.get("text", ""), "follow_up", OUTCOME_DEFERRED,
-                     result="no reply yet; follow-up nudge is the user's call", reason="awaiting_reply",
-                     subtask_id=task.get("id"), health=health)
+        due = self._followup_due(task)
+        if not due:
+            self._record(pid, task.get("text", ""), "follow_up", OUTCOME_DEFERRED,
+                         result="no reply yet; not due for a nudge", reason="awaiting_reply",
+                         subtask_id=task.get("id"), health=health)
+            return
+        ref = self._draft_followup(p, task, health)
+        if not ref:
+            self._record(pid, task.get("text", ""), "follow_up", OUTCOME_DEFERRED,
+                         result="follow-up is due; no draft could be written (nudge is the user's call)",
+                         reason="awaiting_reply", subtask_id=task.get("id"), health=health)
+
+    def _followup_due(self, task: dict) -> bool:
+        """Overdue = the task's date has arrived; with no date, N days
+        (assistant.followup_after_days, default 3) after the task was made."""
+        today = date.today()
+        when = _parse_dt(task.get("follow_up_date"))
+        if when:
+            return when.date() <= today
+        created = _parse_dt(task.get("created") or task.get("sla_created"))
+        days = int((self.cfg.get("assistant") or {}).get("followup_after_days") or 3)
+        return bool(created and (today - created.date()).days >= days)
+
+    def _find_outbound(self, p: dict) -> dict | None:
+        corr = p.get("correspondence")
+        if corr is None and hasattr(self.store, "get_project_correspondence"):
+            try:
+                corr = self.store.get_project_correspondence(p.get("id", ""))
+            except Exception:
+                corr = []
+        outs = [c for c in (corr or []) if isinstance(c, dict) and (c.get("direction") or "") == "outbound"]
+        if not outs:
+            return None
+        outs.sort(key=lambda c: str(c.get("received_at") or c.get("date") or ""))
+        return outs[-1]
+
+    def _contact_email(self, p: dict) -> tuple[str, str]:
+        for c in p.get("contacts") or []:
+            if isinstance(c, dict) and c.get("email"):
+                return c["email"], c.get("name") or ""
+        return "", ""
+
+    def _draft_followup(self, p: dict, task: dict, health: dict | None) -> str:
+        """Write a follow-up nudge DRAFT with the followup.draft prompt. Never
+        sends; the task stays open. Returns the draft ref or ''."""
+        pid = p.get("id", "")
+        if self.llm is None:
+            return ""
+        to_addr, to_name = self._contact_email(p)
+        last_out = self._find_outbound(p)
+        if not to_addr and last_out:
+            raw_to = last_out.get("to_list") or last_out.get("to") or ""
+            if isinstance(raw_to, list):
+                raw_to = ",".join(str(x) for x in raw_to)
+            m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", str(raw_to))
+            to_addr = m.group(0) if m else ""
+        if not to_addr:
+            return ""
+        subject = ("RE: " + (last_out.get("subject") or "").removeprefix("RE: ").removeprefix("Re: ")) \
+            if last_out and last_out.get("subject") else f"Following up: {p.get('name', '')[:60]}"
+        if self._followup_draft_exists(pid, task, subject):
+            self._record(pid, task.get("text", ""), "follow_up", OUTCOME_DEFERRED,
+                         result="unsent follow-up draft already exists", reason="draft_exists",
+                         subtask_id=task.get("id"), health=health)
+            return "exists"
+        sent = _parse_dt((last_out or {}).get("received_at") or task.get("created"))
+        days = (date.today() - sent.date()).days if sent else "?"
+        attempt = 1 + sum(1 for r in (self.store.assistant_log(limit=300) or [])
+                          if (r.get("pid") or r.get("project_id")) == pid and r.get("outcome") == OUTCOME_DRAFTED
+                          and (r.get("item_type") == "follow_up"))
+        facts = self._visible_facts(p)
+        vars_ = {
+            "project_name": p.get("name", ""), "customer_name": to_name or to_addr,
+            "work_description": (p.get("scope") or p.get("name") or "")[:200],
+            "days_since_sent": days, "last_communication": p.get("last_communication") or p.get("last_activity") or "unknown",
+            "attempt_number": attempt, "visible_facts": facts,
+        }
+        vars_["source_text"] = "\n".join(str(v) for v in vars_.values())
+        out = self.llm.run("followup.draft", vars_)
+        if not out:
+            return ""
+        val = out[0]
+        text = val.get("body", "") if isinstance(val, dict) else str(val)
+        text = strip_signature_from_draft(text, self.profile)
+        text = ground_text(text, vars_["source_text"], (self.llm.profile_vars.get("_acronyms") if hasattr(self.llm, "profile_vars") else None))
+        text, _n = self.enforce_visible_fields(text, p)
+        text = text.strip()
+        if not text:
+            return ""
+        ref = self._create_draft(p, {"from_email": to_addr, "subject": subject.removeprefix("RE: "),
+                                     "message": None}, text, subject_override=subject)
+        self.store.add_note(pid, f"DRAFT (unsent): follow-up to {to_addr}", source="assistant")
+        self._record(pid, task.get("text", ""), "follow_up", OUTCOME_DRAFTED,
+                     result=f"follow-up draft {ref} to {to_addr}; task stays open", evidence=f"{days} days since last sent",
+                     draft_v0=text, subtask_id=task.get("id"), health=health, recipient=to_addr, subject=subject)
+        return ref
+
+    def _followup_draft_exists(self, pid: str, task: dict, subject: str) -> bool:
+        try:
+            for row in self.store.assistant_log(limit=300) or []:
+                if (row.get("pid") or row.get("project_id")) != pid or row.get("outcome") != OUTCOME_DRAFTED:
+                    continue
+                detail = row.get("detail") or {}
+                if isinstance(detail, str):
+                    try:
+                        detail = json.loads(detail)
+                    except ValueError:
+                        detail = {}
+                if (detail.get("subject") or "").lower() == subject.lower() \
+                        and str(detail.get("subtask_id") or "") == str(task.get("id") or ""):
+                    return True
+        except Exception:
+            return False
+        return False
 
     # -- everything else ----------------------------------------------------
     def _work_other(self, p: dict, task: dict, health: dict | None) -> None:
@@ -828,7 +1120,12 @@ class AssistantPass:
         self.counts[outcome] += 1
         entry = {"ts": _now_iso(), "run_id": self.run_id, "proj": pid or "", "item": item, "item_type": item_type,
                  "outcome": outcome}
+        body_v0 = detail.pop("draft_v0", None)
         entry.update({k: v for k, v in detail.items() if v not in (None, "")})
+        if body_v0:
+            # Never write a whole draft into the logs: length and a short head only.
+            entry["draft_len"] = len(body_v0)
+            entry["draft_head"] = body_v0[:80]
         self.items.append(entry)
         self._log(pid, item_type, outcome, {k: v for k, v in entry.items()
                                             if k not in ("ts", "run_id", "proj", "item_type", "outcome")})
@@ -847,6 +1144,112 @@ class AssistantPass:
                 fh.write(json.dumps(row, default=str) + "\n")
         except Exception:
             pass
+
+
+# ----------------------------------------------------------------------
+# weekly digest (a draft to self; nothing is sent)
+# ----------------------------------------------------------------------
+
+DIGEST_SUBJECT = "Your week in Email Boss"
+
+
+def _client_of(p: dict) -> str:
+    kd = p.get("key_details") or {}
+    c = p.get("client") or kd.get("client") or kd.get("client_name") or kd.get("customer") or ""
+    if not c:
+        for ct in p.get("contacts") or []:
+            if isinstance(ct, dict) and ct.get("company"):
+                c = ct["company"]
+                break
+    return str(c).strip() or "No client named"
+
+
+def digest_stats(store: Any, profession: dict, today: date | None = None) -> dict:
+    """Open items, overdue and waiting-on-me counts, grouped by client."""
+    today = today or date.today()
+    clients: dict[str, dict] = {}
+    for p in store.active_projects() or []:
+        pend = [t for t in (p.get("subtasks") or []) if (t.get("status") or "pending") == "pending"]
+        if not pend:
+            continue
+        row = clients.setdefault(_client_of(p), {"open": 0, "overdue": 0, "waiting_on_me": 0, "projects": []})
+        row["open"] += len(pend)
+        late = 0
+        for t in pend:
+            fu = str(t.get("follow_up_date") or "")[:10]
+            if fu and fu < today.isoformat():
+                late += 1
+            if _RESPOND_RE.search(t.get("text") or ""):
+                row["waiting_on_me"] += 1
+        row["overdue"] += late
+        row["projects"].append(p.get("name", ""))
+    totals = {k: sum(c[k] for c in clients.values()) for k in ("open", "overdue", "waiting_on_me")}
+    return {"clients": clients, "totals": totals, "week_of": today.isoformat()}
+
+
+def digest_stats_block(stats: dict) -> str:
+    t = stats["totals"]
+    lines = [f"Open items: {t['open']}", f"Overdue: {t['overdue']}", f"Waiting on you to reply: {t['waiting_on_me']}"]
+    for name in sorted(stats["clients"], key=lambda n: (-stats["clients"][n]["overdue"], n.lower())):
+        c = stats["clients"][name]
+        lines.append(f"{name}: {c['open']} open, {c['overdue']} overdue, {c['waiting_on_me']} waiting on you")
+    return "\n".join(lines)
+
+
+def digest_plain_text(stats: dict) -> str:
+    """The digest with no model: the same grouped counts, in plain sentences."""
+    t = stats["totals"]
+    if not stats["clients"]:
+        return "Nothing is open on your board this week."
+    out = [f"You have {t['open']} open items. {t['overdue']} are overdue and {t['waiting_on_me']} are waiting on your reply.", ""]
+    for name in sorted(stats["clients"], key=lambda n: (-stats["clients"][n]["overdue"], n.lower())):
+        c = stats["clients"][name]
+        out.append(f"{name}: {c['open']} open, {c['overdue']} overdue, {c['waiting_on_me']} waiting on you.")
+    return "\n".join(out)
+
+
+def _weekday_from(value: Any) -> int:
+    names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    if isinstance(value, str) and value.strip().lower()[:3] in [n[:3] for n in names]:
+        return [n[:3] for n in names].index(value.strip().lower()[:3])
+    try:
+        return int(value) % 7
+    except (TypeError, ValueError):
+        return 0
+
+
+def run_digest(store: Any, cfg: dict, profession: dict, llm: Any = None, mail: Any = None) -> dict:
+    """Build the weekly digest and leave it as a DRAFT to the user themself
+    (provider Drafts folder, else the board's drafts). Never sends."""
+    stats = digest_stats(store, profession)
+    block = digest_stats_block(stats)
+    text = ""
+    if llm is not None and getattr(llm, "available", False):
+        try:
+            out = llm.run("digest.weekly", {"stats_block": block, "today": stats["week_of"]})
+            if out:
+                val = out[0]
+                text = (val.get("digest") or val.get("text") or val.get("body") or "") if isinstance(val, dict) else str(val)
+        except Exception:
+            text = ""
+    text = (text or "").strip() or digest_plain_text(stats)
+    to_addr = ((cfg.get("user") or {}).get("email") or "").strip()
+    if not to_addr:
+        return {"ok": False, "error": "no email address to leave the digest for"}
+    ref = ""
+    if (cfg.get("assistant") or {}).get("drafts_to", "provider") == "provider" and mail is not None \
+            and hasattr(mail, "create_draft"):
+        try:
+            r = mail.create_draft(None, [to_addr], [], DIGEST_SUBJECT,
+                                  _html.escape(text + "\n\n" + block).replace("\n", "<br>"))
+            if r:
+                ref = f"provider:{r}"
+        except Exception:
+            ref = ""
+    if not ref:
+        ref = "local:" + str(store.add_draft("", [to_addr], [], DIGEST_SUBJECT, text + "\n\n" + block,
+                                             reply_to_corr_id=None, created_by="assistant"))
+    return {"ok": True, "draft": ref, "subject": DIGEST_SUBJECT, "stats": stats["totals"]}
 
 
 # ----------------------------------------------------------------------
@@ -876,6 +1279,16 @@ class AssistantScheduler:
             return None
         status = self.ext["assistant_status"]
         try:
+            if is_read_only(self.ext):
+                # Read-only license: background work writes nothing.
+                now = _now_iso()
+                summary = {"run_id": "", "started": now, "finished": now, "duration_ms": 0, "max_items": 0,
+                           "llm_used": False, "counts": {o: 0 for o in OUTCOMES},
+                           "triage": {"approved": 0, "dismissed": 0, "created": 0, "left": {}},
+                           "escalations": [], "items": [], "nothing_sent": True, "skipped": "license_read_only"}
+                status["last_summary"] = summary
+                status["error"] = ""
+                return summary
             status["running"] = True
             cfg = self.ext.get("cfg") or {}
             ap = AssistantPass(self.ext["store"], cfg, self.ext.get("profession") or {},
@@ -892,14 +1305,60 @@ class AssistantScheduler:
             status["running"] = False
             lock.release()
 
+    # -- weekly digest ----------------------------------------------------
+    def _local_now(self) -> datetime:
+        hours = getattr(self.ext.get("store"), "hours", None) or self.ext.get("hours")
+        try:
+            return hours.now_local_naive() if hours is not None else datetime.now()
+        except Exception:
+            return datetime.now()
+
+    def digest_due(self, now: datetime | None = None) -> bool:
+        acfg = (self.ext.get("cfg") or {}).get("assistant") or {}
+        wd = acfg.get("digest_weekday", 0)
+        if wd is None or str(wd).lower() in ("off", "none", "false", "-1"):
+            return False
+        now = now or self._local_now()
+        try:
+            hour = int(acfg.get("digest_hour", 7))
+        except (TypeError, ValueError):
+            hour = 7
+        if now.weekday() != _weekday_from(wd) or now.hour < hour:
+            return False
+        st = self.ext.get("store")
+        return not (st is not None and st.meta_get("digest_last_sent") == now.date().isoformat())
+
+    def maybe_run_digest(self, now: datetime | None = None) -> dict | None:
+        """Runs the digest once on the configured weekday (default Monday,
+        07:00 local) and catches up later that day. Draft only."""
+        if not self.digest_due(now):
+            return None
+        if is_read_only(self.ext):
+            return None
+        st = self.ext["store"]
+        now = now or self._local_now()
+        res = run_digest(st, self.ext.get("cfg") or {}, self.ext.get("profession") or {},
+                         self.ext.get("llm"), self.ext.get("mail"))
+        if res.get("ok"):
+            st.meta_set("digest_last_sent", now.date().isoformat())
+        return res
+
     def _loop(self) -> None:
         status = self.ext["assistant_status"]
+        next_pass = time.monotonic() + self.interval * 60
+        status["next_run_at"] = (datetime.now() + timedelta(minutes=self.interval)).isoformat(timespec="seconds")
         while not self.stop_event.is_set():
-            status["next_run_at"] = (datetime.now() + timedelta(minutes=self.interval)).isoformat(timespec="seconds")
-            if self.stop_event.wait(self.interval * 60):
+            if self.stop_event.wait(30):
                 break
-            if self._enabled():
-                self.run_once()
+            try:
+                self.maybe_run_digest()
+            except Exception as e:
+                status["error"] = f"digest: {e}"
+            if time.monotonic() >= next_pass:
+                if self._enabled():
+                    self.run_once()
+                next_pass = time.monotonic() + self.interval * 60
+                status["next_run_at"] = (datetime.now() + timedelta(minutes=self.interval)).isoformat(timespec="seconds")
 
     def start(self) -> "AssistantScheduler":
         if self.thread and self.thread.is_alive():

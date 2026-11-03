@@ -216,6 +216,67 @@ def test_mail_api_blueprint(cfg, mail_cache):
     r = c.get("/api/mail/oauth/callback?state=nope&code=x")
     assert r.status_code == 400
     r = c.get("/api/mail/status")
-    assert r.status_code == 200 and r.get_json()["provider"] == "pa_folder"
+    # oauth/start persists the pending provider choice before redirecting
+    assert r.status_code == 200 and r.get_json()["provider"] == "gmail"
     r = c.post("/api/mail/run", json={})
     assert r.status_code == 200 and "triage" in r.get_json()["results"]
+
+
+# ---- built-in OAuth defaults, wizard shape, persist-before-redirect ----
+
+def _oauth_app(cfg=None):
+    import flask
+    from plannerboard.api import mail_api
+    app = flask.Flask(__name__)
+    app.extensions["pb"] = {"store": None, "cfg": cfg if cfg is not None else {}, "profession": {}, "llm": None}
+    app.register_blueprint(mail_api.bp)
+    return app
+
+
+def test_gmail_graph_fall_back_to_builtin_ids(monkeypatch):
+    monkeypatch.setenv("PB_GMAIL_CLIENT_ID", "builtin-gid")
+    monkeypatch.setenv("PB_GMAIL_CLIENT_SECRET", "builtin-gsec")
+    monkeypatch.setenv("PB_GRAPH_CLIENT_ID", "builtin-mid")
+    g = GmailProvider({"mail": {"gmail": {"client_id": ""}}})
+    assert g.client_id == "builtin-gid" and g.client_secret == "builtin-gsec" and g.builtin
+    url = g.begin_auth("http://127.0.0.1:8080/api/mail/oauth/callback")["url"]
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert q["client_id"] == ["builtin-gid"] and q["code_challenge_method"] == ["S256"]
+    m = GraphProvider({"mail": {"graph": {"client_id": "", "tenant": ""}}})
+    assert m.client_id == "builtin-mid" and m.tenant == "common" and m.builtin
+    # the user's own id always wins
+    assert GmailProvider({"mail": {"gmail": {"client_id": "mine"}}}).client_id == "mine"
+    assert GraphProvider({"mail": {"graph": {"client_id": "mine"}}}).client_id == "mine"
+
+
+def test_no_builtin_ids_means_error(monkeypatch):
+    for k in ("PB_GMAIL_CLIENT_ID", "PB_GMAIL_CLIENT_SECRET", "PB_GRAPH_CLIENT_ID"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(ValueError):
+        GmailProvider({}).begin_auth("http://127.0.0.1:8080/x")
+    c = _oauth_app().test_client()
+    assert c.get("/api/mail/oauth/ready").get_json() == {"ok": True, "gmail": False, "graph": False}
+    r = c.post("/api/mail/oauth/start", json={"provider": "graph"})
+    assert r.status_code == 400
+
+
+def test_oauth_ready_and_start_with_top_level_shape(monkeypatch):
+    monkeypatch.setenv("PB_GMAIL_CLIENT_ID", "builtin-gid")
+    monkeypatch.setenv("PB_GMAIL_CLIENT_SECRET", "builtin-gsec")
+    monkeypatch.setenv("PB_GRAPH_CLIENT_ID", "builtin-mid")
+    app = _oauth_app()
+    c = app.test_client()
+    assert c.get("/api/mail/oauth/ready").get_json() == {"ok": True, "gmail": True, "graph": True}
+    # wizard shape: client_id / tenant at the top level, no "settings"
+    r = c.post("/api/mail/oauth/start", json={"provider": "graph", "client_id": "wizard-id", "tenant": "contoso"})
+    assert r.status_code == 200, r.get_json()
+    assert "login.microsoftonline.com/contoso/" in r.get_json()["url"] and "client_id=wizard-id" in r.get_json()["url"]
+    # persisted before redirect, so the callback can rebuild the provider
+    g = app.extensions["pb"]["cfg"]["mail"]
+    assert g["provider"] == "graph" and g["graph"] == {"client_id": "wizard-id", "tenant": "contoso"}
+    # blank client_id: built-in id used, and NOT written into the saved config
+    app2 = _oauth_app()
+    r = app2.test_client().post("/api/mail/oauth/start", json={"provider": "gmail", "settings": {"client_id": ""}})
+    assert r.status_code == 200 and "client_id=builtin-gid" in r.get_json()["url"]
+    saved = app2.extensions["pb"]["cfg"]["mail"]
+    assert saved["provider"] == "gmail" and "client_id" not in saved["gmail"]

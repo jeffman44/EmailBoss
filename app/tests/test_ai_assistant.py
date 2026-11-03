@@ -183,7 +183,8 @@ def test_full_pass(tmp_path):
     files = list((tmp_path / "logs").glob("assistant_*.jsonl"))
     assert len(files) == 1
     rows = [json.loads(l) for l in files[0].read_text().splitlines()]
-    assert any(r["outcome"] == "drafted" and r.get("draft_v0") for r in rows)
+    drafted = [r for r in rows if r["outcome"] == "drafted"]
+    assert drafted and all("draft_v0" not in r and r.get("draft_len") and len(r.get("draft_head", "")) <= 80 for r in drafted)
     assert all(r["run_id"] == summary["run_id"] for r in rows)
 
 

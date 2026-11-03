@@ -20,7 +20,10 @@ on the runtime.
 from __future__ import annotations
 
 import base64
+import re
 import threading
+from pathlib import PurePosixPath, PureWindowsPath
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 from flask import Blueprint, Response, jsonify, request
@@ -28,7 +31,8 @@ from flask import Blueprint, Response, jsonify, request
 from ..mail import runner as mail_runner
 from ..mail.base import message_dict
 from ..mail.compose import (forward_subject, quote_forward, quote_reply, reply_recipients,
-                            reply_subject)
+                            reply_subject, reply_to_differs)
+from ..mail.imap import MailRefused
 from ..mail.message import Address, Attachment, Message, write_record
 from ._common import body, error_response, int_arg, rt, view
 
@@ -78,9 +82,10 @@ def _provider():
     cfg = _cfg()
     pid = (cfg.get("mail") or {}).get("provider") or "none"
     if pid == "none":
-        raise LookupError("No mail provider is configured. Open Settings > Mail.")
+        raise LookupError("No email account is connected yet. Open Settings > Mail to connect one.")
     if pid not in mail_runner.PROVIDER_CLASSES:
-        raise LookupError(f"unknown mail provider '{pid}'")
+        raise LookupError("Email Boss does not recognise the email account type in your settings. "
+                          "Open Settings > Mail and pick one again.")
     runner = _runner()
     if runner is not None and getattr(runner, "threads", None):
         t = runner.threads.get(pid)
@@ -113,23 +118,68 @@ def reset_cache():
 def _guard(cap: str | None = None):
     """(provider, None) or (None, error response)."""
     if not _client_enabled():
-        return None, error_response(403, "The mail client is turned off (mail.client_enabled).")
+        return None, error_response(403, "The mail client is turned off. You can turn it back on in Settings > Mail.")
     try:
         prov = _provider()
     except LookupError as e:
         return None, error_response(409, str(e))
     except Exception as e:
-        return None, error_response(500, f"{type(e).__name__}: {e}")
+        return None, error_response(500, "Email Boss could not open your mailbox. Try again in a moment.",
+                                    detail=f"{type(e).__name__}: {e}")
     if cap and not (prov.capabilities() or {}).get(cap):
-        return None, error_response(501, f"The {prov.id} provider cannot do '{cap}'.")
+        return None, error_response(501, f"Your email account type ({prov.id}) does not support this in Email Boss.")
     return prov, None
 
 
 def _fail(e: Exception):
+    """Plain-language error; the technical text rides along as ``detail``."""
+    if isinstance(e, MailRefused):
+        return error_response(409, str(e))
     msg = f"{type(e).__name__}: {e}"
-    if "not signed in" in msg or "login rejected" in msg or "no IMAP password" in msg:
-        return error_response(401, msg)
-    return error_response(502, msg)
+    low = msg.lower()
+    if "not signed in" in low or "login rejected" in low or "no imap password" in low \
+            or "authentication" in low or "no smtp password" in low:
+        return error_response(401, "Email Boss could not sign in to your mailbox. "
+                                   "Check your password or sign in again in Settings > Mail.", detail=msg)
+    if "unencrypted" in low:
+        return error_response(400, str(e), detail=msg)
+    if isinstance(e, (ConnectionError, TimeoutError, OSError)) or "timed out" in low:
+        return error_response(502, "Email Boss could not reach your mail server. "
+                                   "Check your internet connection and try again.", detail=msg)
+    return error_response(502, "Your mail server did not accept that. Try again, and if it keeps happening "
+                               "check Settings > Mail.", detail=msg)
+
+
+def _aliases() -> list[str]:
+    return [str(a) for a in ((_cfg().get("user") or {}).get("aliases") or []) if a]
+
+
+_SAFE_INLINE = frozenset(("image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"))
+
+
+def _safe_name(name: str, fallback: str = "attachment.bin") -> str:
+    """A bare file name: no directories, no control characters."""
+    n = str(name or "")
+    n = PureWindowsPath(PurePosixPath(n.replace("\\", "/")).name).name
+    n = re.sub(r"[\x00-\x1f\x7f]", "", n).strip().strip(".")
+    return n[:200] or fallback
+
+
+def _unique_names(names):
+    seen: dict[str, int] = {}
+    out = []
+    for raw in names:
+        n = _safe_name(raw)
+        key = n.lower()
+        if key in seen:
+            seen[key] += 1
+            stem, dot, ext = n.rpartition(".")
+            n = f"{stem} ({seen[key]}).{ext}" if dot and stem else f"{n} ({seen[key]})"
+            seen[n.lower()] = 0
+        else:
+            seen[key] = 0
+        out.append(n)
+    return out
 
 
 def _attachments_from_body(items) -> list[Attachment]:
@@ -227,19 +277,19 @@ def api_message():
         return err
     ref = request.args.get("ref") or ""
     if not ref:
-        return error_response(400, "ref required")
+        return error_response(400, "Pick a message first.")
     try:
         msg = prov.get_message(ref)
     except Exception as e:
         return _fail(e)
     if msg is None:
-        return error_response(404, "message not found")
+        return error_response(404, "That message is no longer in the mailbox. Reload the list.")
     d = message_dict(msg, flagged=bool(getattr(msg, "flagged", False)))
     d["ok"] = True
     d["provider"] = prov.id
     # Inline images: the reading pane rewrites cid: URLs to this endpoint.
     for a in d["attachments"]:
-        a["url"] = f"/api/mail/client/attachment?ref={request.args.get('ref')}&index={a['index']}"
+        a["url"] = f"/api/mail/client/attachment?ref={quote(ref, safe='')}&index={a['index']}"
     if request.args.get("mark_read") in ("1", "true") and not msg.is_read and prov.capabilities().get("flags"):
         try:
             prov.set_flags(ref, read=True)
@@ -257,17 +307,22 @@ def api_attachment():
     ref = request.args.get("ref") or ""
     idx = int_arg("index", -1)
     if not ref or idx < 0:
-        return error_response(400, "ref and index required")
+        return error_response(400, "That attachment link is incomplete.")
     try:
         msg = prov.get_message(ref)
     except Exception as e:
         return _fail(e)
     if msg is None or idx >= len(msg.attachments):
-        return error_response(404, "attachment not found")
+        return error_response(404, "That attachment could not be found.")
     att = msg.attachments[idx]
-    disp = "inline" if att.is_inline else "attachment"
-    return Response(att.content or b"", mimetype=att.content_type or "application/octet-stream",
-                    headers={"Content-Disposition": f'{disp}; filename="{att.name}"',
+    ctype = (att.content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    safe = ctype in _SAFE_INLINE
+    disp = "inline" if (att.is_inline and safe) else "attachment"
+    fname = _safe_name(att.name)
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', "_", fname)
+    return Response(att.content or b"", mimetype=ctype if safe else "application/octet-stream",
+                    headers={"Content-Disposition": f"{disp}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(fname, safe='')}",
+                             "Content-Security-Policy": "sandbox",
                              "X-Content-Type-Options": "nosniff"})
 
 
@@ -282,7 +337,7 @@ def api_flags():
     data = body()
     ref = data.get("ref") or ""
     if not ref:
-        return error_response(400, "ref required")
+        return error_response(400, "Pick a message first.")
     try:
         ok = prov.set_flags(ref, read=data.get("read"), flagged=data.get("flagged"))
         return jsonify({"ok": bool(ok), "ref": ref})
@@ -299,7 +354,7 @@ def api_move():
     data = body()
     ref, folder = data.get("ref") or "", data.get("folder") or ""
     if not ref or not folder:
-        return error_response(400, "ref and folder required")
+        return error_response(400, "Pick a message and a folder first.")
     try:
         new_ref = prov.move_message(ref, folder)
         return jsonify({"ok": True, "ref": ref, "new_ref": new_ref, "folder": folder})
@@ -315,7 +370,7 @@ def api_delete():
         return err
     ref = body().get("ref") or ""
     if not ref:
-        return error_response(400, "ref required")
+        return error_response(400, "Pick a message first.")
     try:
         return jsonify({"ok": bool(prov.delete_message(ref)), "ref": ref})
     except Exception as e:
@@ -335,24 +390,34 @@ def api_compose():
     data = body()
     ref, mode = data.get("ref") or "", (data.get("mode") or "reply").lower()
     if not ref:
-        return error_response(400, "ref required")
+        return error_response(400, "Pick a message first.")
     try:
         msg = prov.get_message(ref)
     except Exception as e:
         return _fail(e)
     if msg is None:
-        return error_response(404, "message not found")
+        return error_response(404, "That message is no longer in the mailbox. Reload the list.")
+    block = not bool(data.get("load_images"))
     if mode == "forward":
         atts = [{"name": a.name, "content_type": a.content_type, "size": a.size or len(a.content or b""),
                  "is_inline": a.is_inline, "content_id": a.content_id,
                  "content_b64": base64.b64encode(a.content or b"").decode("ascii")}
                 for a in msg.attachments if not a.is_inline]
+        q = quote_forward(msg, block_remote=block)
         return jsonify({"ok": True, "mode": mode, "to": "", "cc": "", "subject": forward_subject(msg.subject),
-                        "body_html": quote_forward(msg), "reply_ref": None, "attachments": atts})
-    to, cc = reply_recipients(msg, _me(), reply_all=(mode == "reply_all"))
+                        "body_html": q, "remote_blocked": block and "data-pb-src" in q,
+                        "reply_ref": None, "attachments": atts})
+    use_rt = bool(data.get("use_reply_to"))
+    to, cc = reply_recipients(msg, _me(), reply_all=(mode == "reply_all"), aliases=_aliases(), use_reply_to=use_rt)
+    alt = reply_to_differs(msg)
+    q = quote_reply(msg, block_remote=block)
     return jsonify({"ok": True, "mode": mode,
                     "to": ", ".join(a.display() for a in to), "cc": ", ".join(a.display() for a in cc),
-                    "subject": reply_subject(msg.subject), "body_html": quote_reply(msg),
+                    "recipient_count": len(to) + len(cc),
+                    "from_display": msg.sender.display() if msg.sender and msg.sender.email else "",
+                    "reply_to_alt": ", ".join(a.display() for a in alt), "use_reply_to": use_rt and bool(alt),
+                    "subject": reply_subject(msg.subject), "body_html": q,
+                    "remote_blocked": block and "data-pb-src" in q,
                     "reply_ref": ref, "attachments": []})
 
 
@@ -368,7 +433,7 @@ def api_draft():
     try:
         atts = _attachments_from_body(data.get("attachments"))
     except ValueError as e:
-        return error_response(413, str(e))
+        return error_response(413, "The attachments are too big. Email Boss can keep up to 25 MB at a time.")
     v = view()
     store = v.get("store")
     reply_to = _reply_target(prov, data.get("reply_ref"))
@@ -400,8 +465,8 @@ def api_draft():
 def api_send():
     """Body: {to, cc, bcc, subject, body_html, reply_ref, attachments[], project_id}."""
     if not _send_enabled():
-        return error_response(403, "Sending is turned off. Turn on 'Allow sending' in Settings > Mail "
-                                   "(mail.send_enabled) to send from Email Boss.", send_enabled=False)
+        return error_response(403, "Sending is turned off, so this can only be saved as a draft. "
+                                   "Turn on sending in Settings > Mail to send from Email Boss.", send_enabled=False)
     prov, err = _guard("send")
     if err:
         return err
@@ -409,13 +474,13 @@ def api_send():
     to = data.get("to") or ""
     if not Address.parse_many(to) and not Address.parse_many(data.get("cc") or "") \
             and not Address.parse_many(data.get("bcc") or ""):
-        return error_response(400, "at least one recipient is required")
+        return error_response(400, "Add at least one person to send this to.")
     if not (data.get("subject") or data.get("body_html")):
-        return error_response(400, "a subject or body is required")
+        return error_response(400, "Add a subject or a message before sending.")
     try:
         atts = _attachments_from_body(data.get("attachments"))
     except ValueError as e:
-        return error_response(413, str(e))
+        return error_response(413, "The attachments are too big. Email Boss can send up to 25 MB at a time.")
     reply_to = _reply_target(prov, data.get("reply_ref"))
     try:
         result = prov.send_message(to, data.get("cc") or "", data.get("bcc") or "",
@@ -462,7 +527,7 @@ def api_stage():
         return err
     ref = body().get("ref") or ""
     if not ref:
-        return error_response(400, "ref required")
+        return error_response(400, "Pick a message first.")
     v = view()
     store, cfg = v.get("store"), v.get("cfg") or {}
     try:
@@ -470,14 +535,14 @@ def api_stage():
     except Exception as e:
         return _fail(e)
     if msg is None:
-        return error_response(404, "message not found")
+        return error_response(404, "That message is no longer in the mailbox. Reload the list.")
     if store is not None and store.message_seen(msg.id):
         return jsonify({"ok": True, "already": True, "message_id": msg.id})
     cache = mail_runner.mail_cache_dir(cfg)
     try:
         write_record(cache, msg)
     except Exception as e:
-        return error_response(500, f"could not write the message into the mail cache: {e}")
+        return error_response(500, "Email Boss could not copy that message to the triage list.", detail=str(e))
     from ..triage.pipeline import run_cycle
     summary = run_cycle(store, cfg, v.get("profession") or {}, llm=v.get("llm"), mail_cache=cache)
     return jsonify({"ok": True, "already": False, "message_id": msg.id,
@@ -496,17 +561,17 @@ def api_file():
     data = body()
     ref, pid = data.get("ref") or "", data.get("project_id") or ""
     if not ref or not pid:
-        return error_response(400, "ref and project_id required")
+        return error_response(400, "Pick a message and a project first.")
     v = view()
     store, cfg = v.get("store"), v.get("cfg") or {}
     if store is None or not store.project_exists(pid):
-        return error_response(404, f"project {pid} not found")
+        return error_response(404, "That project no longer exists.")
     try:
         msg = prov.get_message(ref)
     except Exception as e:
         return _fail(e)
     if msg is None:
-        return error_response(404, "message not found")
+        return error_response(404, "That message is no longer in the mailbox. Reload the list.")
     from ..triage.normalize import normalize_record
     from ..triage.pipeline import register_conversation
     rec = msg.to_pa_record()
@@ -518,10 +583,9 @@ def api_file():
     tmpdir = None
     if msg.attachments:
         tmpdir = tempfile.mkdtemp(prefix="pbmail_")
-        for a in msg.attachments:
-            if a.is_inline:
-                continue
-            p = Path(tmpdir) / (a.name or "attachment.bin")
+        real = [a for a in msg.attachments if not a.is_inline]
+        for a, nm in zip(real, _unique_names(a.name for a in real)):
+            p = Path(tmpdir) / nm
             p.write_bytes(a.content or b"")
             paths.append(str(p))
     corr_id = _file(store, pid, email_obj, paths)

@@ -42,7 +42,7 @@ LABEL_KINDS = {"INBOX": "inbox", "SENT": "sent", "DRAFT": "drafts", "TRASH": "tr
                "SPAM": "junk", "STARRED": "other", "IMPORTANT": "other"}
 SYSTEM_HIDDEN = {"CHAT", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS",
                  "CATEGORY_UPDATES", "CATEGORY_FORUMS", "UNREAD", "STARRED", "IMPORTANT"}
-DEFAULT_INITIAL_DAYS = 2
+DEFAULT_INITIAL_DAYS = 30
 PAGE_CAP = 500
 
 
@@ -56,6 +56,22 @@ def _b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
 
+def oauth_defaults() -> dict:
+    """Built-in OAuth client ids shipped with the app, read from the environment
+    (set at build time). Never written to the user's config file.
+
+    Google requires a client secret even for installed (desktop) apps, and
+    documents that it is not confidential there: the flow is protected by PKCE
+    and the loopback redirect, so shipping it in the build is expected.
+    Microsoft's public-client PKCE flow needs no secret at all."""
+    import os
+    return {
+        "gmail_default_client_id": os.environ.get("PB_GMAIL_CLIENT_ID", "").strip(),
+        "gmail_default_client_secret": os.environ.get("PB_GMAIL_CLIENT_SECRET", "").strip(),
+        "graph_default_client_id": os.environ.get("PB_GRAPH_CLIENT_ID", "").strip(),
+    }
+
+
 class GmailProvider(BaseProvider):
     id = "gmail"
     label = "Gmail API (OAuth)"
@@ -64,7 +80,7 @@ class GmailProvider(BaseProvider):
          "help": "A Desktop-type OAuth client from Google Cloud Console."},
         {"key": "client_secret", "label": "OAuth client secret", "type": "secret",
          "secret_key": "gmail_client_secret"},
-        {"key": "initial_days", "label": "Days of history on first sync", "type": "number", "default": 2},
+        {"key": "initial_days", "label": "Days of history on first sync", "type": "number", "default": DEFAULT_INITIAL_DAYS},
     ]
 
     def __init__(self, cfg: dict, cache_dir=None, http=http_request, token_cache: TokenCache | None = None):
@@ -73,6 +89,13 @@ class GmailProvider(BaseProvider):
         g = dict(mail_cfg.get("gmail") or {})
         self.client_id = (g.get("client_id") or "").strip()
         self.client_secret = (g.get("client_secret") or "").strip()
+        self.builtin = False
+        if not self.client_id:
+            d = oauth_defaults()
+            if d["gmail_default_client_id"]:
+                self.client_id = d["gmail_default_client_id"]
+                self.client_secret = d["gmail_default_client_secret"]
+                self.builtin = True
         self.initial_days = int(g.get("initial_days") or DEFAULT_INITIAL_DAYS)
         self.max_per_cycle = int(g.get("max_per_cycle") or 100)
         self.cache_dir = cache_dir

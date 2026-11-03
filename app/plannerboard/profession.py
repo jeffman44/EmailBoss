@@ -23,9 +23,9 @@ BASE = {
                "location": "Location", "contact": "Contact", "quote": "Proposal"},
     "work_types": [], "fields": [], "id_patterns": [],
     "date_types": [{"id": "follow_up", "label": "Follow-up"}, {"id": "deadline", "label": "Deadline"},
-                   {"id": "sla", "label": "SLA"}],
+                   {"id": "sla", "label": "Reply by"}],
     "teams": [],
-    "business_hours": {"tz": "UTC", "start": 8, "end": 17, "days": [0, 1, 2, 3, 4]},
+    "business_hours": {"tz": "", "start": 8, "end": 17, "days": [0, 1, 2, 3, 4]},
     "sla_hours": 4,
     "money": {"currency": "USD", "annual_goal": None},
     "triage": {"classifications": ["request", "client_reply", "approval", "vendor", "scheduling",
@@ -86,9 +86,16 @@ def load_template(template_id):
     return merged
 
 
-def effective(template_id, overrides=None, user=None, features=None):
+def effective(template_id, overrides=None, user=None, features=None, timezone=None):
     """Template deep-merged with the user's overrides, plus `user` and
-    `features` blocks for /api/profession. Falls back to `general` when the
+    `features` blocks for /api/profession.
+
+    Features: the template's `features` block (plus any `overrides.features`,
+    which is where a user's explicit Display choice lives) decides what is
+    available; the `features` argument (the config's global toggles) can only
+    switch a feature OFF, never force it on over a template that says off.
+    `timezone` (config.timezone) fills business_hours.tz when the template
+    leaves it empty. Falls back to `general` when the
     named template is missing so a typo in config never blanks the board."""
     try:
         base = load_template(template_id)
@@ -103,10 +110,12 @@ def effective(template_id, overrides=None, user=None, features=None):
         from . import workflows as wfm
         prof["workflows"] = wfm.minimal_document()
     prof["user"] = dict(user or {})
-    feats = dict(prof.get("features") or {})
+    feats = {k: bool(v) for k, v in (prof.get("features") or {}).items()}
     for k, v in (features or {}).items():
-        feats[k] = bool(v)
+        feats[k] = bool(v) if k not in feats else (feats[k] and bool(v))
     prof["features"] = feats
+    if timezone:
+        prof["timezone"] = str(timezone)
     prof["customer_visible_fields"] = list(prof.get("customer_visible_fields") or [])
     return prof
 

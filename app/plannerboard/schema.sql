@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS triage_cards (
     signals         TEXT DEFAULT '{}',               -- JSON object
     suggestion      TEXT,                            -- JSON object or null
     is_quote_request INTEGER DEFAULT 0,
+    leave_reason    TEXT DEFAULT '',                 -- assistant: multi_project | no_project | needs_human
     is_self_note    INTEGER DEFAULT 0,
     doc_links       TEXT DEFAULT '[]',               -- JSON array
 
@@ -367,7 +368,8 @@ CREATE TABLE IF NOT EXISTS questions (
     answer      TEXT DEFAULT '',
     asked_by    TEXT DEFAULT 'assistant',
     created     TEXT NOT NULL,
-    answered_at TEXT
+    answered_at TEXT,
+    consumed_at TEXT                      -- set once the assistant has acted on the answer
 );
 CREATE INDEX IF NOT EXISTS idx_questions_status  ON questions(status);
 CREATE INDEX IF NOT EXISTS idx_questions_project ON questions(project_id, status);

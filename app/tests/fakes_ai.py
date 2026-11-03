@@ -169,7 +169,36 @@ class FakeStore:
         return qid
 
     def open_questions(self, pid=None):
-        return [q for q in self.questions if q["status"] == "open" and (pid is None or q["pid"] == pid)]
+        return [dict(q, project_id=q["pid"]) for q in self.questions
+                if q["status"] == "open" and (pid is None or q["pid"] == pid)]
+
+    def unconsumed_answers(self, pid=None):
+        return [dict(q, project_id=q["pid"]) for q in self.questions
+                if q["status"] == "answered" and not q.get("consumed") and (pid is None or q["pid"] == pid)]
+
+    def mark_question_consumed(self, qid):
+        for q in self.questions:
+            if q["id"] == qid:
+                q["consumed"] = True
+
+    def get_question(self, qid):
+        q = next((q for q in self.questions if q["id"] == qid), None)
+        return dict(q, project_id=q["pid"]) if q else None
+
+    def answer_question(self, qid, status="answered", answer=""):
+        q = next((q for q in self.questions if q["id"] == qid), None)
+        if not q:
+            return None
+        q["status"], q["answer"], q["consumed"] = status, answer, False
+        return {"question_id": qid, "status": status, "project_id": q["pid"]}
+
+    def answer(self, qid, text):
+        for q in self.questions:
+            if q["id"] == qid:
+                q["status"], q["answer"] = "answered", text
+
+    def update_triage_card(self, triage_id, **fields):
+        self.triage[triage_id].update(fields)
 
     def add_draft(self, pid, to, cc, subject, body, reply_to_corr_id=None, created_by="assistant"):
         did = "draft_" + uuid.uuid4().hex[:6]

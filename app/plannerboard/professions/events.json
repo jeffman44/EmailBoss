@@ -1,0 +1,417 @@
+{
+  "id": "events",
+  "label": "Photography and Events",
+  "description": "Photographers, planners and event vendors: inquiry, quote, booked, delivered.",
+  "icon": "📷",
+  "entity": {
+    "project": "Booking",
+    "projects": "Bookings",
+    "client": "Client",
+    "location": "Venue",
+    "contact": "Contact",
+    "quote": "Quote"
+  },
+  "work_types": [
+    {
+      "id": "event",
+      "label": "Event",
+      "short": "EVT",
+      "color": "#f0b429",
+      "workflow_id": "event"
+    },
+    {
+      "id": "task",
+      "label": "General Task",
+      "short": "TASK",
+      "color": "#a0a0a0",
+      "workflow_id": "general"
+    }
+  ],
+  "fields": [
+    {
+      "key": "event_date",
+      "label": "Event date",
+      "type": "date",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "venue",
+      "label": "Venue",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": true,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "package",
+      "label": "Package",
+      "type": "text",
+      "show_on": [
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "quote_amount",
+      "label": "Quote",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "approved_amount",
+      "label": "Booked amount",
+      "type": "money",
+      "show_on": [
+        "drawer",
+        "list"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "column"
+    },
+    {
+      "key": "deposit_paid",
+      "label": "Deposit paid",
+      "type": "money",
+      "show_on": [
+        "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Money",
+      "source": "key_details"
+    }
+  ],
+  "id_patterns": [],
+  "date_types": [
+    {
+      "id": "follow_up",
+      "label": "Follow-up"
+    },
+    {
+      "id": "deadline",
+      "label": "Deadline"
+    },
+    {
+      "id": "sla",
+      "label": "Reply by"
+    }
+  ],
+  "teams": [],
+  "business_hours": {
+    "tz": "",
+    "start": 8,
+    "end": 17,
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "sla_hours": 4,
+  "money": {
+    "currency": "USD",
+    "annual_goal": null
+  },
+  "triage": {
+    "classifications": [
+      "request",
+      "client_reply",
+      "approval",
+      "vendor",
+      "scheduling",
+      "internal",
+      "informational",
+      "needs_reply",
+      "no_reply",
+      "junk"
+    ],
+    "notification_senders": [
+      "noreply@",
+      "no-reply@",
+      "notifications@",
+      "donotreply@",
+      "mailer-daemon@"
+    ],
+    "internal_admin_subjects": [
+      "timesheet",
+      "payroll",
+      "benefits enrollment",
+      "open enrollment",
+      "parking"
+    ]
+  },
+  "vocab": {
+    "keywords": [
+      "shoot",
+      "wedding",
+      "session",
+      "package",
+      "deposit",
+      "gallery",
+      "venue"
+    ],
+    "acronyms": [],
+    "scope_phrases": [
+      "hours of coverage",
+      "edited images"
+    ]
+  },
+  "prompt_profile": {
+    "industry": "photography and events",
+    "role_noun": "photographer"
+  },
+  "customer_visible_fields": [
+    "name",
+    "location",
+    "scope",
+    "contacts",
+    "event_date",
+    "package"
+  ],
+  "features": {
+    "money": true,
+    "game_layer": false,
+    "analytics": true
+  },
+  "workflows": {
+    "workflows": [
+      {
+        "id": "event",
+        "label": "Event",
+        "icon": "📷",
+        "color": "#f0b429",
+        "stages": [
+          {
+            "id": "inquiry",
+            "label": "Inquiry",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Reply to the inquiry",
+              "date_type": "sla",
+              "sla_hours": 8
+            }
+          },
+          {
+            "id": "quote_sent",
+            "label": "Quote sent",
+            "role": "out",
+            "column": true,
+            "owning_task": {
+              "text": "Follow up on the quote",
+              "date_type": "follow_up",
+              "days": 4
+            },
+            "auto_arm": false
+          },
+          {
+            "id": "booked",
+            "label": "Booked",
+            "role": "won",
+            "column": true,
+            "owning_task": {
+              "text": "Collect the deposit and confirm the date",
+              "date_type": "follow_up",
+              "days": 3
+            }
+          },
+          {
+            "id": "delivered",
+            "label": "Delivered",
+            "role": "in_progress",
+            "column": true,
+            "owning_task": {
+              "text": "Check the client is happy with the delivery",
+              "date_type": "follow_up",
+              "days": 7
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting on client",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "cold",
+            "label": "Dormant",
+            "role": "cold",
+            "column": false
+          },
+          {
+            "id": "complete",
+            "label": "Closed",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "inquiry",
+        "won_transition": {
+          "from": "quote_sent",
+          "to": "booked"
+        },
+        "extra_tasks": []
+      },
+      {
+        "id": "general",
+        "label": "General Task",
+        "icon": "📋",
+        "color": "#a0a0a0",
+        "stages": [
+          {
+            "id": "action_required",
+            "label": "To Do",
+            "role": "todo",
+            "column": true,
+            "owning_task": {
+              "text": "Respond",
+              "date_type": "sla",
+              "sla_hours": 4
+            }
+          },
+          {
+            "id": "waiting",
+            "label": "Waiting",
+            "role": "waiting",
+            "column": true
+          },
+          {
+            "id": "complete",
+            "label": "Done",
+            "role": "closed",
+            "column": false,
+            "closed": true
+          },
+          {
+            "id": "ignored",
+            "label": "Ignored",
+            "role": "ignored",
+            "column": false,
+            "closed": true
+          }
+        ],
+        "entry_stage": "action_required",
+        "won_transition": null,
+        "extra_tasks": []
+      }
+    ],
+    "tabs": [
+      {
+        "id": "active",
+        "label": "Active",
+        "filter": {
+          "closed": false
+        },
+        "urgency": "sum"
+      },
+      {
+        "id": "todo",
+        "label": "To Do",
+        "filter": {
+          "stage_in": [
+            "inquiry",
+            "action_required"
+          ]
+        },
+        "urgency": "max"
+      },
+      {
+        "id": "deadlines",
+        "label": "Deadlines",
+        "filter": {
+          "subtask_date_type": "deadline",
+          "pending": true
+        },
+        "urgency": "deadline"
+      },
+      {
+        "id": "closed",
+        "label": "Closed",
+        "filter": {
+          "closed": true
+        },
+        "urgency": "none"
+      },
+      {
+        "id": "ignored",
+        "label": "Ignored",
+        "filter": {
+          "stage_in": [
+            "ignored"
+          ]
+        },
+        "urgency": "none"
+      }
+    ],
+    "tab_rules": {
+      "auto_stage_tabs": true
+    },
+    "sort": {
+      "mode": "subtask",
+      "priority": [
+        {
+          "id": "deadline",
+          "label": "Deadline",
+          "match": {
+            "date_type": "deadline"
+          }
+        },
+        {
+          "id": "sla",
+          "label": "Reply by",
+          "match": {
+            "date_type": "sla"
+          }
+        },
+        {
+          "id": "follow_up",
+          "label": "Follow-up",
+          "match": {
+            "date_type": "follow_up"
+          }
+        },
+        {
+          "id": "other",
+          "label": "Everything else",
+          "match": {}
+        }
+      ]
+    },
+    "hud": {
+      "hp": "won_vs_goal",
+      "mp": "quoted_vs_goal",
+      "xp": "threads_closed"
+    },
+    "theme": "default"
+  }
+}

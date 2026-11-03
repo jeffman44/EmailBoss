@@ -37,6 +37,8 @@ from pathlib import Path
 from ..mail.message import parse_iso
 from .attachments import attachment_files, extract_attachment_data, labeled_total
 from .classify import classify, is_robot_sender
+from .deadlines import extract_deadline
+from .license_gate import is_read_only
 from .match import MatchContext, compile_id_patterns, is_internal, match_email_to_projects, unique_exact_match
 from .normalize import (ScanWarnings, move_to_processed, purge_processed, scan_email_files,
                         write_capture_status)
@@ -282,9 +284,17 @@ def _summary(email_obj: dict, cfg: dict | None, llm) -> str:
 
 # ── the cycle ───────────────────────────────────────────────────────────────
 
-def run_cycle(store, cfg: dict, profession: dict, llm=None, mail_cache=None) -> dict:
+QUOTE_LABELS = ("quote_request", "bid_invitation", "proposal_request")
+
+
+def run_cycle(store, cfg: dict, profession: dict, llm=None, mail_cache=None, license=None) -> dict:
     """One triage pass over ``<mail_cache>/inbox`` and ``/sent``. Never raises
-    for a single email; returns a summary dict."""
+    for a single email; returns a summary dict. Writes nothing while the
+    license client (``license`` or the installed provider) reports read_only."""
+    if is_read_only(client=license):
+        return {"scanned": 0, "dedup_skipped": 0, "auto_committed": 0, "staged": 0, "dismissed": 0,
+                "errors": 0, "error_detail": [], "cards": [], "skipped": "license_read_only",
+                "at": datetime.now().isoformat(timespec="seconds")}
     cfg = cfg or {}
     profession = profession or {}
     mail_cache = Path(mail_cache or mail_cache_dir(cfg))
@@ -434,15 +444,23 @@ def _stage_pending(store, cfg, profession, llm, mail_cache, email, msg_key, matc
     email["suggestion"] = suggest_project(email, profession, cfg, known_clients=known_clients)
     card = _base_card(email, msg_key)
     fu_days = int(cls.get("follow_up_days") or 0)
+    auto_follow = add_biz_days(date.today(), fu_days, profession) if fu_days > 0 else ""
+    auto_type = "sla" if (cls.get("needs_reply") and email.get("direction") == "inbound") else "follow_up"
+    if email.get("direction", "inbound") == "inbound":
+        # A date the sender set ("due", "respond by", "bids due") is a deadline.
+        stated = extract_deadline(f"{email.get('subject') or ''}\n{email.get('body') or email.get('body_raw') or email.get('body_preview') or ''}")
+        if stated:
+            auto_follow, auto_type = stated, "deadline"
     card.update({
+        "is_quote_request": 1 if cls.get("classification") in QUOTE_LABELS else 0,
         "matched_project": prefill,
         "confidence": prefill_conf,
         "match_reason": prefill_reason or (f"{len(matches)} candidate(s)" if matches else "no match"),
         "classification": cls.get("classification", ""),
         "needs_reply": bool(cls.get("needs_reply")),
         "auto_action": cls.get("auto_action", ""),
-        "auto_follow_up": add_biz_days(date.today(), fu_days, profession) if fu_days > 0 else "",
-        "auto_date_type": "sla" if (cls.get("needs_reply") and email.get("direction") == "inbound") else "follow_up",
+        "auto_follow_up": auto_follow,
+        "auto_date_type": auto_type,
         "summary": _summary(email, cfg, llm),
         "suggestion": email["suggestion"],
     })

@@ -39,7 +39,8 @@ def data_root(tmp_path, monkeypatch):
 
 def make_config(data_root, template="hvac_contractor", **over):
     doc = {"user": {"name": "Pat Example", "email": "pat@example.com"},
-           "profession": {"template": template},
+           "profession": {"template": template,
+                          "overrides": {"business_hours": {"tz": "America/New_York"}}},
            "paths": {"data_root": str(data_root)}}
     for k, v in over.items():
         doc[k] = v

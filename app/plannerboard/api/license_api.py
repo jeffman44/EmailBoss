@@ -57,6 +57,27 @@ def api_license_activate():
                     "status": _status(client)})
 
 
+@bp.route("/api/license/trial", methods=["POST"])
+def api_license_trial():
+    """Body: {email}. Starts the free trial on the license server (no portal
+    visit): the key is emailed, stored here and this machine is activated."""
+    data = body()
+    email = (data.get("email") or "").strip()
+    if not email:
+        return error_response(400, "email required")
+    client = _client()
+    try:
+        result = client.start_trial(email)
+    except LicenseError as e:
+        http = e.http_status if 400 <= (e.http_status or 0) < 600 else 400
+        return jsonify({"ok": False, "error": str(e), "code": e.code, "status": _status(client)}), http
+    except Exception as e:
+        return error_response(502, f"{type(e).__name__}: {e}")
+    client._invalidate()
+    return jsonify({"ok": True, "license": result.get("license"), "activation": result.get("activation"),
+                    "status": _status(client)})
+
+
 @bp.route("/api/license/refresh", methods=["POST"])
 def api_license_refresh():
     """Forced heartbeat: re-signs the activation when the server agrees."""

@@ -287,7 +287,9 @@ class Store:
                          ("auto_match_reason", "TEXT DEFAULT ''"),
                          ("needs_reply", "INTEGER DEFAULT 0"), ("source_folder", "TEXT DEFAULT ''"),
                          ("internet_message_id", "TEXT DEFAULT ''"), ("auto_reason", "TEXT DEFAULT ''"),
-                         ("doc_links", "TEXT DEFAULT '[]'")],
+                         ("doc_links", "TEXT DEFAULT '[]'"),
+                         ("is_quote_request", "INTEGER DEFAULT 0"), ("leave_reason", "TEXT DEFAULT ''")],
+        "questions": [("consumed_at", "TEXT")],
         "processed_messages": [("project_id", "TEXT")],
         "project_correspondence": [("cc_list", "TEXT DEFAULT ''")],
         "hp_history": [("damage_events", "TEXT DEFAULT '[]'")],
@@ -1151,6 +1153,8 @@ class Store:
         if d.get("suggestion") is None:
             d["suggestion"] = {}
         d["needs_reply"] = bool(d.get("needs_reply"))
+        d["is_quote_request"] = bool(d.get("is_quote_request"))
+        d["leave_reason"] = d.get("leave_reason") or ""
         d["id"] = d.get("triage_id")          # the triage layer and the UI both read `id`
         return d
 
@@ -1391,7 +1395,11 @@ class Store:
                 raise LookupError(f"project {pid} not found")
             self.store_ids_from_email(item, pid)
             updates = {"last_activity": self._now(), "last_communication": email_day}
-            if follow_up:
+            deadline_task = None
+            if follow_up and date_type == "deadline" and direction != "outbound" and not is_self:
+                # A date the sender set is a deadline subtask, not the project's follow-up date.
+                deadline_task = ((item.get("subject") or "").strip() or "Deadline")[:70]
+            elif follow_up:
                 updates["follow_up_date"] = follow_up
             if direction == "outbound":
                 self.increment_emails_sent(pid)
@@ -1409,6 +1417,9 @@ class Store:
                     if amt:
                         updates["quote_amount"] = amt
             self.update_project(pid, **updates)
+            if deadline_task:
+                self.add_subtask(pid, f"Deadline: {deadline_task}", date_type="deadline",
+                                 follow_up_date=str(follow_up)[:10], source="triage")
             from_info = item.get("from_name") or item.get("from_email") or "unknown"
             self.append_note(pid, f"Triage: {direction} from {from_info}: {(item.get('subject') or '')[:60]}",
                              self._note_time("triage"))
@@ -1776,8 +1787,13 @@ class Store:
     # QUESTIONS (server.py:6666-6744)
     # ══════════════════════════════════════════════════════════════════════
 
+    MAX_OPEN_QUESTIONS = 5
+
     def add_question(self, pid, question, options, recommend="", evidence="", unblocks="", asked_by="assistant"):
-        """Idempotent on (project, text) while open. Returns the question id."""
+        """Several questions may be open on one project (up to MAX_OPEN_QUESTIONS).
+        Idempotent on (project, text) while open. Returns the question id; when
+        the cap is reached the oldest open question's id is returned instead of
+        a new row."""
         text = (question or "").strip()
         if not pid or not text:
             raise ValueError("project_id and question are required")
@@ -1785,6 +1801,10 @@ class Store:
                                   "AND status = 'open'", (pid, text)).fetchone()
         if dupe:
             return dupe["id"]
+        open_rows = self._conn.execute("SELECT id FROM questions WHERE project_id = ? AND status = 'open' "
+                                       "ORDER BY created ASC", (pid,)).fetchall()
+        if len(open_rows) >= self.MAX_OPEN_QUESTIONS:
+            return open_rows[0]["id"]
         qid = "q_" + os.urandom(4).hex()
         self._conn.execute(
             "INSERT INTO questions (id, project_id, question, options, recommend, evidence, unblocks, status, "
@@ -1813,17 +1833,44 @@ class Store:
     def open_questions(self, pid=None):
         return self.list_questions("open", pid)
 
+    def get_question(self, qid):
+        r = self._conn.execute("SELECT * FROM questions WHERE id = ?", (qid,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["options"] = self._parse_json(d.get("options"), []) or []
+        return d
+
     def answer_question(self, qid, status="answered", answer=""):
+        """Records the answer only. It never touches the project's status."""
         if status not in ("answered", "moot", "open"):
             raise ValueError("status must be answered, moot or open")
-        row = self._conn.execute("SELECT id FROM questions WHERE id = ?", (qid,)).fetchone()
+        row = self._conn.execute("SELECT id, project_id FROM questions WHERE id = ?", (qid,)).fetchone()
         if not row:
             return None
         answered_at = None if status == "open" else self.hours.now_local_naive().isoformat(timespec="seconds")
-        self._conn.execute("UPDATE questions SET status = ?, answer = ?, answered_at = ? WHERE id = ?",
-                           (status, answer or "", answered_at, qid))
+        self._conn.execute("UPDATE questions SET status = ?, answer = ?, answered_at = ?, consumed_at = NULL "
+                           "WHERE id = ?", (status, answer or "", answered_at, qid))
         self._conn.commit()
-        return {"question_id": qid, "status": status}
+        return {"question_id": qid, "status": status, "project_id": row["project_id"]}
+
+    def unconsumed_answers(self, pid=None):
+        """Answered questions the assistant has not acted on yet (oldest first)."""
+        sql, args = "SELECT * FROM questions WHERE status = 'answered' AND consumed_at IS NULL AND answer != ''", []
+        if pid:
+            sql += " AND project_id = ?"
+            args.append(pid)
+        out = []
+        for r in self._conn.execute(sql + " ORDER BY answered_at ASC", args).fetchall():
+            d = dict(r)
+            d["options"] = self._parse_json(d.get("options"), []) or []
+            out.append(d)
+        return out
+
+    def mark_question_consumed(self, qid):
+        self._conn.execute("UPDATE questions SET consumed_at = ? WHERE id = ?",
+                           (self.hours.now_local_naive().isoformat(timespec="seconds"), qid))
+        self._conn.commit()
 
     def delete_question(self, qid):
         self._conn.execute("DELETE FROM questions WHERE id = ?", (qid,))
@@ -1835,6 +1882,10 @@ class Store:
 
     def add_draft(self, pid, to, cc, subject, body, reply_to_corr_id=None, created_by="assistant"):
         did = "draft_" + uuid.uuid4().hex[:10]
+        if isinstance(to, (list, tuple)):
+            to = ", ".join(str(x) for x in to if x)
+        if isinstance(cc, (list, tuple)):
+            cc = ", ".join(str(x) for x in cc if x)
         now = self._now()
         self._conn.execute(
             'INSERT INTO drafts (id, project_id, "to", cc, subject, body, reply_to_corr_id, status, created_by, '

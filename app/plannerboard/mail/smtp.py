@@ -40,6 +40,8 @@ def smtp_settings(mail_cfg: dict | None, imap_settings: dict | None = None) -> d
         "user": (raw.get("user") or imap_settings.get("user") or "").strip(),
         "auth_mode": (raw.get("auth_mode") or imap_settings.get("auth_mode") or "password").strip().lower(),
         "timeout": int(raw.get("timeout") or 45),
+        # Cleartext LOGIN is refused unless the config says so explicitly.
+        "allow_insecure": raw.get("allow_insecure", imap_settings.get("allow_insecure", False)) is True,
     }
 
 
@@ -55,6 +57,9 @@ def connect(settings: dict, password: str | None = None, oauth_token: str | None
     if not host:
         raise ValueError("no SMTP host configured")
     ctx = ssl.create_default_context()
+    if not (settings.get("ssl") or settings.get("starttls")) and settings.get("allow_insecure") is not True:
+        raise ValueError("Email Boss will not send your password over an unencrypted connection. "
+                         "Turn on SSL or STARTTLS for the outgoing server (or set allow_insecure: true).")
     if smtp_factory is not None:
         conn = smtp_factory(host, port, timeout, ctx, bool(settings.get("ssl")))
     elif settings.get("ssl"):

@@ -86,10 +86,21 @@
     },
     {
       "key": "effective_date",
-      "label": "Effective",
+      "label": "Effective date",
       "type": "date",
       "show_on": [
         "card",
+        "drawer"
+      ],
+      "searchable": false,
+      "group": "Details",
+      "source": "key_details"
+    },
+    {
+      "key": "renewal_date",
+      "label": "Renewal date",
+      "type": "date",
+      "show_on": [
         "drawer"
       ],
       "searchable": false,
@@ -147,7 +158,7 @@
     },
     {
       "id": "sla",
-      "label": "SLA"
+      "label": "Reply by"
     },
     {
       "id": "quote",
@@ -156,7 +167,7 @@
   ],
   "teams": [],
   "business_hours": {
-    "tz": "America/New_York",
+    "tz": "",
     "start": 8,
     "end": 17,
     "days": [
@@ -248,8 +259,8 @@
     "effective_date"
   ],
   "features": {
-    "money": true,
-    "game_layer": true,
+    "money": false,
+    "game_layer": false,
     "analytics": true
   },
   "workflows": {
@@ -508,7 +519,7 @@
         },
         {
           "id": "sla",
-          "label": "SLA",
+          "label": "Reply by",
           "match": {
             "date_type": "sla"
           }

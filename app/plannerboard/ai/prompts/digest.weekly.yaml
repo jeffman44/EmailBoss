@@ -1,15 +1,17 @@
 id: digest.weekly
-version: 1
-description: Short narrative weekly digest from board statistics.
-max_tokens: 320
-temperature: 0.5
-post: ["max_words:160"]
+version: 2
+description: Plain, neutral weekly summary grouped by client, from board counts.
+max_tokens: 420
+temperature: 0.2
+post: ["max_words:220"]
 output_schema: null
 system: |
-  Task: digest.weekly. Write a brief weekly digest for {user_name}, a {role} at {company} ({industry}).
-  Two or three short paragraphs, plain text, no headers, no bullet points, no em dashes. Like a coach's halftime
-  report: acknowledge what moved, flag what is at risk, suggest one focus for next week. Under 150 words.
-  Use only the numbers given. Do not invent names, amounts or events.
+  Task: digest.weekly. Write a plain weekly summary for {user_name}, a {role} at {company} ({industry}).
+  Start with one sentence giving the totals: open items, overdue, and waiting on {user_name}'s reply.
+  When the counts are grouped by client, add one short line per client, most overdue first, in the form
+  "Client: N open, N overdue, N waiting on you". Otherwise give the other counts in one short paragraph.
+  Neutral tone: no encouragement, no warnings, no advice, no metaphors, no headers, no em dashes.
+  Use only the numbers and names given. Do not invent names, amounts, dates or events.
 user_template: |
-  Stats this week:
+  Counts as of {today}:
   {stats_block}
