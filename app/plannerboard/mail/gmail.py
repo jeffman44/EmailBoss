@@ -65,10 +65,14 @@ def oauth_defaults() -> dict:
     and the loopback redirect, so shipping it in the build is expected.
     Microsoft's public-client PKCE flow needs no secret at all."""
     import os
+    try:
+        from .. import _oauth_ids as baked
+    except Exception:  # pragma: no cover
+        baked = None
     return {
-        "gmail_default_client_id": os.environ.get("PB_GMAIL_CLIENT_ID", "").strip(),
-        "gmail_default_client_secret": os.environ.get("PB_GMAIL_CLIENT_SECRET", "").strip(),
-        "graph_default_client_id": os.environ.get("PB_GRAPH_CLIENT_ID", "").strip(),
+        "gmail_default_client_id": (os.environ.get("PB_GMAIL_CLIENT_ID") or getattr(baked, "GMAIL_CLIENT_ID", "")).strip(),
+        "gmail_default_client_secret": (os.environ.get("PB_GMAIL_CLIENT_SECRET") or getattr(baked, "GMAIL_CLIENT_SECRET", "")).strip(),
+        "graph_default_client_id": (os.environ.get("PB_GRAPH_CLIENT_ID") or getattr(baked, "GRAPH_CLIENT_ID", "")).strip(),
     }
 
 

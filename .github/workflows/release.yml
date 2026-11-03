@@ -48,6 +48,10 @@ jobs:
           pip install -e "app[dev,tray,attachments,http,desktop]" pyinstaller build
       - name: Build bundle (release channel)
         shell: pwsh
+        env:
+          PB_GMAIL_CLIENT_ID: ${{ secrets.PB_GMAIL_CLIENT_ID }}
+          PB_GMAIL_CLIENT_SECRET: ${{ secrets.PB_GMAIL_CLIENT_SECRET }}
+          PB_GRAPH_CLIENT_ID: ${{ secrets.PB_GRAPH_CLIENT_ID }}
         run: app\scripts\build_release.ps1 -Python python
       - name: Installer (Inno Setup)
         shell: pwsh

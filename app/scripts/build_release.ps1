@@ -46,7 +46,17 @@ if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
 # Release channel: PB_LICENSE_DEV / --dev-license are inert in what we ship.
 $ChannelFile = "plannerboard\_channel.py"
 $ChannelBackup = Get-Content $ChannelFile -Raw
+$IdsFile = "plannerboard\_oauth_ids.py"
+$IdsBackup = Get-Content $IdsFile -Raw
 try {
+    # Built-in sign-in: bake the OAuth client ids from the build environment (CI secrets).
+    $ids = Get-Content $IdsFile -Raw
+    $ids = $ids -replace 'GMAIL_CLIENT_ID = ""', ('GMAIL_CLIENT_ID = "' + ($env:PB_GMAIL_CLIENT_ID) + '"')
+    $ids = $ids -replace 'GMAIL_CLIENT_SECRET = ""', ('GMAIL_CLIENT_SECRET = "' + ($env:PB_GMAIL_CLIENT_SECRET) + '"')
+    $ids = $ids -replace 'GRAPH_CLIENT_ID = ""', ('GRAPH_CLIENT_ID = "' + ($env:PB_GRAPH_CLIENT_ID) + '"')
+    Set-Content $IdsFile $ids -NoNewline
+    if ($env:PB_GMAIL_CLIENT_ID) { Write-Host "oauth: Gmail client id baked in" } else { Write-Host "oauth: no Gmail client id (app-password path only)" }
+    if ($env:PB_GRAPH_CLIENT_ID) { Write-Host "oauth: Microsoft client id baked in" } else { Write-Host "oauth: no Microsoft client id (app-password path only)" }
     (Get-Content $ChannelFile -Raw) -replace 'CHANNEL = "dev"', 'CHANNEL = "release"' | Set-Content $ChannelFile -NoNewline
     if (-not (Select-String -Path $ChannelFile -Pattern 'CHANNEL = "release"' -Quiet)) { throw "could not set release channel" }
 
@@ -67,5 +77,6 @@ try {
     }
 } finally {
     Set-Content $ChannelFile $ChannelBackup -NoNewline
+    Set-Content $IdsFile $IdsBackup -NoNewline
 }
 Write-Host "done"
