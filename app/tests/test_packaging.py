@@ -46,7 +46,7 @@ def test_python_dash_m_entry_point():
     r = subprocess.run([sys.executable, "-m", "plannerboard", "--version"], capture_output=True, text=True,
                        cwd=str(APP), timeout=60)
     assert r.returncode == 0, r.stderr
-    assert "Email Boss 1.3.1" in (r.stdout + r.stderr)
+    assert "Email Boss 1.3.2" in (r.stdout + r.stderr)
 
 
 def test_version_files_agree():
@@ -103,3 +103,16 @@ def test_release_workflow_signs_and_uploads_manifest():
     wf = (APP.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "make_update_manifest.py" in wf and "EB_RELEASE_SIGNING_KEY" in wf
     assert wf.count("app/dist/update.json.sig") == 2 and wf.count("app/dist/update.json\n") == 2
+
+
+def test_bundle_entry_imports_the_package_not_a_loose_script():
+    """1.3.1 shipped with start.py as the PyInstaller entry; its relative
+    imports fail in a frozen build ("no known parent package")."""
+    spec = (APP_DIR / "scripts" / "build_pyinstaller.spec").read_text()
+    assert 'ENTRY = SPEC_DIR / "launch.py"' in spec
+    launch = (APP_DIR / "scripts" / "launch.py").read_text()
+    assert "from plannerboard.start import main" in launch
+    import subprocess, sys
+    r = subprocess.run([sys.executable, str(APP_DIR / "scripts" / "launch.py"), "--version"],
+                       capture_output=True, text=True, cwd=str(APP_DIR))
+    assert "Email Boss" in (r.stdout + r.stderr)

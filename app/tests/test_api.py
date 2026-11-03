@@ -145,7 +145,7 @@ def test_project_subtask_triage_health_flow(client):
     for key in ("status", "db_write_ok", "watchers", "restart_needed", "alerts", "last_triage", "mail", "ai",
                 "license", "version", "watchers_down"):
         assert key in h, key
-    assert h["db_write_ok"] is True and h["version"] == "1.3.1"
+    assert h["db_write_ok"] is True and h["version"] == "1.3.2"
     assert h["mail"]["provider"] == "none" and "today_cost_usd" in h["ai"]
     cfg = c.get("/api/config").json
     assert cfg["profession"]["template"] == "hvac_contractor" and cfg["features"]["money"] is True

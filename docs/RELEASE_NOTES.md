@@ -1,5 +1,12 @@
 # Release notes
 
+## 1.3.2
+
+- Fixes the 1.3.1 installer: the packaged program failed on start with
+  "attempted relative import with no known parent package". The bundle now
+  starts through a launcher that imports the package properly.
+
+
 ## 1.3.1
 
 - Fixes the 1.3.0 desktop launch: the window's health probe was refused by

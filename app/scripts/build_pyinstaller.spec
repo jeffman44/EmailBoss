@@ -30,7 +30,7 @@ except NameError:
 
 APP_DIR = (SPEC_DIR / "..").resolve()
 PKG = APP_DIR / "plannerboard"
-ENTRY = PKG / "start.py"
+ENTRY = SPEC_DIR / "launch.py"
 
 APP_NAME = "EmailBoss"
 # keep in step with plannerboard/__init__.py and /VERSION
