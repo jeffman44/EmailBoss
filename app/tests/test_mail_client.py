@@ -710,3 +710,170 @@ def test_unique_names_and_safe_names():
     from plannerboard.api import mail_client_api as api
     assert api._unique_names(["a.pdf", "A.pdf", "a.pdf", "../../etc/passwd", "x\\y\\z.txt"]) == \
         ["a.pdf", "A (1).pdf", "a (2).pdf", "passwd", "z.txt"]
+
+
+# ---- sanitizer: positioning / hiding styles, quote box --------------------
+
+def test_sanitizer_strips_overlay_and_hiding_styles():
+    from plannerboard.mail.compose import sanitize_html, quote_reply
+    out = sanitize_html('<div style="position:fixed;top:0;left:0;z-index:9;width:100%;height:100%;background:#fff;color:red">PHISH</div>')
+    assert "position" not in out and "z-index" not in out and "top" not in out
+    assert "background:#fff" in out and "color:red" in out
+    out = sanitize_html('<p style="margin:0 -9999px;margin-left:-5px;transform:scale(9);-webkit-transform:rotate(1deg);'
+                        'clip:rect(0,0,0,0);clip-path:inset(0);opacity:0;pointer-events:none;font-weight:bold">x</p>')
+    for bad in ("margin", "transform", "clip", "opacity", "pointer-events"):
+        assert bad not in out
+    assert "font-weight:bold" in out
+    assert "margin:0 auto" in sanitize_html('<p style="margin:0 auto;opacity:.9">x</p>')
+    assert "opacity:.9" in sanitize_html('<p style="opacity:.9">x</p>')
+    # escapes, comments and image-set drop the whole attribute
+    for st in ("pos\\69tion:fixed", "position/**/:fixed", "background:image-set('https://evil/x' 1x)",
+               "background:-webkit-image-set(url(x) 1x)"):
+        assert "style=" not in sanitize_html(f'<p style="{st}">x</p>')
+    q = quote_reply(_msg(is_html=True, body='<div style="position:absolute;top:0">x</div>'))
+    assert 'class="pb-quote"' in q and "position:absolute" not in q
+
+
+def test_quote_box_css_contains_the_original():
+    from pathlib import Path
+    css = (Path(__file__).resolve().parents[1] / "plannerboard" / "static" / "mail.css").read_text(encoding="utf-8")
+    rule = css[css.index(".pb-quote"):]
+    rule = rule[:rule.index("}")]
+    assert "contain: paint" in rule and "overflow: hidden" in rule and "max-height: 60vh" in rule
+
+
+# ---- image proxy -------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, data, chunk=65536):
+        self.data, self.pos, self.chunk = data, 0, chunk
+
+    def read(self, n):
+        out = self.data[self.pos:self.pos + min(n, self.chunk)]
+        self.pos += len(out)
+        return out
+
+
+class _FakeConn:
+    def close(self):
+        pass
+
+
+def _proxy(monkeypatch, routes, dns=None):
+    """routes: {(host, path): (status, headers, bytes)}; dns: {host: [ips]}."""
+    from plannerboard.api import mail_client_api as api
+    dns = dns or {}
+    seen = []
+    monkeypatch.setattr(api, "_resolve", lambda h: dns.get(h, ["93.184.216.34"]))
+
+    def fake_get(host, ip, path, timeout):
+        seen.append((host, ip, path))
+        status, headers, data = routes[(host, path)]
+        return status, {k.lower(): v for k, v in headers.items()}, _FakeResp(data), _FakeConn()
+    monkeypatch.setattr(api, "_http_get", fake_get)
+    return seen
+
+
+def test_image_proxy_serves_images_with_safe_headers(client_app, monkeypatch):
+    app, store, cfg, prov = client_app
+    c = app.test_client()
+    seen = _proxy(monkeypatch, {("img.example", "/a.png?x=1"): (200, {"Content-Type": "image/png; charset=x"}, b"\x89PNG....")})
+    r = c.get("/api/mail/client/image", query_string={"url": "https://img.example/a.png?x=1"})
+    assert r.status_code == 200 and r.data == b"\x89PNG...." and r.mimetype == "image/png"
+    assert r.headers["X-Content-Type-Options"] == "nosniff" and "sandbox" in r.headers["Content-Security-Policy"]
+    assert seen == [("img.example", "93.184.216.34", "/a.png?x=1")]     # connected to the vetted address
+
+
+def test_image_proxy_refuses_bad_targets(client_app, monkeypatch):
+    app, store, cfg, prov = client_app
+    c = app.test_client()
+    seen = _proxy(monkeypatch, {}, dns={"intranet.example": ["10.0.0.5"], "mixed.example": ["93.184.216.34", "127.0.0.1"],
+                                   "v6.example": ["::1"], "tun.example": ["64:ff9b::a00:1"]})
+    def get(u):
+        return c.get("/api/mail/client/image", query_string={"url": u})
+    for u in ("http://img.example/a.png", "ftp://img.example/a.png", "file:///etc/passwd", "//img.example/a.png",
+              "https://user:pw@img.example/a.png", "https://img.example:8443/a.png", "", "https://", "https://img.example/a b", "https://2130706433/a.png", "https://0x7f.1/a.png"):
+        assert get(u).status_code == 400, u
+    for u in ("https://127.0.0.1/a.png", "https://[::1]/a.png", "https://10.1.2.3/a.png", "https://192.168.0.1/a.png",
+              "https://169.254.169.254/latest/meta-data", "https://0.0.0.0/a.png", "https://[::ffff:127.0.0.1]/a.png",
+              "https://intranet.example/a.png", "https://mixed.example/a.png", "https://v6.example/a.png",
+              "https://tun.example/a.png"):
+        r = get(u)
+        assert r.status_code in (403, 502), (u, r.status_code)
+        assert "error" in r.get_json()
+    assert seen == []                                   # nothing was ever fetched
+
+
+def test_image_proxy_content_type_size_redirects_timeout(client_app, monkeypatch):
+    from plannerboard.api import mail_client_api as api
+    app, store, cfg, prov = client_app
+    c = app.test_client()
+    big = b"x" * (api.IMAGE_MAX_BYTES + 10)
+    _proxy(monkeypatch, {
+        ("h.example", "/page"): (200, {"Content-Type": "text/html"}, b"<script>"),
+        ("h.example", "/none"): (200, {}, b"abc"),
+        ("h.example", "/big"): (200, {"Content-Type": "image/png"}, big),
+        ("h.example", "/biglen"): (200, {"Content-Type": "image/png", "Content-Length": str(len(big))}, b"x"),
+        ("h.example", "/ok"): (200, {"Content-Type": "image/gif"}, b"GIF89a"),
+        ("h.example", "/gone"): (404, {}, b""),
+        ("h.example", "/r1"): (302, {"Location": "https://h.example/ok"}, b""),
+        ("h.example", "/rhttp"): (302, {"Location": "http://h.example/ok"}, b""),
+        ("h.example", "/rloop"): (302, {"Location": "/rloop"}, b""),
+        ("h.example", "/rint"): (302, {"Location": "https://internal.example/a.png"}, b""),
+    }, dns={"internal.example": ["192.168.1.9"]})
+    get = lambda p: c.get("/api/mail/client/image", query_string={"url": "https://h.example" + p})
+    assert get("/page").status_code == 415 and get("/none").status_code == 415
+    assert get("/big").status_code == 413 and get("/biglen").status_code == 413
+    assert get("/ok").status_code == 200
+    assert get("/gone").status_code == 502
+    assert get("/r1").data == b"GIF89a"                    # https -> https is followed
+    assert get("/rhttp").status_code == 400                # downgrade refused
+    assert get("/rloop").status_code == 502                # bounded hops
+    assert get("/rint").status_code == 403                 # redirect into a private address refused
+    # 10 second budget
+    clock = [0.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+    orig = api._http_get
+    def slow(host, ip, path, timeout):
+        clock[0] += 11
+        return orig(host, ip, path, timeout)
+    monkeypatch.setattr(api, "_http_get", slow)
+    r = get("/r1")
+    assert r.status_code == 504
+
+
+def test_image_proxy_respects_client_switch(client_app, monkeypatch):
+    app, store, cfg, prov = client_app
+    cfg["mail"]["client_enabled"] = False
+    assert app.test_client().get("/api/mail/client/image", query_string={"url": "https://img.example/a.png"}).status_code == 403
+
+
+# ---- request size limits -------------------------------------------------------
+
+def test_oversize_requests_answer_413_in_plain_language(client_app):
+    from plannerboard.api import mail_client_api as api
+    app, store, cfg, prov = client_app
+    c = app.test_client()
+    cfg["mail"]["send_enabled"] = True
+    blob = base64.b64encode(b"a" * (api.MAX_ATTACH_BYTES + 1)).decode()
+    for path in ("/api/mail/client/draft", "/api/mail/client/send"):
+        # one file over 25 MB: refused before decoding
+        r = c.post(path, json={"to": "a@b.example", "subject": "s", "body_html": "<p>x</p>",
+                               "attachments": [{"name": "big.bin", "content_b64": blob}]})
+        assert r.status_code == 413 and "25 MB" in r.get_json()["error"], path
+        # several files that only add up past 25 MB
+        part = base64.b64encode(b"a" * (13 * 1024 * 1024)).decode()
+        r = c.post(path, json={"to": "a@b.example", "subject": "s", "body_html": "<p>x</p>",
+                               "attachments": [{"name": "a", "content_b64": part}, {"name": "b", "content_b64": part}]})
+        assert r.status_code == 413 and "25 MB" in r.get_json()["error"], path
+        # a body larger than any allowed request is refused by size alone (Content-Length)
+        r = c.post(path, data=b'{"x":"' + b"a" * (api.MAX_UPLOAD_REQUEST_BYTES + 10) + b'"}', content_type="application/json")
+        assert r.status_code == 413 and "25 MB" in r.get_json()["error"], path
+    # the small endpoints take far less
+    r = c.post("/api/mail/client/flags", data=b'{"ref":"' + b"a" * (api.MAX_SMALL_REQUEST_BYTES + 10) + b'"}',
+               content_type="application/json")
+    assert r.status_code == 413 and r.get_json()["ok"] is False
+    # a normal attachment still goes through
+    r = c.post("/api/mail/client/draft", json={"to": "a@b.example", "subject": "s", "body_html": "<p>x</p>",
+                                               "attachments": [{"name": "n.txt", "content_b64": base64.b64encode(b"hi").decode()}]})
+    assert r.status_code == 200

@@ -49,7 +49,47 @@ _DROP_WITH_CONTENT = frozenset("script style iframe frame frameset object embed 
 _PLACEHOLDER_SRC = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 _SAFE_DATA_IMG = re.compile(r"^data:image/(png|jpe?g|gif|webp);base64,[a-z0-9+/=]+$", re.I)
 _URL_JUNK = re.compile(r"[\x00-\x20\x7f-\x9f\u200b-\u200f\u2028\u2029\ufeff]+")
-_BAD_STYLE = re.compile(r"url\s*\(|expression|@import|behaviou?r|javascript|vbscript|-moz-binding|\\|/\*", re.I)
+_BAD_STYLE = re.compile(r"url\s*\(|image-set|expression|@import|behaviou?r|javascript|vbscript|-moz-binding|\\|/\*", re.I)
+# Properties that let a quoted message escape its box, cover the page or hide
+# content: dropped one by one (the rest of the style attribute survives).
+_VENDOR = re.compile(r"^-(?:webkit|moz|ms|o)-")
+_BAD_PROPS = frozenset((
+    "position", "z-index", "top", "left", "right", "bottom", "inset", "inset-block", "inset-inline",
+    "transform", "transform-origin", "transform-style", "translate", "rotate", "scale", "perspective",
+    "perspective-origin", "clip", "clip-path", "mask", "mask-image", "filter", "backdrop-filter",
+    "mix-blend-mode", "isolation", "pointer-events", "will-change", "contain", "content-visibility",
+    "float", "appearance", "cursor", "zoom",
+))
+_NEG_NUM = re.compile(r"(^|[\s(,])-\s*(?:\d|\.\d)")
+_NEG_PROPS = re.compile(r"^(?:margin(?:-[a-z]+)*|text-indent|letter-spacing|word-spacing|vertical-align)$")
+_NUM = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*(%?)\s*(?:!important)?\s*$", re.I)
+
+
+def _clean_style(style: str) -> str:
+    """Keep only declarations that cannot reposition, hide or overlay. Anything
+    unparseable is dropped; the empty string means "emit no style attribute"."""
+    keep = []
+    for decl in style.split(";"):
+        if ":" not in decl:
+            continue
+        prop, _, val = decl.partition(":")
+        prop = _VENDOR.sub("", prop.strip().lower())
+        val = val.strip()
+        if not prop or not val or not re.fullmatch(r"[a-z-]+", prop):
+            continue
+        if prop in _BAD_PROPS or prop.startswith(("transform", "mask", "inset", "perspective", "animation", "transition")):
+            continue
+        if prop == "opacity":
+            m = _NUM.match(val)
+            if not m:
+                continue
+            n = float(m.group(1)) / (100.0 if m.group(2) else 1.0)
+            if n < 0.5:
+                continue
+        if _NEG_PROPS.match(prop) and _NEG_NUM.search(val):
+            continue
+        keep.append(f"{prop}:{val}")
+    return ";".join(keep)
 _SIMPLE_ATTRS = {"a": ("title",), "img": ("alt", "title"), "td": ("colspan", "rowspan"), "th": ("colspan", "rowspan")}
 _INT = re.compile(r"^\d{1,5}%?$")
 
@@ -117,7 +157,9 @@ class _Sanitizer(HTMLParser):
                 parts.append(f'{k}="{_html.escape(a[k], quote=True)}"')
         style = a.get("style", "")
         if style and not _BAD_STYLE.search(style) and len(style) < 1000:
-            parts.append(f'style="{_html.escape(style, quote=True)}"')
+            style = _clean_style(style)
+            if style:
+                parts.append(f'style="{_html.escape(style, quote=True)}"')
         self.out.append("<" + " ".join([tag] + parts) + ">")
         if tag not in _VOID:
             self.stack.append(tag)

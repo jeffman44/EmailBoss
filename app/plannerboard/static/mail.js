@@ -8,7 +8,10 @@
  *
  * Bodies render inside a sandboxed iframe (no scripts, no same-origin). Remote
  * images and CSS url() are replaced by a placeholder until the person presses
- * "Load images". Anything that reaches the composer's innerHTML has been
+ * "Load images"; then each image is fetched through the server proxy
+ * (/api/mail/client/image) and handed to the frame as a data: URL, so the page
+ * CSP stays img-src 'self' data:. CSS url(), image-set, escapes, svg and math
+ * never reach the frame. Anything that reaches the composer's innerHTML has been
  * sanitized on the server and is sanitized again here.
  *
  * Sending: Send asks "Send to X and N others?", then waits 10 seconds with an
@@ -88,6 +91,35 @@ window.PBMail = (() => {
   const DROP_TAGS = new Set('SCRIPT STYLE IFRAME FRAME FRAMESET OBJECT EMBED APPLET FORM BASE META LINK SVG MATH NOSCRIPT TEMPLATE TITLE HEAD TEXTAREA SELECT BUTTON AUDIO VIDEO SOURCE CANVAS'.split(' '));
   const cleanUrl = (u) => String(u || '').replace(/[\u0000-\u0020\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]+/g, '');
   const isRemote = (u) => /^(https?:|\/\/|ftp:)/i.test(cleanUrl(u));
+  // Same policy as the server sanitizer: a style that can fetch, escape or script is dropped.
+  const BAD_CSS = /url\s*\(|image-set|expression|@import|behaviou?r|javascript|vbscript|-moz-binding|\\|\/\*/i;
+  const IMG_PROXY = '/api/mail/client/image?url=';
+  const MAX_PROXY_IMAGES = 40;
+  const MAX_PROXY_BYTES = 5 * 1048576;
+  const normRemote = (u) => { const c = cleanUrl(u); return c.indexOf('//') === 0 ? 'https:' + c : c; };
+  async function fetchProxied(u) {
+    try {
+      const r = await fetch(IMG_PROXY + encodeURIComponent(u), { credentials: 'same-origin', headers: { 'X-Requested-With': 'EmailBoss' } });
+      if (!r.ok) return '';
+      const blob = await r.blob();
+      if (!/^image\//i.test(blob.type || '') || blob.size > MAX_PROXY_BYTES) return '';
+      return await new Promise((res) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result)); fr.onerror = () => res(''); fr.readAsDataURL(blob); });
+    } catch (e) { return ''; }
+  }
+  // url -> data: URL for the https images in a message body (best effort, a few at a time).
+  async function proxyImages(html) {
+    const doc = new DOMParser().parseFromString(html || '', 'text/html');
+    const urls = [];
+    doc.querySelectorAll('img[src]').forEach((i) => {
+      const u = normRemote(i.getAttribute('src'));
+      if (/^https:/i.test(u) && !urls.includes(u) && urls.length < MAX_PROXY_IMAGES) urls.push(u);
+    });
+    const map = {};
+    let next = 0;
+    const worker = async () => { while (next < urls.length) { const u = urls[next++]; const d = await fetchProxied(u); if (d) map[u] = d; } };
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    return map;
+  }
   function sanitizeNode(parent, blockRemote) {
     Array.from(parent.childNodes).forEach((n) => {
       if (n.nodeType === 3) return;
@@ -109,11 +141,12 @@ window.PBMail = (() => {
             return;
           }
         } else if (name === 'data-pb-src' && n.tagName === 'IMG') keep = /^https?:/i.test(cleanUrl(val)) && blockRemote !== false;
-        else if (name === 'style') keep = !/url\s*\(|expression|@import|behaviou?r|javascript|vbscript|\\|\/\*/i.test(val);
+        else if (name === 'style') keep = !BAD_CSS.test(val);
         else if (['alt', 'title', 'width', 'height', 'colspan', 'rowspan'].includes(name)) keep = true;
         if (!keep) n.removeAttribute(a.name);
       });
       if (n.tagName === 'A') n.setAttribute('rel', 'noopener noreferrer');
+      if (n.tagName === 'IMG' && blockRemote !== false && !n.hasAttribute('src') && n.hasAttribute('data-pb-src')) n.setAttribute('src', PLACEHOLDER);
     });
   }
   function sanitizeClient(html, blockRemote) {
@@ -124,7 +157,7 @@ window.PBMail = (() => {
   // Put real image URLs back (used right before sending the quoted original).
   function restoreRemote(html) {
     const doc = new DOMParser().parseFromString('<body>' + (html || '') + '</body>', 'text/html');
-    doc.body.querySelectorAll('img[data-pb-src]').forEach((i) => { i.setAttribute('src', i.getAttribute('data-pb-src')); i.removeAttribute('data-pb-src'); });
+    doc.body.querySelectorAll('img[data-pb-src]').forEach((i) => { i.setAttribute('src', i.getAttribute('data-pb-src')); i.removeAttribute('data-pb-src'); i.removeAttribute('data-pb-loaded'); });
     return doc.body.innerHTML;
   }
   const looksHtml = (s) => /<\/?(p|div|br|span|b|i|a|ul|ol|li|table|blockquote)\b/i.test(s || '');
@@ -382,10 +415,11 @@ window.PBMail = (() => {
   }
 
   // Build the sandboxed document: active content stripped, remote content held back.
-  function prepareBody(m, cidMap, loadImages) {
+  function prepareBody(m, cidMap, loadImages, remoteMap) {
     let html = m.is_html ? (m.body || '') : ('<pre style="white-space:pre-wrap;font-family:inherit">' + esc(m.body || '') + '</pre>');
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    doc.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,base,meta,link,noscript,audio,video,source,template,input,button,textarea,select').forEach(n => n.remove());
+    doc.querySelectorAll('script,iframe,frame,frameset,object,embed,applet,form,base,meta,link,noscript,audio,video,source,template,input,button,textarea,select,svg,math').forEach(n => n.remove());
+    remoteMap = remoteMap || {};
     let blocked = 0;
     doc.querySelectorAll('*').forEach((n) => {
       Array.from(n.attributes).forEach((a) => {
@@ -399,22 +433,28 @@ window.PBMail = (() => {
         const cid = /^cid:/i.test(cleanUrl(src)) ? cleanUrl(src).slice(4) : null;
         if (cid && cidMap[cid]) { n.setAttribute('src', cidMap[cid]); }
         else if (isRemote(src)) {
-          if (!loadImages) { n.setAttribute('data-pb-src', src); n.setAttribute('src', PLACEHOLDER); blocked++; }
+          const real = normRemote(src);
+          if (loadImages && remoteMap[real]) n.setAttribute('src', remoteMap[real]);
+          else { n.setAttribute('data-pb-src', real); n.setAttribute('src', PLACEHOLDER); if (!loadImages) blocked++; }
         } else if (!/^data:image\//i.test(cleanUrl(src))) { n.removeAttribute('src'); }
-        if (!loadImages && n.hasAttribute('srcset')) { n.removeAttribute('srcset'); blocked++; }
+        if (n.hasAttribute('srcset')) { n.removeAttribute('srcset'); if (!loadImages) blocked++; }
       }
-      if (!loadImages) {
-        if (n.hasAttribute('background')) { n.removeAttribute('background'); blocked++; }
-        const st = n.getAttribute('style');
-        if (st && /url\s*\(/i.test(st)) { n.setAttribute('style', st.replace(/url\s*\([^)]*\)/gi, 'none')); blocked++; }
+      if (n.hasAttribute('background')) { n.removeAttribute('background'); if (!loadImages) blocked++; }
+      const st = n.getAttribute('style');
+      if (st && BAD_CSS.test(st)) {
+        // Only a plain url() is "an image held back"; escapes, image-set and the rest are simply dropped.
+        const plain = st.replace(/url\s*\([^)]*\)/gi, 'none');
+        if (/url\s*\(/i.test(st) && !loadImages) blocked++;
+        if (BAD_CSS.test(plain)) n.removeAttribute('style'); else n.setAttribute('style', plain);
       }
     });
-    if (!loadImages) {
-      doc.querySelectorAll('style').forEach((s) => {
-        const t = s.textContent || '';
-        if (/url\s*\(|@import/i.test(t)) { s.textContent = t.replace(/@import[^;]*;?/gi, '').replace(/url\s*\([^)]*\)/gi, 'none'); blocked++; }
-      });
-    }
+    doc.querySelectorAll('style').forEach((s) => {
+      const t = s.textContent || '';
+      if (!BAD_CSS.test(t)) return;
+      const plain = t.replace(/@import[^;]*;?/gi, '').replace(/url\s*\([^)]*\)/gi, 'none');
+      if (/url\s*\(|@import/i.test(t) && !loadImages) blocked++;
+      if (BAD_CSS.test(plain)) s.remove(); else s.textContent = plain;
+    });
     return { html: doc.body ? doc.body.innerHTML : '', head: Array.from(doc.querySelectorAll('head style')).map(s => s.outerHTML).join(''), blocked };
   }
   function bodyDoc(prep) {
@@ -442,7 +482,9 @@ window.PBMail = (() => {
     const ref = m.ref;
     const map = await inlineImages(m);
     if (!S.open || S.open.ref !== ref) return;
-    const prep = prepareBody(m, map, !!m._loadImages);
+    const remote = m._loadImages && m.is_html ? await proxyImages(m.body || '') : {};
+    if (!S.open || S.open.ref !== ref) return;
+    const prep = prepareBody(m, map, !!m._loadImages, remote);
     const bar = $('mail-img-bar');
     if (bar) {
       bar.textContent = '';
@@ -673,7 +715,7 @@ window.PBMail = (() => {
     ['mc-to', 'mc-cc', 'mc-bcc', 'mc-subject'].forEach(id => $(id).addEventListener('input', () => C.dirty = true));
     body.addEventListener('input', () => C.dirty = true);
     renderReplyTo();
-    renderImgNotice(!!init.remote_blocked || !!body.querySelector('img[data-pb-src]'));
+    renderImgNotice(!!init.remote_blocked || !!body.querySelector('img[data-pb-src]:not([data-pb-loaded])'));
     renderAtts();
     $('mail-compose-overlay').classList.add('open');
     setTimeout(() => { (init.to ? body : $('mc-to')).focus(); }, 30);
@@ -699,7 +741,11 @@ window.PBMail = (() => {
     n.style.display = 'flex'; n.textContent = '';
     n.appendChild(el('span', { text: 'Images in the quoted message are hidden.' }));
     n.appendChild(el('button', { class: 'mail-btn', text: 'Load images', on: { click: () => {
-      $('mc-body').querySelectorAll('img[data-pb-src]').forEach((i) => { const u = i.getAttribute('data-pb-src'); if (/^https?:/i.test(u)) { i.setAttribute('src', u); i.removeAttribute('data-pb-src'); } });
+      // Through the server proxy (https only); data-pb-src keeps the real URL for sending.
+      $('mc-body').querySelectorAll('img[data-pb-src]').forEach((i) => {
+        const u = normRemote(i.getAttribute('data-pb-src'));
+        if (/^https:/i.test(u)) { i.setAttribute('src', IMG_PROXY + encodeURIComponent(u)); i.setAttribute('data-pb-loaded', '1'); }
+      });
       n.style.display = 'none';
     } } }));
   }
@@ -709,7 +755,7 @@ window.PBMail = (() => {
   function stopAutosave() { if (C.timer) { clearInterval(C.timer); C.timer = null; } }
   function composerSnapshot() {
     return { to: $('mc-to').value.trim(), cc: $('mc-cc').value.trim(), bcc: $('mc-bcc').value.trim(),
-      subject: $('mc-subject').value.trim(), body: $('mc-body').innerHTML, project_id: $('mc-project').value || '' };
+      subject: $('mc-subject').value.trim(), body: restoreRemote($('mc-body').innerHTML), project_id: $('mc-project').value || '' };
   }
   async function autosaveNow() {
     if (!C.open || !C.dirty || !$('mc-body')) return;
@@ -915,7 +961,7 @@ window.PBMail = (() => {
 
   return { show, hide, selectFolder, reloadFolders, openMessage, more, refresh, flag, markRead, move, del, trash, fileTo, stage,
            compose, closeCompose, toggleCc, attach, removeAtt, reply, send, saveDraft, aiDraft, toggleKeys, state: S,
-           _sanitizeClient: sanitizeClient,
+           _sanitizeClient: sanitizeClient, _prepareBody: prepareBody,
            // Settings flipped a mail flag: re-read capabilities (send gate, provider) without losing the open folder.
            resetCaps: async () => { S.caps = null; if (S.built) { await loadCaps(); renderFolders(); } } };
 })();

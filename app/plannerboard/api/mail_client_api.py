@@ -20,13 +20,19 @@ on the runtime.
 from __future__ import annotations
 
 import base64
+import http.client
+import ipaddress
 import re
+import socket
+import ssl
 import threading
+import time
 from pathlib import PurePosixPath, PureWindowsPath
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 from datetime import datetime, timezone
 
 from flask import Blueprint, Response, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from ..mail import runner as mail_runner
 from ..mail.base import message_dict
@@ -39,11 +45,36 @@ from ._common import body, error_response, int_arg, rt, view
 bp = Blueprint("mail_client_api", __name__)
 
 MAX_ATTACH_BYTES = 25 * 1024 * 1024
+# Request size limits. Attachments travel as base64 inside the JSON body (4/3 of
+# the file) plus the message text; every other call carries a few hundred bytes.
+MAX_UPLOAD_REQUEST_BYTES = MAX_ATTACH_BYTES * 4 // 3 + 2 * 1024 * 1024
+MAX_SMALL_REQUEST_BYTES = 1024 * 1024
+_UPLOAD_ENDPOINTS = frozenset(("mail_client_api.api_draft", "mail_client_api.api_send"))
+_TOO_BIG = ("The attachments are too big. Email Boss can keep up to 25 MB at a time. "
+            "Remove a file or send it another way.")
 _lock = threading.Lock()
 _cache: dict = {}            # {provider_id: provider}  (one per process)
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
+
+@bp.before_request
+def _limit_request_size():
+    """Cap the body before anything reads it (also covers chunked uploads that
+    carry no Content-Length). Only draft/send may carry attachments."""
+    limit = MAX_UPLOAD_REQUEST_BYTES if request.endpoint in _UPLOAD_ENDPOINTS else MAX_SMALL_REQUEST_BYTES
+    request.max_content_length = limit
+    if request.content_length is not None and request.content_length > limit:
+        return error_response(413, _TOO_BIG if limit == MAX_UPLOAD_REQUEST_BYTES
+                              else "That request is too large for Email Boss to handle.")
+    return None
+
+
+@bp.errorhandler(RequestEntityTooLarge)
+def _too_large(_e):
+    return error_response(413, _TOO_BIG if request.endpoint in _UPLOAD_ENDPOINTS
+                          else "That request is too large for Email Boss to handle.")
+
 
 def _cfg() -> dict:
     return view().get("cfg") or {}
@@ -188,8 +219,11 @@ def _attachments_from_body(items) -> list[Attachment]:
     for it in items or []:
         if not isinstance(it, dict):
             continue
+        raw = it.get("content_b64") or it.get("contentBytes") or ""
+        if (len(raw) * 3 // 4) + total > MAX_ATTACH_BYTES:    # refuse before decoding a huge string
+            raise ValueError(f"attachments exceed {MAX_ATTACH_BYTES // (1024 * 1024)} MB")
         try:
-            content = base64.b64decode(it.get("content_b64") or it.get("contentBytes") or "")
+            content = base64.b64decode(raw)
         except Exception:
             content = b""
         total += len(content)
@@ -377,6 +411,170 @@ def api_delete():
         return _fail(e)
 
 
+# ── remote image proxy ("Load images") ──────────────────────────────────────
+#
+# The page CSP is img-src 'self' data:, so a remote image can only be shown by
+# the server fetching it. https only, public addresses only (the connection is
+# pinned to the address that was checked), redirects followed only to https and
+# re-checked, 10 s and 5 MB overall, image/* only, sent back nosniff + sandboxed.
+
+IMAGE_MAX_BYTES = 5 * 1024 * 1024
+IMAGE_TIMEOUT_S = 10.0
+IMAGE_MAX_REDIRECTS = 3
+
+
+class _ImageRefused(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
+
+
+def _resolve(host: str) -> list[str]:
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise _ImageRefused(502, "Email Boss could not find that image's server.")
+    return sorted({i[4][0] for i in infos})
+
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_SIX_TO_FOUR = ipaddress.ip_network("2002::/16")
+_TEREDO = ipaddress.ip_network("2001::/32")
+
+
+def _public_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if ip.version == 6 and (ip in _NAT64 or ip in _SIX_TO_FOUR or ip in _TEREDO):
+        return False                         # tunnels that can wrap a private IPv4 address
+    return ip.is_global and not ip.is_multicast
+
+
+def _check_target(url: str) -> tuple[str, str, str]:
+    """(host, ip, path) for an https URL that points at a public address."""
+    if len(url) > 2000 or any(ord(c) < 33 or ord(c) == 127 for c in url):
+        raise _ImageRefused(400, "That image address is not valid.")
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "https":
+        raise _ImageRefused(400, "Email Boss only loads images over a secure (https) connection.")
+    host = (parts.hostname or "").strip(".").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if not host or parts.username is not None or parts.password is not None or port not in (None, 443):
+        raise _ImageRefused(400, "That image address is not valid.")
+    try:
+        ipaddress.ip_address(host)
+        addrs = [host]                       # a literal address: judged below like any other
+    except ValueError:
+        if re.fullmatch(r"(?:0x[0-9a-f]*|\d+)", host.rsplit(".", 1)[-1]):
+            raise _ImageRefused(400, "That image address is not valid.")     # 2130706433, 0x7f.1: odd IP spellings
+        addrs = _resolve(host)
+    if not addrs or not all(_public_ip(a) for a in addrs):
+        raise _ImageRefused(403, "Email Boss will not load images from that address.")
+    path = (parts.path or "/") + (("?" + parts.query) if parts.query else "")
+    return host, addrs[0], path
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """TLS to ``host`` (certificate checked for that name) over a socket opened
+    to an address that was already vetted, so DNS cannot change its mind."""
+
+    def __init__(self, host: str, ip: str, timeout: float):
+        super().__init__(host, 443, timeout=timeout, context=ssl.create_default_context())
+        self._ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, 443), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _http_get(host: str, ip: str, path: str, timeout: float):
+    """(status, headers, response, connection). Split out so tests can stub the network."""
+    conn = _PinnedHTTPS(host, ip, timeout)
+    conn.request("GET", path, headers={"Host": host, "Accept": "image/*", "User-Agent": "Mozilla/5.0 (EmailBoss image proxy)",
+                                       "Accept-Encoding": "identity", "Connection": "close"})
+    resp = conn.getresponse()
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp, conn
+
+
+def fetch_remote_image(url: str) -> tuple[bytes, str]:
+    deadline = time.monotonic() + IMAGE_TIMEOUT_S
+    for _hop in range(IMAGE_MAX_REDIRECTS + 1):
+        host, ip, path = _check_target(url)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _ImageRefused(504, "That image took too long to load.")
+        try:
+            status, headers, resp, conn = _http_get(host, ip, path, left)
+        except _ImageRefused:
+            raise
+        except (OSError, http.client.HTTPException, ssl.SSLError):
+            raise _ImageRefused(502, "Email Boss could not load that image.")
+        try:
+            if status in (301, 302, 303, 307, 308):
+                loc = headers.get("location") or ""
+                url = urljoin(f"https://{host}{path}", loc)
+                continue                                    # re-validated at the top (https, public)
+            if status != 200:
+                raise _ImageRefused(502, "The image is no longer available.")
+            ctype = (headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if not re.fullmatch(r"image/[a-z0-9.+-]+", ctype):
+                raise _ImageRefused(415, "That link is not an image.")
+            try:
+                if int(headers.get("content-length") or 0) > IMAGE_MAX_BYTES:
+                    raise _ImageRefused(413, "That image is too large to load.")
+            except ValueError:
+                pass
+            chunks, size = [], 0
+            while True:
+                if time.monotonic() > deadline:
+                    raise _ImageRefused(504, "That image took too long to load.")
+                try:
+                    chunk = resp.read(65536)
+                except (OSError, http.client.HTTPException, ssl.SSLError):
+                    raise _ImageRefused(502, "Email Boss could not load that image.")
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > IMAGE_MAX_BYTES:
+                    raise _ImageRefused(413, "That image is too large to load.")
+                chunks.append(chunk)
+            return b"".join(chunks), ctype
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    raise _ImageRefused(502, "That image link redirects too many times.")
+
+
+@bp.route("/api/mail/client/image", methods=["GET"])
+def api_image():
+    """?url=<https image>. Bytes of the image, or a plain-language error."""
+    if not _client_enabled():
+        return error_response(403, "The mail client is turned off. You can turn it back on in Settings > Mail.")
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return error_response(400, "That image address is not valid.")
+    try:
+        data, ctype = fetch_remote_image(url)
+    except _ImageRefused as e:
+        return error_response(e.status, e.message)
+    resp = Response(data, mimetype=ctype)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    resp.headers["Cache-Control"] = "private, max-age=3600"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Disposition"] = "inline"
+    return resp
+
+
 # ── compose: reply / forward scaffolding, drafts, send ──────────────────────
 
 @bp.route("/api/mail/client/compose", methods=["POST"])
@@ -433,7 +631,7 @@ def api_draft():
     try:
         atts = _attachments_from_body(data.get("attachments"))
     except ValueError as e:
-        return error_response(413, "The attachments are too big. Email Boss can keep up to 25 MB at a time.")
+        return error_response(413, _TOO_BIG)
     v = view()
     store = v.get("store")
     reply_to = _reply_target(prov, data.get("reply_ref"))
@@ -480,7 +678,7 @@ def api_send():
     try:
         atts = _attachments_from_body(data.get("attachments"))
     except ValueError as e:
-        return error_response(413, "The attachments are too big. Email Boss can send up to 25 MB at a time.")
+        return error_response(413, _TOO_BIG)
     reply_to = _reply_target(prov, data.get("reply_ref"))
     try:
         result = prov.send_message(to, data.get("cc") or "", data.get("bcc") or "",

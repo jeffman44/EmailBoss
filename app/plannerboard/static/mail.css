@@ -175,3 +175,6 @@
   min-width: 52px; text-align: center; background: var(--bg3); border: 1px solid var(--line3); border-radius: 4px;
   padding: 2px 6px; font-family: 'JetBrains Mono', monospace; font-size: max(var(--fs-min, 12px), 12px); color: var(--t0);
 }
+
+/* Quoted original inside the composer: whatever the sender's HTML does, it stays in this box. */
+.pb-quote, .pb-forward { contain: paint; overflow: hidden; max-height: 60vh; position: relative; }

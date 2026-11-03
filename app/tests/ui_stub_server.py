@@ -699,7 +699,7 @@ def api_ai_search():
                     "items": [{"project_id": p["id"], "label": p["name"], "detail": p["location"]} for p in hits]})
 
 
-@app.route("/api/ai/weekly-digest")
+@app.route("/api/ai/weekly-digest", methods=["GET", "POST"])
 def api_ai_digest():
     return jsonify({"ok": True, "text": "A steady week. Two replies are waiting on you.", "digest": "A steady week.",
                     "items": [{"label": "Overdue: 1", "detail": ""}]})

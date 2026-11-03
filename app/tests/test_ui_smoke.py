@@ -502,3 +502,85 @@ def test_board_13_today_decisions_ai_drafts(server, browser):
     assert errors == [], "\n".join(errors)
     assert stub.app.unknown == [], f"page hit endpoints the stub does not define: {stub.app.unknown}"
     page.close()
+
+
+# ---- no inline event handlers; data never becomes code ----------------------
+
+def test_board_source_has_no_inline_handlers():
+    import html as _html
+    import re
+    from pathlib import Path
+    st = Path(__file__).resolve().parents[1] / "plannerboard" / "static"
+    page = (st / "board.html").read_text(encoding="utf-8")
+    js = (st / "board.js").read_text(encoding="utf-8")
+    csp = re.search(r'Content-Security-Policy" content="([^"]+)"', page).group(1)
+    script_src = re.search(r"script-src ([^;]+)", csp).group(1)
+    assert "unsafe-inline" not in script_src and "unsafe-eval" not in script_src
+    assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", page), "inline <script> block"
+    attr = re.compile(r"(?<![\w.\-])on[a-z]+=[\"']")
+    for name, text in (("board.html", page), ("board.js", js), ("mail.js", (st / "mail.js").read_text(encoding="utf-8"))):
+        bad = [m.group(0) for m in attr.finditer(text)]
+        assert not bad, f"{name}: inline handler attribute left: {bad[:3]}"
+    # every handler the markup names must resolve to a function
+    names = set(re.findall(r'"f":"(\w+)"', _html.unescape(page))) | set(re.findall(r"EK\('(\w+)'", js + page))
+    assert len(names) > 100
+    for n in sorted(names):
+        assert re.search(r"^(async\s+)?function\s+%s\s*\(" % n, js, re.M) or re.search(r"^\s{2}%s\(" % n, js, re.M), \
+            f"handler {n} is not defined"
+
+
+def test_delegated_handlers_pass_data_as_data(server, browser):
+    errors = []
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    _collect(page, errors)
+    page.goto(server + "/", wait_until="networkidle")
+    page.wait_for_timeout(800)
+    hostile = "x');window.__pwn=1;('\"><img src=x onerror=window.__pwn=2>"
+    got = page.evaluate("""(h) => {
+        window.__calls = [];
+        window.openPanel = (...a) => window.__calls.push(a);
+        const d = document.createElement('div');
+        d.innerHTML = '<button id="hostile" data-on-click="' + EH(null, EK('openPanel', h, 7)) + '">go</button>' +
+                      '<input id="hv" data-on-change="' + EH(null, EK('openPanel', 'v', $V)) + '">' +
+                      '<div id="ov" data-on-click="' + EH({g: 'self'}, EK('openPanel', 'overlay')) + '"><b id="kid">k</b></div>';
+        document.body.appendChild(d);
+        document.getElementById('hostile').click();
+        const i = document.getElementById('hv'); i.value = 'typed'; i.dispatchEvent(new Event('change', {bubbles: true}));
+        document.getElementById('kid').click();
+        document.getElementById('ov').click();
+        return {calls: window.__calls, pwn: window.__pwn === undefined, kids: d.querySelectorAll('img').length};
+    }""", hostile)
+    assert got["calls"] == [[hostile, 7], ["v", "typed"], ["overlay"]]
+    assert got["pwn"] and got["kids"] == 0
+    # nothing rendered by the board itself carries an inline handler
+    n = page.evaluate("""() => document.querySelectorAll('[onclick],[onchange],[oninput],[onblur],[onfocus],[onkeydown],[ondrop],[ondragover]').length""")
+    assert n == 0
+    assert errors == [], "\n".join(errors)
+    page.close()
+
+
+def test_reading_pane_body_prep_drops_active_and_css_tricks(server, browser):
+    page = browser.new_page(viewport={"width": 1200, "height": 800})
+    page.goto(server + "/", wait_until="networkidle")
+    page.wait_for_timeout(500)
+    html = ('<svg><style>*{background:url(https://evil/x)}</style><a href="x">s</a></svg><math><mi>m</mi></math>'
+            '<p id="a" style="background:image-set(\'https://evil/a\' 1x)">a</p>'
+            '<p id="b" style="b\\61ckground:red">b</p>'
+            '<p id="c" style="background:url(https://evil/c);color:red">c</p>'
+            '<p id="d" style="color:blue">d</p>'
+            '<style>.x{background:-webkit-image-set(url(a) 1x)}</style><style>.y{color:green}</style>'
+            '<img id="i" src="https://img.example/p.png" srcset="https://evil/2x 2x">')
+    r = page.evaluate("""(h) => {
+        const mk = (load, map) => { const p = PBMail._prepareBody({is_html: true, body: h}, {}, load, map);
+          const d = new DOMParser().parseFromString('<head>' + p.head + '</head><body>' + p.html + '</body>', 'text/html');
+          return {html: p.html, head: p.head, blocked: p.blocked, d: d.body.innerHTML}; };
+        return {held: mk(false, {}), loaded: mk(true, {'https://img.example/p.png': 'data:image/png;base64,AAAA'})};
+    }""", html)
+    for k in ("held", "loaded"):
+        out = r[k]["html"] + r[k]["head"]
+        assert "<svg" not in out and "<math" not in out and "image-set" not in out and "evil" not in out.replace("data-pb-src", "")
+        assert 'id="b"' in out and "b\\61ckground" not in out
+        assert "color:green" in out.replace(" ", "") and "color:blue" in out.replace(" ", "")
+    assert r["held"]["blocked"] >= 2 and 'data-pb-src="https://img.example/p.png"' in r["held"]["html"]
+    assert 'src="data:image/png;base64,AAAA"' in r["loaded"]["html"] and r["loaded"]["blocked"] == 0
+    page.close()
