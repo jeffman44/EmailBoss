@@ -54,7 +54,7 @@ DEFAULTS = {
         "graph": {"client_id": "", "tenant": "common"},
     },
     "ai": {
-        "provider": "none", "model": "", "base_url": "",
+        "provider": "emailboss", "model": "", "base_url": "",
         "daily_budget_usd": 2.0,
         "features": {"classify": True, "summarize": True, "match_rerank": True,
                      "draft_reply": True, "assistant": False},

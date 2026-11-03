@@ -71,12 +71,45 @@ def resolve(ext: Any) -> ExtView:
     return view
 
 
+def license_creds_getter(rt: Any):
+    """Lazy reader of the license client's material for the built-in provider.
+    The license client is attached by the license middleware, possibly after
+    the LLM is built, so look it up on every call."""
+    def _get() -> dict:
+        client = None
+        if isinstance(rt, dict):
+            client = rt.get("license")
+        else:
+            client = getattr(rt, "license", None) or getattr(rt, "license_client", None)
+            if client is None:
+                ext = getattr(rt, "ext", None)
+                if isinstance(ext, dict):
+                    client = ext.get("license")
+        if client is None:
+            return {}
+        try:
+            st = client.status() or {}
+            act = client.stored_activation()
+            lid = ""
+            if act:
+                try:
+                    lid = str(client.parse_activation(act).get("lid") or "")
+                except Exception:
+                    lid = ""
+            return {"lid": lid, "fingerprint": client.fingerprint, "activation": act,
+                    "server_url": client.server_url, "status": st.get("status", "")}
+        except Exception:
+            return {}
+    return _get
+
+
 def install(rt: Any, secret_getter=None, start_scheduler: bool = True) -> Any:
     """Build the LLM from the runtime's config, attach it, wire the health
     hook and (optionally) start the hourly assistant pass. Returns the LLM."""
     view = resolve(rt)
     getter = secret_getter or view.get("secret_getter")
-    llm = build_llm(view["cfg"], view["profession"], view["store"], getter)
+    llm = build_llm(view["cfg"], view["profession"], view["store"], getter,
+                    license_creds=license_creds_getter(rt))
     view["llm"] = llm
     if not isinstance(rt, dict):
         try:

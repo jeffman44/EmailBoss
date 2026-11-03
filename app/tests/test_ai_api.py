@@ -48,7 +48,7 @@ def test_providers_and_usage(tmp_path):
     app, store, _ = _app(tmp_path)
     c = app.test_client()
     r = c.get("/api/ai/providers").get_json()
-    assert r["ok"] and {p["id"] for p in r["providers"]} == {"none", "anthropic", "openai", "ollama"}
+    assert r["ok"] and {p["id"] for p in r["providers"]} == {"emailboss", "none", "anthropic", "openai", "ollama"}
     anth = next(p for p in r["providers"] if p["id"] == "anthropic")
     assert anth["required"] == ["api_key"] and "claude-sonnet-4-5" in anth["models"]
     assert r["current"]["provider"] == "fake" and "reply.draft" in r["prompts"]

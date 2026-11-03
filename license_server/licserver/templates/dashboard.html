@@ -16,6 +16,23 @@
     <button type="button" class="copy" data-target="key-{{ lic.lid }}">Copy key</button>
   </div>
   <div class="small muted">features: <span class="mono">{{ lic.features | join(', ') }}</span></div>
+  <div class="ai-credits" style="margin-top:12px">
+    <strong>AI credits</strong>
+    {% if lic.ai_wallet %}<span class="mono">{{ lic.ai_wallet.balance }}</span>{% else %}<span class="muted small">{{ ai_trial }} free credits arrive with first use</span>{% endif %}
+    <span class="small muted">last 30 days: {{ lic.ai_totals.calls }} calls, {{ lic.ai_totals.credits }} credits used, {{ lic.ai_totals.in_tok + lic.ai_totals.out_tok }} tokens</span>
+    {% if ai_packs %}
+    <div style="margin-top:6px">
+    {% for p in ai_packs %}
+      <form method="post" action="/ai/checkout" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="hidden" name="lid" value="{{ lic.lid }}">
+        <input type="hidden" name="pack" value="{{ p.id }}">
+        <button class="small" type="submit">Buy {{ p.label }}</button>
+      </form>
+    {% endfor %}
+    </div>
+    {% endif %}
+  </div>
   {% if lic.devices %}
   <table style="margin-top:12px">
     <thead><tr><th>device</th><th>app</th><th>first seen</th><th>last seen</th><th>valid until</th><th></th></tr></thead>

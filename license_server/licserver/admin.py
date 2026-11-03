@@ -24,6 +24,9 @@ def admin_home(request: Request, admin: dict = Depends(require_admin)):
     for lic in licenses:
         lic["state"] = license_state(lic)
         lic["seats_used"] = len(db.active_activations(lic["lid"]))
+        w = db.get_wallet(lic["lid"])
+        lic["ai_balance"] = w["balance"] if w else None
+        lic["ai_spend"] = db.ledger_totals(lic["lid"], days=30)["credits"]
     return render(request, "admin/index.html", accounts=accounts, licenses=licenses, plans=PLANS)
 
 
@@ -73,6 +76,20 @@ def renew(request: Request, lid: str, admin: dict = Depends(require_admin), days
     except KeyError:
         return redirect("/admin", error="No such license.")
     return redirect("/admin", notice=f"Renewed {lid} to {lic['expires']}. Key re-signed.")
+
+
+@router.post("/licenses/{lid}/credits")
+def grant_credits(request: Request, lid: str, admin: dict = Depends(require_admin), credits: int = Form(0),
+                  note: str = Form(""), csrf_token: str = Form("")):
+    check_csrf(request, csrf_token)
+    db = db_of(request)
+    if not db.get_license(lid):
+        return redirect("/admin", error="No such license.")
+    if not 1 <= credits <= 1_000_000:
+        return redirect("/admin", error="Credits must be between 1 and 1,000,000.")
+    bal = db.credit(lid, credits, reason=f"admin grant: {note[:80]}", actor=admin["id"],
+                    trial_credits=settings_of(request).ai_trial_credits)
+    return redirect("/admin", notice=f"Granted {credits} AI credits to {lid}. Balance {bal}.")
 
 
 @router.post("/accounts/{aid}/admin")

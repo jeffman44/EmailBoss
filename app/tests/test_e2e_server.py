@@ -126,7 +126,7 @@ def test_full_flow_from_setup_to_assistant(data_root):
     assert lic["status"] == "dev" and lic["read_only"] is False and lic["dev_mode"] is True
     assert c.post("/api/license/activate", json={}).status_code == 400
     assert [p["id"] for p in c.get("/api/mail/providers").json["providers"]] == ["pa_folder", "imap", "gmail", "graph", "none"]
-    assert {p["id"] for p in c.get("/api/ai/providers").json["providers"]} == {"none", "anthropic", "openai", "ollama"}
+    assert {p["id"] for p in c.get("/api/ai/providers").json["providers"]} == {"emailboss", "none", "anthropic", "openai", "ollama"}
     assert c.post("/api/ai/draft-reply", json={"subject": "x"}).status_code == 503
     assert c.get("/api/mail/status").json["provider"] == "none"
     h = c.get("/api/health").json

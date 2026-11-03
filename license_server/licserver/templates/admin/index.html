@@ -10,7 +10,7 @@
 <h2>Licenses ({{ licenses | length }})</h2>
 <div class="panel">
 <table>
-  <thead><tr><th>lid</th><th>account</th><th>plan</th><th>seats</th><th>expires</th><th>state</th><th></th></tr></thead>
+  <thead><tr><th>lid</th><th>account</th><th>plan</th><th>seats</th><th>expires</th><th>state</th><th>AI credits</th><th></th></tr></thead>
   <tbody>
   {% for l in licenses %}
   <tr>
@@ -20,6 +20,13 @@
     <td class="mono">{{ l.seats_used }}/{{ l.seats }}</td>
     <td class="mono small">{{ l.expires[:10] }}</td>
     <td><span class="badge {{ l.state }}">{{ l.state }}</span></td>
+    <td class="mono small">{{ l.ai_balance if l.ai_balance is not none else '-' }} <span class="muted">(30d spend {{ l.ai_spend }})</span>
+      <form method="post" action="/admin/licenses/{{ l.lid }}/credits" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="number" name="credits" value="100" min="1" max="1000000" style="width:5.5em">
+        <button class="small" type="submit">Grant</button>
+      </form>
+    </td>
     <td style="white-space:nowrap">
       <form method="post" action="/admin/licenses/{{ l.lid }}/renew" class="inline">
         <input type="hidden" name="csrf_token" value="{{ csrf }}"><input type="hidden" name="days" value="365">
@@ -32,7 +39,7 @@
       </form>{% endif %}
     </td>
   </tr>
-  {% else %}<tr><td colspan="7" class="muted">No licenses issued.</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="8" class="muted">No licenses issued.</td></tr>{% endfor %}
   </tbody>
 </table>
 </div>

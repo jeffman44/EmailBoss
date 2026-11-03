@@ -76,6 +76,24 @@ def _plan_for(session: dict, plan_map: dict) -> tuple[str, int | None]:
     return (plan if plan in ("trial", "solo", "team") else "solo"), seats
 
 
+def _handle_ai_credits(app, session: dict) -> dict:
+    """A paid credit-pack session: credit the wallet once per Stripe session id."""
+    db, settings = app.state.db, app.state.settings
+    meta = session.get("metadata") or {}
+    lid, sid = str(meta.get("lid") or ""), str(session.get("id") or "")
+    credits = int(meta["credits"]) if str(meta.get("credits", "")).isdigit() else 0
+    if not lid or not sid or credits <= 0 or not db.get_license(lid):
+        db.audit("ai.purchase_rejected", actor="stripe", target=lid, detail={"session": sid})
+        return {"ok": False, "ignored": "bad ai_credits session"}
+    if session.get("payment_status") not in (None, "paid", "no_payment_required"):
+        return {"ok": True, "ignored": "not paid"}
+    applied = db.record_purchase(lid, sid, credits, int(session.get("amount_total") or 0),
+                                 trial_credits=settings.ai_trial_credits)
+    if not applied:
+        return {"ok": True, "ignored": "duplicate session"}
+    return {"ok": True, "ai_credits": credits, "lid": lid}
+
+
 def handle_event(app, event: dict) -> dict:
     db, settings = app.state.db, app.state.settings
     etype = event.get("type", "")
@@ -83,6 +101,9 @@ def handle_event(app, event: dict) -> dict:
     db.audit("stripe.event", actor="stripe", target=event.get("id", ""), detail={"type": etype})
     if not db.claim_webhook_event(str(event.get("id") or ""), etype):
         return {"ok": True, "ignored": "duplicate event"}
+
+    if etype == "checkout.session.completed" and (obj.get("metadata") or {}).get("kind") == "ai_credits":
+        return _handle_ai_credits(app, obj)
 
     if etype == "checkout.session.completed":
         email = ((obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or "").lower().strip()

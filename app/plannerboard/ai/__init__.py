@@ -21,9 +21,9 @@ __all__ = [
 ]
 
 
-def build_llm(cfg: dict, profession: dict, store, secret_getter=None) -> LLM:
+def build_llm(cfg: dict, profession: dict, store, secret_getter=None, license_creds=None) -> LLM:
     """Provider from config + usage meter on the store + prompt registry."""
-    provider = make_provider(cfg, secret_getter)
+    provider = make_provider(cfg, secret_getter, license_creds=license_creds)
     budget = float(((cfg or {}).get("ai") or {}).get("daily_budget_usd") or 0.0)
     meter = UsageMeter(store, budget)
     return LLM(provider, meter, cfg, profession)

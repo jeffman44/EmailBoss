@@ -202,5 +202,5 @@ def test_factory_routes_and_null_provider():
     assert isinstance(p, OllamaProvider) and p.host == "http://box:11434"
     p = make_provider({"ai": {"provider": "anthropic"}}, lambda k: "", overrides={"api_key": "over"})
     assert isinstance(p, AnthropicProvider) and p.api_key == "over"
-    assert {c["id"] for c in PROVIDER_CATALOG} == {"none", "anthropic", "openai", "ollama"}
+    assert {c["id"] for c in PROVIDER_CATALOG} == {"emailboss", "none", "anthropic", "openai", "ollama"}
     assert NullProvider().complete("s", "u").ok is False

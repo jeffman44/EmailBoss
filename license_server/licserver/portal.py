@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
+from .ai_relay import AiError, _packs, create_checkout_session
 from .licenses import license_state
 from .web import check_csrf, current_account, db_of, redirect, render, require_account, settings_of
 
@@ -15,6 +16,9 @@ def _decorate(db, lic: dict) -> dict:
     lic["state"] = license_state(lic)
     lic["devices"] = db.all_activations(lic["lid"])
     lic["seats_used"] = sum(1 for d in lic["devices"] if not d["revoked"])
+    wallet = db.get_wallet(lic["lid"])
+    lic["ai_wallet"] = wallet
+    lic["ai_totals"] = db.ledger_totals(lic["lid"], days=30)
     return lic
 
 
@@ -29,7 +33,22 @@ def home(request: Request):
 def dashboard(request: Request, account: dict = Depends(require_account)):
     db = db_of(request)
     licenses = [_decorate(db, lic) for lic in db.licenses_for_account(account["id"])]
-    return render(request, "dashboard.html", licenses=licenses)
+    return render(request, "dashboard.html", licenses=licenses, ai_packs=_packs(settings_of(request)),
+                  ai_trial=settings_of(request).ai_trial_credits)
+
+
+@router.post("/ai/checkout")
+def ai_buy(request: Request, account: dict = Depends(require_account), lid: str = Form(""), pack: str = Form(""),
+           csrf_token: str = Form("")):
+    check_csrf(request, csrf_token)
+    lic = db_of(request).get_license(lid)
+    if not lic or lic["account_id"] != account["id"]:
+        return redirect("/dashboard", error="That license is not yours.")
+    try:
+        out = create_checkout_session(request.app, lid, pack)
+    except AiError as e:
+        return redirect("/dashboard", error=e.message)
+    return redirect(out["url"])
 
 
 @router.post("/licenses/{lid}/devices/{act_id}/deactivate")

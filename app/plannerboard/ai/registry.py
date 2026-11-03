@@ -189,6 +189,7 @@ class LLM:
         self._avail_ttl = availability_ttl_s
         self._lock = threading.Lock()
         self.last_error = ""
+        self.credits_exhausted = False
 
     # -- state -----------------------------------------------------------
     @property
@@ -244,6 +245,8 @@ class LLM:
             "budget_usd": self.meter.daily_budget_usd if self.meter else 0.0,
             "budget_hit": self.budget_hit,
             "last_error": self.last_error,
+            "credits_exhausted": getattr(self, "credits_exhausted", False),
+            "balance": getattr(self.provider, "last_balance", None),
         }
 
     # -- the call ----------------------------------------------------------
@@ -270,9 +273,10 @@ class LLM:
         model = overrides.get("model")
 
         try:
-            result = self.provider.complete(system, user, max_tokens=max_tokens,
-                                            temperature=temperature, json_schema=schema,
-                                            model=model)
+            kw = dict(max_tokens=max_tokens, temperature=temperature, json_schema=schema, model=model)
+            if getattr(self.provider, "name", "") == "emailboss":
+                kw["task"] = prompt_id
+            result = self.provider.complete(system, user, **kw)
         except Exception as e:  # a provider bug must never take the board down
             result = LLMResult.failure(f"provider exception: {e}")
         if self.meter:
@@ -280,6 +284,8 @@ class LLM:
         if not result.ok:
             self.last_error = result.error
             self.invalidate() if result.error.startswith(("network", "timeout", "auth")) else None
+            if result.error.startswith("credits"):
+                self.credits_exhausted = True
             return None
 
         value: Any = result.parsed if (spec.wants_json and result.parsed is not None) else result.text

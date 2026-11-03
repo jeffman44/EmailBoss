@@ -7,6 +7,9 @@ Tables:
     licenses(lid, account_id, plan, seats, features_json, issued, expires, revoked, stripe_sub_id, key)
     activations(id, lid, fingerprint, app_version, first_seen, last_seen, valid_until, revoked)
     audit_log(id, ts, actor, action, target, detail)
+    ai_wallets(lid, balance, trial_granted, updated)
+    ai_ledger(id, lid, fingerprint, ts, task, tier, model, in_tok, out_tok, vendor_usd, credits, ok, error)
+    ai_purchases(id, lid, stripe_session, credits, usd_cents, ts)
 """
 from __future__ import annotations
 
@@ -80,6 +83,36 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action  TEXT NOT NULL,
     target  TEXT NOT NULL DEFAULT '',
     detail  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS ai_wallets (
+    lid           TEXT PRIMARY KEY REFERENCES licenses(lid) ON DELETE CASCADE,
+    balance       INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+    trial_granted INTEGER NOT NULL DEFAULT 0,
+    updated       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_ledger (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lid         TEXT NOT NULL,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    ts          TEXT NOT NULL,
+    task        TEXT NOT NULL DEFAULT '',
+    tier        TEXT NOT NULL DEFAULT '',
+    model       TEXT NOT NULL DEFAULT '',
+    in_tok      INTEGER NOT NULL DEFAULT 0,
+    out_tok     INTEGER NOT NULL DEFAULT 0,
+    vendor_usd  REAL NOT NULL DEFAULT 0,
+    credits     INTEGER NOT NULL DEFAULT 0,
+    ok          INTEGER NOT NULL DEFAULT 1,
+    error       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_ai_ledger_lid_ts ON ai_ledger(lid, ts);
+CREATE TABLE IF NOT EXISTS ai_purchases (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    lid            TEXT NOT NULL,
+    stripe_session TEXT NOT NULL UNIQUE,
+    credits        INTEGER NOT NULL,
+    usd_cents      INTEGER NOT NULL DEFAULT 0,
+    ts             TEXT NOT NULL
 );
 """
 
@@ -377,3 +410,105 @@ class Database:
     def revoke_all_activations(self, lid: str) -> int:
         with self._lock, self.connect() as c:
             return c.execute("UPDATE activations SET revoked = 1 WHERE lid = ?", (lid,)).rowcount
+
+    # ------------------------------------------------------------ AI credits
+
+    def get_wallet(self, lid: str) -> Optional[dict]:
+        row = self._one("SELECT * FROM ai_wallets WHERE lid = ?", (lid,))
+        if row:
+            row["trial_granted"] = bool(row["trial_granted"])
+        return row
+
+    def ensure_wallet(self, lid: str, trial_credits: int = 0) -> dict:
+        """Create the wallet on first use and grant the trial allowance exactly
+        once (INSERT OR IGNORE: a second call never re-grants)."""
+        trial = max(0, int(trial_credits))
+        created = False
+        with self._lock, self.connect() as c:
+            cur = c.execute("INSERT OR IGNORE INTO ai_wallets(lid, balance, trial_granted, updated) VALUES (?,?,1,?)",
+                            (lid, trial, iso(utcnow())))
+            created = cur.rowcount == 1
+        if created and trial:
+            self.audit("ai.trial_grant", actor="system", target=lid, detail={"credits": trial})
+        return self.get_wallet(lid)  # type: ignore[return-value]
+
+    def debit(self, lid: str, credits: int) -> Optional[int]:
+        """Atomically subtract ``credits``. Returns the new balance, or None
+        (nothing changed) when the balance is too low or there is no wallet."""
+        n = int(credits)
+        if n < 0:
+            raise ValueError("credits must be >= 0")
+        with self._lock, self.connect() as c:
+            cur = c.execute("UPDATE ai_wallets SET balance = balance - ?, updated = ? WHERE lid = ? AND balance >= ?",
+                            (n, iso(utcnow()), lid, n))
+            if cur.rowcount != 1:
+                return None
+            return int(c.execute("SELECT balance FROM ai_wallets WHERE lid = ?", (lid,)).fetchone()[0])
+
+    def debit_upto(self, lid: str, credits: int) -> tuple[int, int]:
+        """Subtract min(credits, balance) in one statement. Returns
+        (charged, new_balance). Used after a vendor call already happened."""
+        n = int(credits)
+        with self._lock, self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT balance FROM ai_wallets WHERE lid = ?", (lid,)).fetchone()
+            if not row:
+                c.execute("ROLLBACK")
+                return 0, 0
+            take = max(0, min(n, int(row[0])))
+            c.execute("UPDATE ai_wallets SET balance = balance - ?, updated = ? WHERE lid = ?",
+                      (take, iso(utcnow()), lid))
+            c.execute("COMMIT")
+            return take, int(row[0]) - take
+
+    def credit(self, lid: str, credits: int, reason: str = "", actor: str = "system", trial_credits: int = 0) -> int:
+        """Add credits (creating the wallet if needed). Returns the new balance."""
+        n = int(credits)
+        if n <= 0:
+            raise ValueError("credits must be positive")
+        self.ensure_wallet(lid, trial_credits)
+        with self._lock, self.connect() as c:
+            c.execute("UPDATE ai_wallets SET balance = balance + ?, updated = ? WHERE lid = ?",
+                      (n, iso(utcnow()), lid))
+            bal = int(c.execute("SELECT balance FROM ai_wallets WHERE lid = ?", (lid,)).fetchone()[0])
+        self.audit("ai.credit", actor=actor, target=lid, detail={"credits": n, "reason": reason, "balance": bal})
+        return bal
+
+    def ledger_insert(self, lid: str, fingerprint: str, task: str, tier: str, model: str, in_tok: int,
+                      out_tok: int, vendor_usd: float, credits: int, ok: bool, error: str = "") -> int:
+        return self._exec(
+            "INSERT INTO ai_ledger(lid, fingerprint, ts, task, tier, model, in_tok, out_tok, vendor_usd, credits, ok, error) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (lid, fingerprint[:16], iso(utcnow()), task[:64], tier[:16], model[:64], int(in_tok), int(out_tok),
+             float(vendor_usd), int(credits), int(bool(ok)), error[:64]))
+
+    def ledger_totals(self, lid: str, days: int = 30) -> dict:
+        since = iso(utcnow() - timedelta(days=days))
+        row = self._one(
+            "SELECT COUNT(*) AS calls, COALESCE(SUM(ok),0) AS ok_calls, COALESCE(SUM(in_tok),0) AS in_tok, "
+            "COALESCE(SUM(out_tok),0) AS out_tok, COALESCE(SUM(credits),0) AS credits, "
+            "COALESCE(SUM(vendor_usd),0) AS vendor_usd FROM ai_ledger WHERE lid = ? AND ts >= ?", (lid, since))
+        return row or {"calls": 0, "ok_calls": 0, "in_tok": 0, "out_tok": 0, "credits": 0, "vendor_usd": 0.0}
+
+    def record_purchase(self, lid: str, stripe_session: str, credits: int, usd_cents: int = 0,
+                        trial_credits: int = 0) -> bool:
+        """Credit a paid pack exactly once per Stripe session id. True when
+        applied, False on a replay."""
+        n = int(credits)
+        if n <= 0 or not stripe_session:
+            raise ValueError("credits and stripe_session required")
+        self.ensure_wallet(lid, trial_credits)
+        with self._lock, self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute("INSERT INTO ai_purchases(lid, stripe_session, credits, usd_cents, ts) VALUES (?,?,?,?,?)",
+                          (lid, stripe_session, n, int(usd_cents or 0), iso(utcnow())))
+            except sqlite3.IntegrityError:
+                c.execute("ROLLBACK")
+                return False
+            c.execute("UPDATE ai_wallets SET balance = balance + ?, updated = ? WHERE lid = ?",
+                      (n, iso(utcnow()), lid))
+            c.execute("COMMIT")
+        self.audit("ai.purchase", actor="stripe", target=lid,
+                   detail={"credits": n, "usd_cents": int(usd_cents or 0), "session": stripe_session})
+        return True

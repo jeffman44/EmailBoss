@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import admin, auth, billing, licenses, portal
+from . import admin, ai_relay, auth, billing, licenses, portal
 from .config import Settings
 from .keys import Signer
 from .models import Database
@@ -30,6 +30,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(licenses.router)
     app.include_router(billing.router)
+    app.include_router(ai_relay.router)
     app.include_router(auth.router)
     app.include_router(portal.router)
     app.include_router(admin.router)

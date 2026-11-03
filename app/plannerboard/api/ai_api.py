@@ -141,10 +141,64 @@ def api_ai_usage():
         pass
     budget = float(getattr(getattr(llm, "meter", None), "daily_budget_usd",
                            ((v.get("cfg").get("ai") or {}).get("daily_budget_usd") or 0.0)))
+    prov = _builtin_provider(llm)
     return jsonify({"ok": True, "today": today, "budget_usd": budget,
                     "budget_hit": bool(llm.budget_hit) if llm is not None else False,
                     "provider": llm.provider_name if llm is not None else "none",
-                    "model": llm.model if llm is not None else ""})
+                    "model": llm.model if llm is not None else "",
+                    "builtin": prov is not None,
+                    "balance": getattr(prov, "last_balance", None) if prov is not None else None,
+                    "credits_today": int(round(float(today.get("cost_usd") or 0) * 100)) if prov is not None else None,
+                    "credits_exhausted": bool(getattr(llm, "credits_exhausted", False))})
+
+
+_balance_cache: dict = {"ts": 0.0, "data": {}}
+
+
+def _builtin_provider(llm):
+    prov = getattr(llm, "provider", None)
+    return prov if getattr(prov, "name", "") == "emailboss" else None
+
+
+@bp.route("/api/ai/balance", methods=["GET"])
+def api_ai_balance():
+    """Credit balance + packs from the relay (cached 60 s). Shape is stable
+    even when the built-in provider is not in use."""
+    import time as _t
+    v = view()
+    llm = v.get("llm")
+    prov = _builtin_provider(llm)
+    if prov is None:
+        return jsonify({"ok": True, "builtin": False, "balance": None, "packs": [], "low": False})
+    force = (request.args.get("refresh") or "") == "1"
+    if force or _t.time() - _balance_cache["ts"] > 60 or not _balance_cache["data"]:
+        data = prov.balance() or {}
+        if data:
+            _balance_cache.update(ts=_t.time(), data=data)
+    data = _balance_cache["data"] or {}
+    bal = data.get("balance")
+    bal = int(bal) if bal is not None else prov.last_balance
+    return jsonify({"ok": True, "builtin": True, "balance": bal,
+                    "packs": data.get("packs") or [], "trial_granted": bool(data.get("trial_granted")),
+                    "low": (bal is not None and bal < 50), "reachable": bool(data),
+                    "credits_exhausted": bool(getattr(llm, "credits_exhausted", False))})
+
+
+@bp.route("/api/ai/checkout", methods=["POST"])
+def api_ai_checkout():
+    """{pack} -> {url}. The UI opens the URL in the system browser."""
+    v = view()
+    prov = _builtin_provider(v.get("llm"))
+    if prov is None:
+        return jsonify({"ok": False, "error": "Email Boss AI is not the active provider"}), 400
+    pack = str(body().get("pack") or "")
+    if not pack:
+        return jsonify({"ok": False, "error": "pack required"}), 400
+    url, err = prov.checkout_url(pack)
+    if not url:
+        return jsonify({"ok": False, "error": err or "could not start checkout"}), 502
+    _balance_cache["ts"] = 0.0
+    return jsonify({"ok": True, "url": url})
 
 
 @bp.route("/api/ai/test", methods=["POST"])
@@ -155,7 +209,9 @@ def api_ai_test():
     data = body()
     overrides = {k: data.get(k) for k in ("provider", "api_key", "model", "base_url") if data.get(k) not in (None, "")}
     try:
-        prov = make_provider(v.get("cfg") or {}, v.get("secret_getter"), overrides=overrides)
+        from ..ai.wiring import license_creds_getter
+        prov = make_provider(v.get("cfg") or {}, v.get("secret_getter"), overrides=overrides,
+                             license_creds=license_creds_getter(v.backing if hasattr(v, "backing") else v))
     except Exception as e:
         return jsonify({"ok": False, "provider": "none", "error": f"{type(e).__name__}: {e}"})
     if isinstance(prov, NullProvider):

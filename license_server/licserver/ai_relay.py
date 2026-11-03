@@ -1,0 +1,365 @@
+"""Email Boss AI relay: metered model calls charged against a per-license credit wallet.
+
+Endpoints (device API, authenticated by the signed activation token):
+    POST /v1/ai/complete   forward one prompt to the vendor, charge the wallet
+    GET  /v1/ai/balance    wallet balance and the packs on sale
+    POST /v1/ai/checkout   create a Stripe Checkout session for a credit pack
+
+Prompt and completion text are never stored or logged; the ledger holds
+metadata only. Errors are {"ok": false, "error": "<message>", "code": "<code>"}.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import socket
+import time
+from typing import Any, Callable, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from .keys import SigningError
+from .licenses import _check_license_live, signer_of
+from .models import parse_iso, utcnow
+from .web import RateLimiter
+
+log = logging.getLogger("licserver.ai")
+router = APIRouter(prefix="/v1/ai", tags=["ai"])
+
+API_URL = "https://api.anthropic.com/v1/messages"
+API_VERSION = "2023-06-01"
+TIMEOUT_S = 60
+JSON_TOOL_NAME = "emit_result"
+STRIPE_SESSIONS_URL = "https://api.stripe.com/v1/checkout/sessions"
+
+# USD per million tokens (input, output). Anthropic rows copied from the app's usage.PRICE_TABLE.
+PRICE_TABLE: dict[str, tuple[float, float]] = {
+    "claude-opus-4-1": (15.0, 75.0),
+    "claude-opus-4": (15.0, 75.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-sonnet-4": (3.0, 15.0),
+    "claude-3-7-sonnet": (3.0, 15.0),
+    "claude-3-5-sonnet": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-3-5-haiku": (0.80, 4.0),
+    "claude-3-haiku": (0.25, 1.25),
+}
+
+
+class AiError(Exception):
+    def __init__(self, status: int, code: str, message: str, reason: str = ""):
+        super().__init__(message)
+        self.status, self.code, self.message, self.reason = status, code, message, reason
+
+
+class VendorError(Exception):
+    """Vendor call failed. ``kind`` is a short category safe to store (no vendor text)."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _fail(e: AiError) -> JSONResponse:
+    body: dict[str, Any] = {"ok": False, "error": e.message, "code": e.code}
+    if e.reason:
+        body["reason"] = e.reason
+    return JSONResponse(body, status_code=e.status)
+
+
+# ------------------------------------------------------------------ pricing
+
+def lookup_price(model: str) -> Optional[tuple[float, float]]:
+    m = (model or "").lower().strip()
+    best = None
+    for prefix, price in PRICE_TABLE.items():
+        if m.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, price)
+    return best[1] if best else None
+
+
+def vendor_cost_usd(model: str, in_tok: int, out_tok: int, fallback_model: str = "") -> float:
+    price = lookup_price(model) or lookup_price(fallback_model) or (3.0, 15.0)
+    return round((max(0, in_tok) * price[0] + max(0, out_tok) * price[1]) / 1_000_000.0, 6)
+
+
+def credits_for(vendor_usd: float, markup: float, minimum: int) -> int:
+    """ceil(vendor_usd * 100 * markup), never below the per-call minimum."""
+    raw = round(float(vendor_usd) * 100.0 * float(markup), 6)  # round away float noise before ceil
+    return max(int(minimum), int(math.ceil(raw)))
+
+
+def reserve_credits(settings, max_tokens: int) -> int:
+    """Worst case for a call: max_tokens of output at the smart-tier output price."""
+    price = lookup_price(settings.ai_model_smart) or (3.0, 15.0)
+    usd = int(max_tokens) * price[1] / 1_000_000.0
+    return credits_for(usd, settings.ai_markup, settings.ai_min_credits)
+
+
+# ------------------------------------------------------------------ vendor
+
+Transport = Callable[[str, dict, bytes, int], tuple[int, str]]
+
+
+def _urllib_transport(url: str, headers: dict, body: bytes, timeout: int) -> tuple[int, str]:
+    req = UrlRequest(url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception:
+            return e.code, ""
+
+
+def _ensure_object_schema(schema: dict) -> tuple[dict, bool]:
+    if isinstance(schema, dict) and schema.get("type") == "object":
+        return schema, False
+    return {"type": "object", "properties": {"result": schema}, "required": ["result"]}, True
+
+
+def vendor_call(model: str, system: str, user: str, max_tokens: int, temperature: float,
+                json_schema: dict | None, *, api_key: str, transport: Transport | None = None,
+                timeout: int = TIMEOUT_S) -> dict:
+    """One Anthropic Messages call (same shaping as the app's anthropic_provider).
+    Returns {text, parsed, input_tokens, output_tokens, model}. Raises VendorError.
+    ``transport(url, headers, body_bytes, timeout) -> (status, text)`` is injectable."""
+    body: dict = {
+        "model": model,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "messages": [{"role": "user", "content": user}],
+    }
+    if system:
+        body["system"] = system
+    wrapped = False
+    if json_schema:
+        tool_schema, wrapped = _ensure_object_schema(json_schema)
+        body["tools"] = [{
+            "name": JSON_TOOL_NAME,
+            "description": "Return the result as structured data matching the schema.",
+            "input_schema": tool_schema,
+        }]
+        body["tool_choice"] = {"type": "tool", "name": JSON_TOOL_NAME}
+    headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": API_VERSION}
+    send = transport or _urllib_transport
+    try:
+        status, raw = send(API_URL, headers, json.dumps(body).encode("utf-8"), timeout)
+    except (socket.timeout, TimeoutError):
+        raise VendorError("timeout")
+    except (URLError, OSError):
+        raise VendorError("network")
+    if status != 200:
+        raise VendorError(f"http_{status}")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise VendorError("parse")
+    text_parts: list[str] = []
+    parsed = None
+    for block in data.get("content") or []:
+        btype = block.get("type")
+        if btype == "text":
+            text_parts.append(block.get("text", ""))
+        elif btype == "tool_use" and block.get("name") == JSON_TOOL_NAME:
+            parsed = block.get("input")
+            if wrapped and isinstance(parsed, dict) and "result" in parsed:
+                parsed = parsed["result"]
+    text = "\n".join(p for p in text_parts if p).strip()
+    if parsed is not None and not text:
+        text = json.dumps(parsed)
+    usage = data.get("usage") or {}
+    return {"text": text, "parsed": parsed, "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0), "model": data.get("model") or model}
+
+
+# ------------------------------------------------------------------ auth
+
+def authenticate(app, lid: str, fingerprint: str, activation: str) -> dict:
+    """Verify the signed activation token and that the license is live.
+    Returns the license row; raises AiError(403, 'license', ...) otherwise."""
+    def deny(reason: str, message: str) -> AiError:
+        return AiError(403, "license", message, reason)
+
+    try:
+        payload = signer_of(app).verify(activation)
+    except SigningError:
+        raise deny("bad_signature", "Activation token rejected.")
+    if payload.get("lid") != lid:
+        raise deny("lid_mismatch", "Activation does not belong to this license.")
+    if payload.get("fingerprint") != fingerprint:
+        raise deny("fingerprint_mismatch", "Activation does not belong to this device.")
+    until = parse_iso(payload.get("valid_until"))
+    if not until or until < utcnow():
+        raise deny("activation_expired", "Activation expired; connect to refresh it.")
+    db = app.state.db
+    try:
+        lic = _check_license_live(db.get_license(lid))
+    except HTTPException as exc:
+        d = exc.detail if isinstance(exc.detail, dict) else {}
+        raise deny(str(d.get("code") or "license"), str(d.get("message") or "License is not active."))
+    act = db.get_activation(lid, fingerprint)
+    if not act or act["revoked"]:
+        raise deny("not_activated", "This device is not activated on that license.")
+    return lic
+
+
+def _packs(settings) -> list[dict]:
+    out = []
+    for pid, p in settings.stripe_credit_packs.items():
+        out.append({"id": pid, "label": f"{p['credits']} credits (${p['usd_cents'] / 100:.2f})",
+                    "credits": p["credits"], "usd_cents": p["usd_cents"]})
+    return out
+
+
+# ------------------------------------------------------------------ models
+
+class CompleteIn(BaseModel):
+    lid: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=16, max_length=128)
+    activation: str = Field(min_length=20, max_length=8192)
+    task: str = Field(default="", max_length=64)
+    tier: str = "fast"
+    system: str = Field(default="", max_length=200_000)
+    user: str = Field(min_length=1, max_length=400_000)
+    max_tokens: int = 800
+    temperature: float = 0.2
+    json_schema: Optional[dict] = None
+
+
+class CheckoutIn(BaseModel):
+    lid: str = Field(min_length=1, max_length=64)
+    fingerprint: str = Field(min_length=16, max_length=128)
+    activation: str = Field(min_length=20, max_length=8192)
+    pack: str = Field(min_length=1, max_length=128)
+
+
+# ------------------------------------------------------------------ complete
+
+def _limiter(app) -> RateLimiter:
+    lim = getattr(app.state, "ai_limiter", None)
+    if lim is None:
+        lim = RateLimiter(max(1, app.state.settings.ai_rate_per_min), 60)
+        app.state.ai_limiter = lim
+    return lim
+
+
+@router.post("/complete")
+def ai_complete(body: CompleteIn, request: Request):
+    app = request.app
+    settings, db = app.state.settings, app.state.db
+    try:
+        authenticate(app, body.lid, body.fingerprint, body.activation)
+        if body.tier not in ("fast", "smart"):
+            raise AiError(400, "bad_request", "tier must be 'fast' or 'smart'.")
+        if not _limiter(app).hit(body.lid):
+            raise AiError(429, "rate_limited", "Too many AI requests; slow down.")
+        if not settings.anthropic_api_key:
+            raise AiError(503, "relay_disabled", "The AI relay is not configured on this server.")
+        max_tokens = max(1, min(int(body.max_tokens), settings.ai_max_tokens))
+        temperature = min(1.0, max(0.0, float(body.temperature)))
+        model = settings.ai_model_smart if body.tier == "smart" else settings.ai_model_fast
+        wallet = db.ensure_wallet(body.lid, settings.ai_trial_credits)
+        need = reserve_credits(settings, max_tokens)
+        if wallet["balance"] < need:
+            raise AiError(402, "no_credits", f"Not enough AI credits (need {need}, have {wallet['balance']}).")
+    except AiError as e:
+        return _fail(e)
+
+    transport = getattr(app.state, "ai_transport", None)
+    t0 = time.monotonic()
+    try:
+        res = vendor_call(model, body.system, body.user, max_tokens, temperature, body.json_schema,
+                          api_key=settings.anthropic_api_key, transport=transport)
+    except VendorError as ve:
+        db.ledger_insert(body.lid, body.fingerprint, body.task, body.tier, model, 0, 0, 0.0, 0, False, ve.kind)
+        log.warning("vendor call failed lid=%s kind=%s", body.lid, ve.kind)
+        return _fail(AiError(502, "vendor", "The AI vendor call failed."))
+    latency = int((time.monotonic() - t0) * 1000)
+
+    usd = vendor_cost_usd(res["model"], res["input_tokens"], res["output_tokens"], fallback_model=model)
+    want = credits_for(usd, settings.ai_markup, settings.ai_min_credits)
+    # Concurrent calls can drain the wallet between the reserve check and here;
+    # never go negative, take what is left.
+    charged, balance = db.debit_upto(body.lid, want)
+    db.ledger_insert(body.lid, body.fingerprint, body.task, body.tier, res["model"], res["input_tokens"],
+                     res["output_tokens"], usd, charged, True, "" if charged == want else "short_charge")
+    return {"ok": True, "text": res["text"], "parsed": res["parsed"], "input_tokens": res["input_tokens"],
+            "output_tokens": res["output_tokens"], "credits_charged": charged, "balance": balance,
+            "model_tier": body.tier, "latency_ms": latency}
+
+
+# ------------------------------------------------------------------ balance
+
+@router.get("/balance")
+def ai_balance(request: Request, lid: str = "", fingerprint: str = "", activation: str = ""):
+    app = request.app
+    settings, db = app.state.settings, app.state.db
+    try:
+        authenticate(app, lid, fingerprint, activation)
+    except AiError as e:
+        return _fail(e)
+    wallet = db.ensure_wallet(lid, settings.ai_trial_credits)
+    return {"ok": True, "balance": wallet["balance"], "trial_granted": wallet["trial_granted"],
+            "packs": _packs(settings), "checkout_url_base": f"{settings.base_url}/v1/ai/checkout"}
+
+
+# ------------------------------------------------------------------ checkout
+
+def _urllib_stripe_transport(url: str, form: dict, secret: str) -> dict:
+    req = UrlRequest(url, data=urlencode(form).encode("utf-8"), method="POST", headers={
+        "Authorization": f"Bearer {secret}", "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        raise AiError(502, "stripe", f"Stripe refused the checkout request ({e.code}).")
+    except (URLError, OSError, ValueError):
+        raise AiError(502, "stripe", "Could not reach Stripe.")
+
+
+def create_checkout_session(app, lid: str, pack_id: str) -> dict:
+    """Create a Stripe Checkout session (mode=payment) for a credit pack. Raises AiError."""
+    settings = app.state.settings
+    pack = settings.stripe_credit_packs.get(pack_id)
+    if not pack:
+        raise AiError(400, "bad_pack", "Unknown credit pack.")
+    if not settings.stripe_secret_key:
+        raise AiError(503, "billing_unconfigured", "Credit purchases are not configured on this server.")
+    form = {
+        "mode": "payment",
+        "line_items[0][price]": pack_id,
+        "line_items[0][quantity]": "1",
+        "client_reference_id": lid,
+        "success_url": f"{settings.base_url}/dashboard?notice=Payment+received.+Credits+arrive+in+a+moment.",
+        "cancel_url": f"{settings.base_url}/dashboard",
+        "metadata[kind]": "ai_credits",
+        "metadata[lid]": lid,
+        "metadata[credits]": str(pack["credits"]),
+    }
+    send = getattr(app.state, "stripe_transport", None) or _urllib_stripe_transport
+    data = send(STRIPE_SESSIONS_URL, form, settings.stripe_secret_key)
+    url = data.get("url") if isinstance(data, dict) else None
+    if not url:
+        raise AiError(502, "stripe", "Stripe returned no checkout URL.")
+    app.state.db.audit("ai.checkout", actor=lid, target=lid,
+                       detail={"pack": pack_id, "credits": pack["credits"], "session": data.get("id", "")})
+    return {"url": url, "session_id": data.get("id", "")}
+
+
+@router.post("/checkout")
+def ai_checkout(body: CheckoutIn, request: Request):
+    app = request.app
+    try:
+        authenticate(app, body.lid, body.fingerprint, body.activation)
+        out = create_checkout_session(app, body.lid, body.pack)
+    except AiError as e:
+        return _fail(e)
+    return {"ok": True, "url": out["url"], "session_id": out["session_id"]}
