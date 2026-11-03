@@ -72,7 +72,7 @@ def test_offline_returns_503_with_v2_shape(tmp_path):
                  "/api/ai/project-health", "/api/ai/project-health/batch"):
         resp = c.post(path, json={})
         assert resp.status_code == 503 and resp.get_json() == {"ok": False, "error": "AI provider is offline"}
-    resp = c.get("/api/ai/weekly-digest")
+    resp = c.post("/api/ai/weekly-digest", json={})
     assert resp.status_code == 503
     # search degrades to plain text search instead of failing
     r = c.post("/api/ai/search", json={"query": "harbor"}).get_json()
@@ -114,7 +114,7 @@ def test_search_and_digest(tmp_path):
     r = c.post("/api/ai/search", json={"query": "harbor jobs by amount"}).get_json()
     assert r["ok"] and r["query"] == "harbor jobs by amount" and r["filters"]["sort_by"] == "amount"
     assert r["count"] == 1 and r["results"][0]["id"] == "proj_a" and "subtasks" not in r["results"][0]
-    r = c.get("/api/ai/weekly-digest").get_json()
+    r = c.post("/api/ai/weekly-digest", json={}).get_json()
     assert r["ok"] and r["digest"].startswith("A steady week")
     assert set(r["stats"]) == {"quotes_sent", "approvals", "new_projects", "overdue_count", "total_pipeline",
                                "won_ytd", "win_rate", "top_opportunity", "stale_count"}
@@ -150,7 +150,7 @@ def test_ui_shapes_for_search_digest_and_usage(tmp_path):
     r = c.post("/api/ai/search", json={"query": "harbor jobs by amount"}).get_json()
     assert r["text"] == "Found 1 match." and r["items"][0]["project_id"] == "proj_a"
     assert set(r["items"][0]) == {"project_id", "label", "detail"}
-    r = c.get("/api/ai/weekly-digest").get_json()
+    r = c.post("/api/ai/weekly-digest", json={}).get_json()
     assert r["text"] == r["digest"] and r["text"].startswith("A steady week")
     labels = [i["label"] for i in r["items"]]
     assert any(l.startswith("Overdue: ") for l in labels) and all(isinstance(l, str) for l in labels)

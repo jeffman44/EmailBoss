@@ -32,6 +32,8 @@ def _safe_data_path(rel):
         abort(403, "database files not served")
     if p.name == r.config.source_path.name if r.config.source_path else False:
         abort(403, "config file not served")
+    if p.name.lower() in ("desktop.json", "plannerboard.json") or p.name.lower().endswith((".pem", ".key")):
+        abort(403, "private file not served")
     if not p.exists() or not p.is_file():
         abort(404, f"not found: {rel}")
     return p

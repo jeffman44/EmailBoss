@@ -559,7 +559,7 @@ def _digest_stats(v) -> dict:
     }
 
 
-@bp.route("/api/ai/weekly-digest", methods=["GET"])
+@bp.route("/api/ai/weekly-digest", methods=["POST"])
 def api_ai_weekly_digest():
     v = view()
     llm = v.get("llm")

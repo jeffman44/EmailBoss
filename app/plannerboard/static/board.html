@@ -12272,7 +12272,7 @@ async function aiTriageReply(tid) {
   showAiPanel({ title: 'Reply draft', text: j.draft || '', editable: true, draft: { project_id: pid, to: it.from_email || '', subject: subj } });
 }
 async function aiWeeklyDigest() {
-  const j = await aiFetch('/api/ai/weekly-digest', null, 'GET');
+  const j = await aiFetch('/api/ai/weekly-digest', {}, 'POST');
   if (!j) return;
   showAiPanel({ title: 'Your week', text: j.text || j.digest || '', items: j.items || [],
                 draft: { project_id: '', to: (PROF.user && PROF.user.email) || '', subject: 'My week' } });

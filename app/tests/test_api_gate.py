@@ -40,11 +40,26 @@ def test_host_and_origin_and_content_type_gates(data_root):
     # CSRF: a cross-site Origin is refused
     r = c.post("/api/restart", headers={"Origin": "https://evil.example"}, json={})
     assert r.status_code == 403
-    # Same-origin fetch is fine
+    # Same-origin fetch is fine (exact origin incl. port; test client host is "localhost")
     assert c.get("/api/health", headers={"Origin": "http://localhost"}).status_code == 200
+    # Same host but another PORT is a different origin (another localhost service)
+    assert c.post("/api/restart", headers={"Origin": "http://localhost:9999", "X-Requested-With": "EmailBoss"},
+                  json={}).status_code == 403
+    # A write without the app header is refused even with the cookie (no-cors CSRF)
+    assert c.post("/api/projects", json={"name": "x"}).status_code == 403
     # A "simple" text/plain write (no preflight) is refused
-    r = c.post("/api/projects", data='{"name":"x"}', content_type="text/plain")
+    r = c.post("/api/projects", data='{"name":"x"}', content_type="text/plain",
+               headers={"X-Requested-With": "EmailBoss"})
     assert r.status_code == 415
+    # multipart is only accepted on the upload routes, JSON inside multipart is not parsed
+    r = c.put("/api/config", data='{"ai":{"base_url":"http://evil"}}', content_type="multipart/form-data",
+              headers={"X-Requested-With": "EmailBoss"})
+    assert r.status_code == 415
+    # cross-site top-level navigation to a GET endpoint is refused
+    assert c.get("/api/health", headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403
+    # OAuth callback is reachable from the system browser (no cookie); state protects it
+    c2 = app.test_client()
+    assert c2.get("/api/mail/oauth/callback?state=x&code=y").status_code != 401
 
 
 def test_bootstrap_next_is_in_site_only(data_root):

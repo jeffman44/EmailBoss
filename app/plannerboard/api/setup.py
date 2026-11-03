@@ -98,6 +98,40 @@ def api_profession():
     return jsonify(rt().profession())
 
 
+_ID_RE = __import__("re").compile(r"^[a-z0-9_]{1,40}$")
+
+
+def _validate_override_ids(overrides: dict) -> str:
+    """Field keys, option ids, work-type and stage ids end up inside the page
+    and as JSON keys: only [a-z0-9_] is allowed, server side."""
+    def check(items, what):
+        for it in items or []:
+            if not isinstance(it, dict):
+                return f"{what}: each entry must be an object"
+            key = str(it.get("key") or it.get("id") or "")
+            if not _ID_RE.match(key):
+                return f"{what}: '{key[:40]}' is not a valid id (letters, digits, underscore, max 40)"
+            for opt in it.get("options") or []:
+                oid = opt.get("id") if isinstance(opt, dict) else opt
+                if not _ID_RE.match(str(oid or "")):
+                    return f"{what}: option id '{str(oid)[:40]}' is not valid"
+        return ""
+    for name in ("fields", "work_types", "date_types", "id_patterns"):
+        err = check(overrides.get(name), name)
+        if err:
+            return err
+    wfs = overrides.get("workflows")
+    if isinstance(wfs, dict):
+        for wid, wf in wfs.items():
+            if not _ID_RE.match(str(wid)):
+                return f"workflows: '{str(wid)[:40]}' is not a valid id"
+            for st in (wf.get("stages") if isinstance(wf, dict) else None) or []:
+                sid = st.get("id") if isinstance(st, dict) else st
+                if not _ID_RE.match(str(sid or "")):
+                    return f"workflows: stage id '{str(sid)[:40]}' is not valid"
+    return ""
+
+
 @bp.route("/api/profession", methods=["PUT"])
 def api_put_profession():
     """Body: {overrides: {...}} or a bare overrides object; optional
@@ -115,6 +149,9 @@ def api_put_profession():
     if overrides is not None:
         if not isinstance(overrides, dict):
             return error_response(400, "overrides must be an object")
+        bad = _validate_override_ids(overrides)
+        if bad:
+            return error_response(400, bad)
         r.config.set_overrides(overrides)
     if isinstance(overrides, dict) and isinstance(overrides.get("workflows"), dict):
         errs = wfm.validate(wfm.normalize(dict(overrides["workflows"])))

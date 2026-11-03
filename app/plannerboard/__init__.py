@@ -11,6 +11,7 @@ effective profession.
 """
 
 import importlib
+import re
 import os
 import sys
 import threading
@@ -235,6 +236,14 @@ _FORM_TYPES = ("multipart/form-data",)
 SESSION_COOKIE = "pb_session"
 
 
+def _cookie_name() -> str:
+    """One cookie per port: a browser shares cookies across every 127.0.0.1
+    port, so name it after ours and never read another service's."""
+    host = request.host or ""
+    port = host.rsplit(":", 1)[1] if host.count(":") == 1 else "80"
+    return f"{SESSION_COOKIE}_{port}"
+
+
 def _host_name(host: str) -> str:
     h = (host or "").strip().lower()
     if h.startswith("["):
@@ -253,7 +262,7 @@ def _token_ok(cfg, session_token: str = "") -> bool:
     equals the session token or, off loopback, the configured api_token."""
     auth = request.headers.get("Authorization", "")
     bearer = auth[7:].strip() if auth.startswith("Bearer ") else ""
-    cookie = request.cookies.get(SESSION_COOKIE, "")
+    cookie = request.cookies.get(_cookie_name(), "")
     if session_token and (_constant_eq(cookie, session_token) or _constant_eq(bearer, session_token)):
         return True
     if cfg.requires_token and cfg.api_token and (_constant_eq(bearer, cfg.api_token) or _constant_eq(cookie, cfg.api_token)):
@@ -269,8 +278,14 @@ def _host_ok(cfg) -> bool:
     return host in _LOOPBACK_HOSTS or host == str(cfg.bind).lower()
 
 
+_MULTIPART_OK = ("/api/projects/import-csv", "/api/projects/intake", "/api/mail/client/attach",
+                 "/api/correspondence")
+_GATE_EXEMPT = ("/api/mail/oauth/callback",)  # the system browser lands here from Google/Microsoft
+
+
 def _origin_ok() -> bool:
-    """A present Origin must be our own origin (same host as Host)."""
+    """A present Origin must be exactly our own origin (scheme, host AND port):
+    cookies ignore the port, so another localhost service must not count."""
     origin = request.headers.get("Origin")
     if not origin:
         return True
@@ -278,7 +293,22 @@ def _origin_ok() -> bool:
         return False
     from urllib.parse import urlsplit
     o = urlsplit(origin)
-    return _host_name(o.netloc) == _host_name(request.host)
+    return (o.scheme, (o.netloc or "").lower()) == (request.scheme, (request.host or "").lower())
+
+
+def _write_header_ok() -> bool:
+    """Writes need the custom header the app always sends. A custom header
+    forces a CORS preflight, which no foreign page can pass."""
+    if request.method not in _WRITE_METHODS:
+        return True
+    return request.headers.get("X-Requested-With", "") == "EmailBoss"
+
+
+def _sec_fetch_ok() -> bool:
+    """Browsers that send Sec-Fetch-Site must not be cross-site (covers top
+    level navigations to GET endpoints, which Lax cookies would ride)."""
+    sfs = request.headers.get("Sec-Fetch-Site", "")
+    return sfs in ("", "same-origin", "none")
 
 
 def _content_type_ok() -> bool:
@@ -287,7 +317,10 @@ def _content_type_ok() -> bool:
     ct = (request.content_type or "").split(";")[0].strip().lower()
     if not ct and (request.content_length or 0) == 0:
         return True  # empty-body POST (e.g. /api/restart)
-    return ct in _JSON_TYPES or ct in _FORM_TYPES
+    if ct in _FORM_TYPES:
+        return any(request.path.startswith(pfx) for pfx in _MULTIPART_OK) or \
+            re.match(r"^/api/projects/[^/]+/intake$", request.path) is not None
+    return ct in _JSON_TYPES
 
 
 def create_app(config_path=None, config=None, testing=None):
@@ -340,7 +373,11 @@ def create_app(config_path=None, config=None, testing=None):
     # Background threads must not write while the license is read-only.
     try:
         from .triage.license_gate import set_license_provider
-        set_license_provider(lambda: getattr(rt, "license", None))
+        def _build_license():
+            c = lic.client_from_app(app)
+            rt.license = c
+            return c
+        set_license_provider(lambda: getattr(rt, "license", None), _build_license)
     except Exception:
         pass
 
@@ -357,8 +394,13 @@ def create_app(config_path=None, config=None, testing=None):
             return None
         if not _host_ok(rt.config):
             return jsonify({"ok": False, "error": "bad_host"}), 400
-        if not _origin_ok():
+        if any(path.startswith(x) for x in _GATE_EXEMPT):
+            return None  # state parameter + Host check protect these
+        if not _origin_ok() or not _sec_fetch_ok():
             return jsonify({"ok": False, "error": "bad_origin"}), 403
+        if app.config.get("PB_ENFORCE_AUTH") and not _write_header_ok():
+            return jsonify({"ok": False, "error": "missing_app_header",
+                            "message": "Writes need the X-Requested-With: EmailBoss header."}), 403
         if not _content_type_ok():
             return jsonify({"ok": False, "error": "unsupported_media_type",
                             "message": "Send JSON (Content-Type: application/json)."}), 415
@@ -381,8 +423,8 @@ def create_app(config_path=None, config=None, testing=None):
         if not nxt.startswith("/") or nxt.startswith("//") or "\\" in nxt:
             nxt = "/"
         resp = redirect(nxt)
-        resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="Lax",
-                        secure=False, path="/", max_age=60 * 60 * 24 * 30)
+        resp.set_cookie(_cookie_name(), token, httponly=True, samesite="Lax",
+                        secure=False, path="/")  # session cookie, per port
         return resp
 
     @app.teardown_request

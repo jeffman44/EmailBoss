@@ -60,7 +60,7 @@ def feature_on(name):
 
 
 def body(default=None):
-    data = request.get_json(force=True, silent=True)
+    data = request.get_json(silent=True)  # never force: Content-Type must say JSON
     if data is None:
         return {} if default is None else default
     return data
