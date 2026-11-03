@@ -150,6 +150,26 @@ Passwords use `hashlib.scrypt` (n=2^14, r=8, p=1, per-user salt). The Stripe
 webhook verifies the `Stripe-Signature` HMAC when `STRIPE_WEBHOOK_SECRET` is
 set and tolerates 5 minutes of skew.
 
+## AI relay
+
+The server also hosts the built-in "Email Boss AI" relay (full design in
+`docs/AI_CREDITS.md`). All three endpoints authenticate with the signed
+activation token the app already holds (signature, `lid`, `fingerprint`,
+`valid_until`, license live, device not released); failures are
+`403 {"ok":false,"code":"license","reason":...}`.
+
+- `POST /v1/ai/complete` `{lid, fingerprint, activation, task, tier, system, user, max_tokens, temperature, json_schema}`:
+  402 `no_credits`, 429 `rate_limited`, 502 `vendor`, 503 `relay_disabled`.
+  Charged `ceil(vendor_usd * 100 * AI_MARKUP)` credits (minimum `AI_MIN_CREDITS_PER_CALL`).
+  Prompt and completion text are never stored or logged.
+- `GET /v1/ai/balance?lid=&fingerprint=&activation=` returns balance, packs and checkout base.
+- `POST /v1/ai/checkout {lid, fingerprint, activation, pack}` returns a Stripe Checkout URL.
+  `checkout.session.completed` with `metadata.kind == "ai_credits"` credits the wallet once per session id.
+
+Env vars: `ANTHROPIC_API_KEY`, `AI_MARKUP`, `AI_MIN_CREDITS_PER_CALL`, `AI_TRIAL_CREDITS`,
+`AI_RATE_PER_MIN`, `AI_MAX_TOKENS`, `AI_MODEL_FAST`, `AI_MODEL_SMART`, `STRIPE_CREDIT_PACKS`,
+`STRIPE_SECRET_KEY` (table in `license_server/README.md`).
+
 ## What is enforced where
 
 | check | client | server |

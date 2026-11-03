@@ -57,6 +57,15 @@ python -m pytest -q
 | `LIC_ALLOW_UNSIGNED_STRIPE` | `0` | `1` accepts unsigned webhook events. Local development only; never in production |
 | `LIC_TRUSTED_PROXY` | `0` | `1` when a reverse proxy in front of the server appends `X-Forwarded-For`; the rate limiter then keys on that (last hop). Leave `0` when clients connect directly, or the header can be spoofed |
 | `STRIPE_PLAN_MAP` | empty | `price_abc:solo:2,price_def:team:5` maps Stripe price ids to plan and seats |
+| `ANTHROPIC_API_KEY` | empty | vendor key for the AI relay; while empty `/v1/ai/complete` answers 503 `relay_disabled` |
+| `AI_MARKUP` | `4.0` | credits charged = `ceil(vendor_usd * 100 * AI_MARKUP)` |
+| `AI_MIN_CREDITS_PER_CALL` | `1` | minimum charge per successful call |
+| `AI_TRIAL_CREDITS` | `300` | free credits granted once per license on first AI use |
+| `AI_RATE_PER_MIN` | `60` | AI calls per license per minute (in memory, per process) |
+| `AI_MAX_TOKENS` | `4000` | cap applied to the requested `max_tokens` |
+| `AI_MODEL_FAST` / `AI_MODEL_SMART` | `claude-haiku-4-5` / `claude-sonnet-4-5` | vendor models behind the `fast` and `smart` tiers |
+| `STRIPE_CREDIT_PACKS` | empty | `price_id:credits:usd_cents,...` e.g. `price_a:500:500,price_b:3000:2500` |
+| `STRIPE_SECRET_KEY` | empty | used to create Checkout sessions for credit packs (REST, no SDK); empty = 503 `billing_unconfigured` |
 | `DOWNLOAD_URL_WINDOWS`, `DOWNLOAD_URL_MACOS`, `DOWNLOAD_URL_LINUX` | empty | links on the Download page (any `DOWNLOAD_URL_*` is listed) |
 
 Plans (`licenses.PLANS`): `trial` 1 seat / 14 days, `solo` 2 seats / 365 days,
