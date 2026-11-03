@@ -1,13 +1,13 @@
 {
   "note": "Upper bounds for tests/bench on the windows-latest runner. Set from the first real run (measured x 1.5, rounded up), then frozen. A null metric is recorded but not enforced.",
-  "frozen": false,
-  "source_run": null,
+  "frozen": true,
+  "source_run": "41732324198 (windows-latest, Python 3.12.10, 50000 messages): cold_open_s 0.603, sync_full_s 180.41, sync_cycle_ms_p50 210.93, reconcile_ms 18.63, list_page_ms_p50 21.99, open_message_ms_p50 0.39",
   "metrics": {
-    "cold_open_s": null,
-    "sync_full_s": null,
-    "sync_cycle_ms_p50": null,
-    "reconcile_ms": null,
-    "list_page_ms_p50": null,
-    "open_message_ms_p50": null
+    "cold_open_s": 1.0,
+    "sync_full_s": 275,
+    "sync_cycle_ms_p50": 320,
+    "reconcile_ms": 30,
+    "list_page_ms_p50": 35,
+    "open_message_ms_p50": 1.0
   }
 }
