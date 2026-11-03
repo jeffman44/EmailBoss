@@ -72,8 +72,10 @@ def test_offline_returns_503_with_v2_shape(tmp_path):
                  "/api/ai/project-health", "/api/ai/project-health/batch"):
         resp = c.post(path, json={})
         assert resp.status_code == 503 and resp.get_json() == {"ok": False, "error": "AI provider is offline"}
+    # the weekly digest falls back to the engine's plain-text digest
     resp = c.post("/api/ai/weekly-digest", json={})
-    assert resp.status_code == 503
+    j = resp.get_json()
+    assert resp.status_code == 200 and j["ok"] and j["ai_used"] is False and j["text"] == j["digest"] and j["text"]
     # search degrades to plain text search instead of failing
     r = c.post("/api/ai/search", json={"query": "harbor"}).get_json()
     assert r["ok"] and r["filters"] == {"name_contains": "harbor"} and r["count"] == 1
@@ -149,7 +151,8 @@ def test_ui_shapes_for_search_digest_and_usage(tmp_path):
     c = app.test_client()
     r = c.post("/api/ai/search", json={"query": "harbor jobs by amount"}).get_json()
     assert r["text"] == "Found 1 match." and r["items"][0]["project_id"] == "proj_a"
-    assert set(r["items"][0]) == {"project_id", "label", "detail"}
+    assert set(r["items"][0]) == {"id", "name", "why", "project_id", "label", "detail"}
+    assert r["items"][0]["id"] == "proj_a" and r["items"][0]["name"] and r["items"][0]["why"]
     r = c.post("/api/ai/weekly-digest", json={}).get_json()
     assert r["text"] == r["digest"] and r["text"].startswith("A steady week")
     labels = [i["label"] for i in r["items"]]

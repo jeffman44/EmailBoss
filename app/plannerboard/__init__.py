@@ -27,7 +27,7 @@ from .business_hours import BusinessHours
 from .config import Config
 from .db import Store, StoreContext
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 class Runtime:

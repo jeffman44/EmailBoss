@@ -178,6 +178,14 @@ PROJECTS = [
                "created": d(-2), "follow_up_date": d(1), "date_type": "follow_up", "completed_date": None,
                "completed_by": None, "blocked_by": None, "sla_type": None, "sla_created": None, "sla_hours": None,
                "category": None, "priority": 0, "metadata": {}},
+              {"id": "st_c2", "text": "Call Lee about the kickoff", "status": "pending", "source": "manual",
+               "created": d(-2), "follow_up_date": d(0), "date_type": "follow_up", "completed_date": None,
+               "completed_by": None, "blocked_by": None, "sla_type": None, "sla_created": None, "sla_hours": None,
+               "category": None, "priority": 0, "metadata": {}},
+              {"id": "st_c3", "text": "Prepare and send proposal", "status": "pending", "source": "system",
+               "created": d(-2), "follow_up_date": d(0), "date_type": "follow_up", "completed_date": None,
+               "completed_by": None, "blocked_by": None, "sla_type": None, "sla_created": None, "sla_hours": None,
+               "category": None, "priority": 0, "metadata": {}},
           ]),
 ]
 
@@ -451,7 +459,7 @@ def api_professions():
 def api_config():
     if request.method == "PUT":
         b = request.get_json(force=True) or {}
-        for k in ("display", "ai", "features"):
+        for k in ("display", "ai", "features", "assistant"):
             if isinstance(b.get(k), dict):
                 CONFIG.setdefault(k, {}).update(b[k])
         if "timezone" in b:
@@ -526,8 +534,15 @@ def api_project(pid):
             p["notes"] = p.get("notes", []) + notes
         if "site" in body and "location" not in body:
             body["location"] = body.pop("site")
+        auto, reminders = [], []
+        if body.get("quote_amount") and p.get("status") == "lead":
+            body["status"] = "proposal_sent"
+            auto.append("status set to Proposal Sent")
+        if isinstance(kd, dict) and kd.get("due_on"):
+            reminders.append({"field": "due_on", "action": "created", "due": kd["due_on"]})
         p.update(body)
-        return jsonify({"ok": True, "project": p})
+        app.last_put = {"pid": pid, "body": body}
+        return jsonify({"ok": True, "project": p, "auto": auto, "reminders": reminders})
     return jsonify(p)
 
 
@@ -671,11 +686,29 @@ def api_draft_delete(did):
 
 @app.route("/api/triage/approve-all", methods=["POST"])
 def api_triage_approve_all():
+    b = request.get_json(silent=True) or {}
+    app.last_approve_all = b
     matched = [t for t in TRIAGE if t.get("status") == "pending" and t.get("matched_project")]
     skipped = [t for t in TRIAGE if t.get("status") == "pending" and not t.get("matched_project")]
-    for t in matched:
+    created = []
+    if b.get("create_new"):
+        created = [t for t in skipped if (t.get("card_type") or "email") == "email"]
+        skipped = [t for t in skipped if t not in created]
+    for t in matched + created:
         TRIAGE.remove(t)
-    return jsonify({"ok": True, "approved": len(matched), "skipped_unmatched": len(skipped), "failed": 0})
+    return jsonify({"ok": True, "approved": len(matched), "created": len(created),
+                    "skipped_unmatched": len(skipped), "failed": 0})
+
+
+@app.route("/api/projects/import-csv", methods=["POST"])
+def api_import_csv():
+    f = request.files.get("file")
+    text = f.read().decode("utf-8") if f else ""
+    rows = [r for r in text.splitlines()[1:] if r.strip()]
+    app.last_import = text
+    errors = [{"row": i + 2, "error": "no name"} for i, r in enumerate(rows) if not r.split(",")[0].strip()]
+    return jsonify({"ok": True, "total": len(rows), "created": len(rows) - len(errors), "skipped": 0,
+                    "errors": errors, "projects": []})
 
 
 @app.route("/api/ai/draft-reply", methods=["POST"])
@@ -696,7 +729,8 @@ def api_ai_search():
     hits = [p for p in PROJECTS if any(w in p["name"].lower() for w in q.split())]
     return jsonify({"ok": True, "query": q, "results": hits, "count": len(hits),
                     "text": f"Found {len(hits)} match{'' if len(hits) == 1 else 'es'}.",
-                    "items": [{"project_id": p["id"], "label": p["name"], "detail": p["location"]} for p in hits]})
+                    "items": [{"id": p["id"], "name": p["name"], "why": "name matches",
+                               "project_id": p["id"], "label": p["name"], "detail": p["location"]} for p in hits]})
 
 
 @app.route("/api/ai/weekly-digest", methods=["GET", "POST"])

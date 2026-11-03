@@ -1,7 +1,7 @@
 {
   "id": "nonprofit",
   "label": "Church and Nonprofit Office",
-  "description": "Requests from members, volunteers and vendors: respond, wait, done.",
+  "description": "Church, club or office: requests, rooms, funerals, events.",
   "icon": "⛪",
   "entity": {
     "project": "Request",

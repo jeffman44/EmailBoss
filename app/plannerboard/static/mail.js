@@ -525,7 +525,7 @@ window.PBMail = (() => {
           <span class="sep" style="margin-left:auto"></span>
           <select class="mail-file-select" id="mail-file-proj"><option value="">File to ${esc((window.ent ? ent('project') : 'project')).toLowerCase()}...</option>${projectOptions()}</select>
           <button class="mail-btn" data-act="file">File</button>
-          <button class="mail-btn" data-act="stage" title="Put this message on the triage panel">Triage</button>
+          <button class="mail-btn" data-act="stage" title="Put this message in New mail to sort so it can go on the board">Add to board</button>
         </div>
       </div>
       <div class="mail-img-bar" id="mail-img-bar" style="display:none"></div>
@@ -604,7 +604,7 @@ window.PBMail = (() => {
   async function stage() {
     if (!S.open) return;
     try { const r = await post('/api/mail/client/stage', { ref: S.open.ref });
-      say(r.already ? 'Already on the board' : (r.auto_committed ? 'Auto-filed to its project' : 'Staged on the triage panel'));
+      say(r.already ? 'Already on the board' : (r.auto_committed ? 'Filed to its ' + ((window.ent ? ent('project') : 'project').toLowerCase()) : 'Added to New mail to sort'));
       if (typeof loadTriageItems === 'function') loadTriageItems(); if (window.loadData) loadData(); }
     catch (e) { say(e.message); }
   }

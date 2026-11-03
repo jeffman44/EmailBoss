@@ -172,3 +172,40 @@ def test_store_extras_for_triage_layer(data_root):
         assert row["suggestion"] == {"name": "N"} and row["auto_reason"] == "thread_match"
         assert row["auto_date_type"] == "sla" and row["dollar_amount"] == 12.5
         assert row["doc_links"][0]["label"] == "Dropbox"
+
+
+def test_approve_all_creates_new_from_unmatched_cards(client):
+    """ADD ALL with create_new: matched cards are added, unmatched email cards
+    become new items named from the suggestion or the sender's display name,
+    with the work type the board picked (or the card's suggested one)."""
+    from datetime import datetime, timedelta, timezone
+    c = client
+    when = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = {"card_type": "email", "direction": "inbound", "received_at": when, "to": "pat@example.com"}
+    t1 = c.post("/api/triage", json=dict(base, from_email="ann@one.example", from_name="Ann Lee",
+                                         subject="hello there", message_id="mm1", conversation_id="cv1")).json["ids"][0]
+    t2 = c.post("/api/triage", json=dict(base, from_email="bo@two.example", from_name="Bo Park",
+                                         subject="question", message_id="mm2", conversation_id="cv2",
+                                         suggestion={"name": "Rooftop service", "location": "Two Co"})).json["ids"][0]
+    # old behavior: without create_new nothing unmatched is guessed
+    r = c.post("/api/triage/approve-all", json={}).json
+    assert r["approved"] == 0 and r["created"] == 0 and r["skipped_unmatched"] == 2
+    wts = c.get("/api/profession").json["work_types"]
+    pick = wts[-1]
+    r = c.post("/api/triage/approve-all", json={"create_new": True,
+                                                "new": {t2: {"work_type": pick["id"], "workflow_id": pick.get("workflow_id")}}}).json
+    assert r["ok"] and r["created"] == 2 and r["approved"] == 0 and r["remaining"] == 0
+    projects = c.get("/api/projects").json["projects"]
+    names = {p["name"] for p in projects}
+    assert any("Ann Lee" in n for n in names) and any("Rooftop service" in n for n in names)
+    p2 = next(p for p in projects if "Rooftop service" in p["name"])
+    assert p2["work_type"] == pick["id"]
+
+
+def test_weekly_digest_and_search_without_ai(client):
+    c = client
+    c.post("/api/projects", json={"name": "Harbor roof job", "location": "Harbor"})
+    r = c.post("/api/ai/weekly-digest", json={})
+    assert r.status_code == 200 and r.json["ok"] and r.json["ai_used"] is False and r.json["text"]
+    s = c.post("/api/ai/search", json={"query": "harbor"}).json
+    assert s["items"] and {"id", "name", "why"} <= set(s["items"][0]) and "harbor" in s["items"][0]["why"].lower()

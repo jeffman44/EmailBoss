@@ -136,6 +136,7 @@ def health_payload(r):
     return {
         "status": "ok" if probe.get("ok") else "degraded",
         "version": __version__,
+        "data_root": str(getattr(getattr(r, "paths", None), "data_root", "") or ""),
         "uptime_s": r.uptime_s(),
         "db_write_ok": bool(probe.get("ok")),
         "db_write_probe": probe,

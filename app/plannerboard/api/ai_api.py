@@ -496,16 +496,43 @@ def api_ai_search():
     results = results[:25]
     return jsonify({"ok": True, "query": query, "filters": filters, "results": results, "count": len(results),
                     "text": _search_sentence(len(results), filters, ai_used=not _offline(llm)),
-                    "items": [_item(p, v) for p in results]})
+                    "items": [_item(p, v, filters, today) for p in results]})
 
 
-def _item(p: dict, v=None) -> dict:
-    """A row the board can render without knowing the project schema."""
+def _why(p: dict, f: dict | None, today: date | None = None) -> str:
+    """One short reason this project matched, in plain words."""
+    f = f or {}
+    today = today or date.today()
+    loc = str(p.get("location") or p.get("site") or "")
+    if f.get("overdue_only"):
+        return f"follow-up was due {str(p.get('follow_up_date') or '')[:10]}"
+    if f.get("days_since_activity"):
+        return f"no activity in {int(f['days_since_activity'])} days"
+    if f.get("client_contains"):
+        return f"client or contact matches \"{f['client_contains']}\""
+    if f.get("site_contains"):
+        return f"at {loc}" if loc else "place matches"
+    if f.get("status"):
+        return f"stage is {p.get('status')}"
+    if f.get("name_contains"):
+        needle = str(f["name_contains"]).lower()
+        if needle in str(p.get("name") or "").lower():
+            return f"name contains \"{f['name_contains']}\""
+        return f"place contains \"{f['name_contains']}\""
+    fu = p.get("follow_up_date")
+    return f"follow up {str(fu)[:10]}" if fu else "matches your question"
+
+
+def _item(p: dict, v=None, filters: dict | None = None, today: date | None = None) -> dict:
+    """A row the board can render without knowing the project schema.
+    id / name / why is the shape the Ask list uses; project_id / label /
+    detail stay for older boards."""
     detail = [str(p.get("location") or p.get("site") or "")]
     fu = p.get("follow_up_date")
     if fu:
         detail.append(f"follow up {str(fu)[:10]}")
-    return {"project_id": p.get("id", ""), "label": p.get("name", ""),
+    return {"id": p.get("id", ""), "name": p.get("name", ""), "why": _why(p, filters, today),
+            "project_id": p.get("id", ""), "label": p.get("name", ""),
             "detail": " · ".join(d for d in detail if d)}
 
 
@@ -563,10 +590,10 @@ def _digest_stats(v) -> dict:
 def api_ai_weekly_digest():
     v = view()
     llm = v.get("llm")
-    if _offline(llm):
-        return jsonify(OFFLINE), 503
     stats = _digest_stats(v)
     money = _money_on(v)
+    if _offline(llm):
+        return _digest_without_ai(v, stats, money)
     lines = []
     for k, val in stats.items():
         if not money and any(m in k for m in ("pipeline", "won", "win_rate", "opportunity")):
@@ -574,12 +601,25 @@ def api_ai_weekly_digest():
         lines.append(f"{k}: {val:,.0f}" if isinstance(val, float) else f"{k}: {val}")
     out = llm.run("digest.weekly", {"stats_block": "\n".join(lines), "today": date.today().isoformat()})
     if not out:
-        return error_response(502, llm.last_error or "no digest produced")
+        return _digest_without_ai(v, stats, money)
     val = out[0]
     digest = (val.get("digest") or val.get("text")) if isinstance(val, dict) else str(val)
     digest = (digest or "").strip()
     return jsonify({"ok": True, "digest": digest, "text": digest, "items": _digest_items(stats, money),
                     "stats": stats, "generated_at": datetime.now().isoformat(timespec="seconds")})
+
+
+def _digest_without_ai(v, stats: dict, money: bool):
+    """AI offline: the engine's plain-sentence digest, never a 503."""
+    from ..ai import assistant as _assistant
+    try:
+        text = _assistant.digest_plain_text(_assistant.digest_stats(v.get("store"), v.get("profession") or {}))
+    except Exception:
+        text = ""
+    if not text:
+        text = "Here are this week's numbers."
+    return jsonify({"ok": True, "digest": text, "text": text, "items": _digest_items(stats, money), "stats": stats,
+                    "ai_used": False, "generated_at": datetime.now().isoformat(timespec="seconds")})
 
 
 _DIGEST_LABELS = (

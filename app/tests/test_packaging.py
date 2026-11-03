@@ -46,7 +46,7 @@ def test_python_dash_m_entry_point():
     r = subprocess.run([sys.executable, "-m", "plannerboard", "--version"], capture_output=True, text=True,
                        cwd=str(APP), timeout=60)
     assert r.returncode == 0, r.stderr
-    assert "Email Boss 1.2.0" in (r.stdout + r.stderr)
+    assert "Email Boss 1.3.0" in (r.stdout + r.stderr)
 
 
 def test_version_files_agree():

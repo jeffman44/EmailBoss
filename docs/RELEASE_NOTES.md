@@ -1,5 +1,72 @@
 # Release notes
 
+## 1.3.0
+
+Built from a simulation of twelve kinds of users (plumber, property manager,
+general contractor, insurance agent, attorney, recruiter, IT provider,
+realtor, consultant, photographer, service contractor, church office) walking
+the app in a browser, and two adversarial security reviews. Average
+"would I keep using this" score went from 2.0 to 2.9 of 5 between rounds.
+
+### For everyone
+
+- Setup is three screens: you and your email, what kind of work you do,
+  done. "Sign in with Google" and "Sign in with Microsoft" when the build
+  carries the publisher's app ids; every provider also has an app-password
+  path with a numbered guide, and you cannot finish setup until mail is
+  actually connected.
+- A free 14-day trial starts from the wizard. The license key is emailed;
+  nothing is pasted.
+- Email Boss AI is built in: no API key. 300 free credits once your email
+  address is confirmed, then credit packs bought inside the app. Your own key
+  (Anthropic, OpenAI-compatible, Ollama) is still available under Advanced.
+- Today view is the first thing you see: Overdue, Reply today, Nudge today,
+  Coming up (7 days), Decisions for you, New mail to sort.
+- Decisions for you: the helper's questions, one at a time, answered with
+  number keys. An answer writes the draft immediately.
+- AI on every card: Write a reply for me, Write a follow-up, What's the
+  status?, Ask (in the search box), Summarize my week. A Drafts tab shows
+  everything the helper wrote, with "Open in my mail".
+- Plain words everywhere: Email Boss brand, "Add to board / Not now / Not
+  for me", "3 days late" instead of a number, time zone taken from the
+  computer, light theme and large text, money and game features off unless
+  your profession uses them.
+- Mail client safety: send confirms the recipients, Reply all with more
+  than three people confirms, a Reply-To that differs from the sender is
+  shown, ten seconds to undo a send, undo for archive and trash, drafts
+  autosave, remote images blocked until you ask.
+- Settings: Display, Fields (rename, hide, add), Stages (basic and
+  advanced), Privacy (what leaves this computer, Turn AI off), time zone and
+  working hours, weekly summary schedule.
+- "Add many from a spreadsheet" (CSV import) with a sample file.
+- Dated fields (court date, renewal date, bid due, showing, closing) keep a
+  reminder in step with them. Moving to a stage arms that stage's task.
+- New professions: trades, events, nonprofit. Legal gets a hearing date;
+  real estate gets a showing stage; insurance renewals arm 30 days out.
+
+### Security (two review passes)
+
+- The engine answers only its own window: per-launch session cookie, exact
+  origin check, app header on every write, JSON-only writes, no token in
+  the page.
+- Email HTML can no longer run script in the app: inert parsing, a
+  server-side sanitizer for quoted mail, no inline scripts or handlers in
+  the board, Content-Security-Policy with script-src 'self'.
+- The helper cannot be talked into misfiling or drafting to a stranger by
+  the text of an email. Drafts only ever go to a project's own contacts.
+- IMAP never expunges; deletes go to Trash or are refused.
+- License: device-bound activations with a proof of possession, trial and
+  relay abuse limits, verified admins, no open redirects.
+
+### Publisher
+
+- Relay: `ANTHROPIC_API_KEY`, `AI_MARKUP`, `STRIPE_CREDIT_PACKS`,
+  `AI_DAILY_USD_PER_LID`, trial budgets. See docs/AI_CREDITS.md and
+  docs/LICENSING.md.
+- Built-in sign-in: docs/OAUTH_SETUP.md.
+- Releases publish SHA256SUMS.txt beside the installer.
+
+
 ## 1.2.0
 
 ### Desktop app

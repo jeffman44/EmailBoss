@@ -102,13 +102,45 @@ async function loadProfession() {
 
 // Entity label helper: ent('project') -> "Project", ent('projects') -> "Projects".
 function ent(k) { return (PROF.entity && PROF.entity[k]) || PROF_DEFAULT.entity[k] || k; }
+// English plural of a label: Address -> Addresses, Property -> Properties.
+function pluralize(w) {
+  w = String(w || '');
+  if (/(s|x|z|ch|sh)$/i.test(w)) return w + 'es';
+  if (/[^aeiou]y$/i.test(w)) return w.slice(0, -1) + 'ies';
+  return w + 's';
+}
+// Plural entity label: the template's own plural key when it has one.
+function entPlural(k) { return (PROF.entity && PROF.entity[k + 's']) || pluralize(ent(k)); }
+function withArticle(w) { w = String(w || ''); return (/^[aeiou]/i.test(w) ? 'an ' : 'a ') + w; }
+// Short date + time for timestamps (last activity and the like).
+function fmtDateTime(v) {
+  if (!v) return '';
+  const str = String(v).trim();
+  // "2026-11-02 \u2014 Called back" style: format the date, keep the words.
+  const m = str.match(/^(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?)\s*[\u2014\u2013:|-]+\s*(.+)$/);
+  if (m) return fmtDateTime(m[1]) + ' \u00b7 ' + m[2];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) { const dd = parseLocalDate(str); return dd ? dd.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : str; }
+  const d = new Date(str.replace(' ', 'T'));
+  if (isNaN(d)) return str;
+  const o = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
+  if (d.getFullYear() !== new Date().getFullYear()) o.year = 'numeric';
+  return d.toLocaleString(undefined, o);
+}
+// Sales-shaped workflow: has a sent-out or won stage. Work orders, claims and
+// tickets do not, so won/lost, sent/won dates and quote-request tasks hide.
+function isSalesFlow(p) {
+  const w = wfById(projectWorkflowId(p));
+  if (!w) return true;
+  return wfStages(w).some(st => st && (st.role === 'out' || st.role === 'won'));
+}
+function advancedDetails() { return displayPref('advanced_details') === true; }
 
 // Static chrome that carries entity names (search placeholder, list header,
 // the title). Everything rendered per-cycle reads ent() directly.
 function applyProfessionChrome() {
   try {
     const sb = document.getElementById('search');
-    if (sb) sb.placeholder = `Search ${ent('projects').toLowerCase()}, ${ent('contact').toLowerCase()}s, ${ent('location').toLowerCase()}s...`;
+    if (sb) sb.placeholder = `Search ${ent('projects').toLowerCase()}, ${entPlural('contact').toLowerCase()}, ${entPlural('location').toLowerCase()}...`;
     document.title = (PROF.user && PROF.user.company ? PROF.user.company + ' ' : '') + 'Email Boss';
     document.body.classList.toggle('no-money', !feat('money'));
     document.body.classList.toggle('no-game', !feat('game_layer'));
@@ -217,6 +249,7 @@ function annualGoal() {
 function profFields(where) {
   return (Array.isArray(PROF.fields) ? PROF.fields : []).filter(f => {
     if (!f || !f.key) return false;
+    if (f.hidden && where) return false;
     if (f.type === 'money' && !feat('money')) return false;
     if (!where) return true;
     const on = Array.isArray(f.show_on) ? f.show_on : ['card', 'drawer', 'list'];
@@ -253,8 +286,26 @@ function fmtFieldValue(f, v) {
   }
 }
 // card | list: compact inline chips. drawer: an editable grid.
+// Per-project field filter: sales dates only on sales-shaped work; CO # and
+// RFI # only off bids (they mean nothing until the job is awarded).
+function fieldShownFor(p, f) {
+  if (!p || !f) return true;
+  const v = fieldValue(p, f);
+  const has = v !== null && v !== undefined && v !== '';
+  if (/^(quote_sent_date|won_date|sold_date)$/.test(f.key) && !isSalesFlow(p)) return false;
+  if (/^(co_number|rfi_number)$/.test(f.key) && !has) {
+    const wid = projectWorkflowId(p);
+    if (p.work_type === 'bid' || wid === 'bid') return false;
+  }
+  if (Array.isArray(f.work_types) && f.work_types.length && !f.work_types.includes(p.work_type) && !has) return false;
+  return true;
+}
 function renderFields(p, where) {
-  const fs = profFields(where);
+  let fs = profFields(where);
+  // The location already has its own row in the drawer; a template field
+  // with the same label would show it twice.
+  if (where === 'drawer') { const loc = String(ent('location')).toLowerCase(); fs = fs.filter(f => !(f.key === 'address' && String(f.label || '').toLowerCase() === loc)); }
+  fs = fs.filter(f => fieldShownFor(p, f));
   if (!fs.length) return '';
   if (where === 'drawer') {
     const groups = {};
@@ -1024,14 +1075,14 @@ function daysSince(ds) {
   const d = parseLocalDate(ds);
   if (!d) return null;
   const now = new Date(); now.setHours(0,0,0,0);
-  return Math.floor((now - d) / 86400000);
+  return Math.round((now - d) / 86400000);   // round, not floor: a DST day is 23 or 25 h
 }
 function daysUntil(ds) {
   if (!ds) return null;
   const d = parseLocalDate(ds);
   if (!d) return null;
   const now = new Date(); now.setHours(0,0,0,0);
-  return Math.floor((d - now) / 86400000);
+  return Math.round((d - now) / 86400000);   // round, not floor: a DST day is 23 or 25 h
 }
 // Fractional days for DoT tick: sub-day score progression
 function fractionalDaysUntil(ds) {
@@ -1076,11 +1127,35 @@ function fmtTs(ts) {
 }
 function fmtNow() { return new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',second:'2-digit'}); }
 
+let _toastTimer = null, _toastAction = null, _cascadeNote = null;
 function toast(msg) {
   const el = document.getElementById('toast');
+  if (_cascadeNote && Date.now() - _cascadeNote.at < 2000 && msg !== _cascadeNote.text) {
+    msg = String(msg).replace(/[.\s]*$/, '') + '. ' + _cascadeNote.text;
+    _cascadeNote = null;
+  }
   el.textContent = msg;
+  el.classList.remove('actionable');
+  _toastAction = null;
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 2500);
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+}
+// A toast with one button (Undo). The button stays live for 8 seconds.
+function toastAction(msg, label, fn) {
+  const el = document.getElementById('toast');
+  _toastAction = fn;
+  el.innerHTML = `<span>${esc(msg)}</span> <button class="eb-btn toast-btn" data-on-click='{"f":"runToastAction"}'>${esc(label)}</button>`;
+  el.classList.add('show', 'actionable');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.classList.remove('show', 'actionable'); _toastAction = null; }, 8000);
+}
+async function runToastAction() {
+  const fn = _toastAction;
+  _toastAction = null;
+  const el = document.getElementById('toast');
+  el.classList.remove('show', 'actionable');
+  if (typeof fn === 'function') { try { await fn(); } catch (e) { toast('Could not undo: ' + e.message); } }
 }
 
 // ── API ──
@@ -1117,7 +1192,28 @@ async function apiPut(id, updates) {
   }
   const d = await r.json();
   if (d && d.project) normalizeProject(d.project);
+  noteCascade(d);
   return d;
+}
+// The engine reports what a save did on its own (a stage change from a
+// quote amount, a reminder from a date field). Say so: it rides on the
+// caller's own toast, or shows by itself when the caller is quiet.
+function noteCascade(d) {
+  if (!d) return;
+  const parts = [];
+  (Array.isArray(d.auto) ? d.auto : []).forEach(a => { if (a) parts.push(String(a)); });
+  (Array.isArray(d.reminders) ? d.reminders : []).forEach(rm => {
+    if (rm && rm.due && (rm.action === 'created' || rm.action === 'moved')) parts.push('Reminder set for ' + (formatLongDate(rm.due) || rm.due));
+    else if (rm && rm.action === 'cleared') parts.push('Reminder removed');
+  });
+  if (!parts.length) return;
+  const text = parts.map(x => x.charAt(0).toUpperCase() + x.slice(1)).join('. ');
+  _cascadeNote = { text, at: Date.now() };
+  setTimeout(() => { if (_cascadeNote && _cascadeNote.text === text) { const n = _cascadeNote; _cascadeNote = null; toast(n.text); } }, 700);
+}
+function formatLongDate(ds) {
+  const d = parseLocalDate(ds);
+  return d ? d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }) : '';
 }
 
 async function saveTimer(projId, field, val) {
@@ -1291,7 +1387,7 @@ function renderEmailTriageCard(item, projects) {
     <div class="triage-card-header">
       <span class="triage-direction triage-dir-${dir}">${dir === 'outbound' ? 'SENT' : 'RECV'}</span>
       <span class="triage-subject" title="${esc(item.subject || '')}">${esc(item.subject || '(no subject)')}</span>
-      <span class="triage-confidence triage-conf-${conf}">${conf}</span>
+      ${feat('game_layer') ? `<span class="triage-confidence triage-conf-${conf}">${conf}</span>` : ''}
     </div>
 
     <div class="triage-from">
@@ -1309,7 +1405,7 @@ function renderEmailTriageCard(item, projects) {
         // ONE control: the checkbox IS the flag. Ticked = it needs a quote.
         const isQR = !!item.is_quote_request || (item.classification === 'quote_request' && item.is_quote_request !== 0);
         if (!isQR && !showMoney()) return item.classification ? `<span class="triage-classification cls-${escA(item.classification)}">${esc(String(item.classification).replace(/_/g, ' '))}</span>` : '';
-        return `<label class="qr-check ${isQR ? 'on' : ''}" title="This mail asks for a ${escA(ent('quote').toLowerCase())}"><input type="checkbox" ${isQR ? 'checked' : ''} data-on-change="${EH(null, EK('toggleQuoteRequest', String(tid)))}">Needs a quote</label>`
+        return `<label class="qr-check ${isQR ? 'on' : ''}" title="This mail asks for a ${escA(ent('quote').toLowerCase())}"><input type="checkbox" ${isQR ? 'checked' : ''} data-on-change="${EH(null, EK('toggleQuoteRequest', String(tid)))}">Needs ${esc(withArticle(ent('quote').toLowerCase()))}</label>`
           + (item.classification && item.classification !== 'quote_request' ? `<span class="triage-classification cls-${escA(item.classification)}">${esc(String(item.classification).replace(/_/g, ' '))}</span>` : '');
       })()}
       ${(showMoney() && item.dollar_amount) ? `<span class="triage-tag" style="background:var(--c-1a150a);color:var(--c-fac775);">${fmtMoney(item.dollar_amount)}</span>` : ''}
@@ -1370,7 +1466,7 @@ function renderEmailTriageCard(item, projects) {
     <div class="triage-buttons">
       <button class="triage-btn triage-btn-approve" data-on-click="${EH(null, EK('approveTriage', String(tid)))}" title="Shortcut: a">Add to board</button>
       <button class="triage-btn triage-btn-dismiss" data-on-click="${EH(null, EK('dismissTriage', String(tid)))}" title="Set this card aside. Shortcut: n">Not now</button>
-      <button class="triage-btn triage-btn-ignore" data-on-click="${EH(null, EK('ignoreTriage', String(tid)))}" title="Hide this mail; it is not work. Shortcut: h">Not work, hide</button>
+      <button class="triage-btn triage-btn-ignore" data-on-click="${EH(null, EK('ignoreTriage', String(tid)))}" title="Hide this mail; it is not for you. Shortcut: h">Not for me</button>
       ${dir !== 'outbound' ? `<button class="triage-btn" data-on-click="${EH(null, EK('aiTriageReply', String(tid)))}">Write a reply</button>` : ''}
     </div>
   </div>`;
@@ -1965,6 +2061,22 @@ function animateCardOut(triageId, animClass = 'triage-exit-approve') {
   });
 }
 
+// Defaults for turning an unmatched card into a new item: the card's
+// suggested work type and suggestion name (the sender's display name when
+// there is no suggestion).
+function triageNewDefaults(item) {
+  item = item || {};
+  const sug = (item.suggestion && typeof item.suggestion === 'object') ? item.suggestion : {};
+  const wts = workTypes();
+  let wt = wts.find(w => w.id === (item.suggested_work_type || sug.work_type)) || null;
+  if (!wt && item.is_quote_request) {
+    wt = wts.find(w => { const wf = wfById(w.workflow_id); return wf && wfStages(wf).some(st => st && (st.role === 'out' || st.role === 'won')); }) || null;
+  }
+  if (!wt) wt = wts[0] || null;
+  const name = String(item.new_project_name || sug.name || item.from_name || String(item.from_email || '').split('@')[0] || item.subject || '').trim();
+  const location = String(item.new_project_location || sug.location || sug.client || '').trim();
+  return { name, location, work_type: wt ? wt.id : '', workflow_id: wt ? (wt.workflow_id || '') : '' };
+}
 async function approveTriage(triageId) {
   try {
     const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
@@ -1999,12 +2111,24 @@ async function approveTriage(triageId) {
       if (tvWorkflow(val)) approvePayload.workflow_id = tvWorkflow(val);
     };
 
+    let createdNew = false;
     if (cardType === 'email' || cardType === 'acknowledgment') {
       const ps = document.getElementById('triage-proj-' + triageId);
       if (ps) {
         approvePayload.matched_project = tvBase(ps.value);
         readNewFields(ps.value);
       }
+      const mp = approvePayload.matched_project !== undefined ? approvePayload.matched_project : ((item && item.matched_project) || '');
+      if (cardType === 'email' && (!mp || mp === '__existing__')) {
+        // No match: create a new item from the card instead of failing.
+        const dn = triageNewDefaults(item);
+        approvePayload.matched_project = '__new__';
+        if (!approvePayload.new_project_name) approvePayload.new_project_name = dn.name;
+        if (!approvePayload.new_project_location) approvePayload.new_project_location = dn.location;
+        if (!approvePayload.work_type && dn.work_type) approvePayload.work_type = dn.work_type;
+        if (!approvePayload.workflow_id && dn.workflow_id) approvePayload.workflow_id = dn.workflow_id;
+      }
+      createdNew = approvePayload.matched_project === '__new__';
       const dollarEl = document.getElementById('triage-dollar-' + triageId);
       if (dollarEl && dollarEl.value) {
         approvePayload.dollar_amount = parseFloat(dollarEl.value) || null;
@@ -2065,8 +2189,8 @@ async function approveTriage(triageId) {
       toast(`Subtask reassigned → ${pName}`);
     } else {
       const projName = data.project ? data.project.name : 'skipped';
-      const stcMsg = stcCount > 0 ? ` + ${stcCount} subtask${stcCount > 1 ? 's' : ''} completed` : '';
-      toast(`Approved → ${projName}${stcMsg}${sibMsg}`);
+      const stcMsg = stcCount > 0 ? ` + ${stcCount} task${stcCount > 1 ? 's' : ''} completed` : '';
+      toast(`${createdNew ? 'Created' : 'Added to'} ${projName}${stcMsg}${sibMsg}`);
     }
 
     // Refresh board + triage data in background: don't block the UI
@@ -2100,6 +2224,8 @@ async function ignoreTriage(triageId) {
       const ok = confirm(`This mail is matched to "${pr.name}". Hiding it will also hide "${pr.name}" from the board (moved to ${stageLabel(ignStage)}).\n\nOK hides both. Cancel keeps "${pr.name}" and only sets the mail aside.`);
       if (!ok) { await dismissTriage(triageId); return; }
     }
+    const prevStatus = pr ? pr.status : null;
+    const movedProj = !!(pr && ignStage && pr.status !== ignStage);
     if (pr && ignStage) await apiPut(proj, { status: ignStage });
     // Remove from staging
     await fetch(`/api/triage/${triageId}`, { method: 'DELETE' });
@@ -2107,7 +2233,12 @@ async function ignoreTriage(triageId) {
     TRIAGE_ITEMS = TRIAGE_ITEMS.filter(i => i.triage_id !== triageId);
     renderTriagePanel();
     await loadData();
-    toast('Ignored' + (pr && ignStage ? ` -> ${pr.name} set to ${stageLabel(ignStage)}` : ''));
+    toastAction('Hidden' + (movedProj ? `, and ${pr.name} moved to ${stageLabel(ignStage)}` : ''), 'Undo', async () => {
+      await fetch(`/api/triage/${encodeURIComponent(triageId)}/revive`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (movedProj && prevStatus) await apiPut(proj, { status: prevStatus });
+      await loadTriageItems(); await loadData();
+      toast('Back in New mail to sort');
+    });
   } catch(e) { toast('Error: ' + e.message); }
 }
 
@@ -2116,14 +2247,33 @@ async function approveAllTriage() {
   if (!pending.length) return;
   // Server path: one call, unmatched cards are skipped and left for the user.
   try {
-    const r = await fetch('/api/triage/approve-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    // Unmatched email cards become new items: the work type picked on the
+    // card (or its suggestion) and the suggested name ride along per card.
+    const fresh = {};
+    pending.forEach(it => {
+      if ((it.card_type || 'email') !== 'email') return;
+      const mp = it.matched_project;
+      const ps = document.getElementById('triage-proj-' + it.triage_id);
+      const sel = ps ? ps.value : '';
+      if (mp && !String(mp).startsWith('__') && tvBase(sel) !== '__new__') return;
+      const dn = triageNewDefaults(it);
+      if (tvBase(sel) === '__new__' && tvWorkType(sel)) { dn.work_type = tvWorkType(sel); dn.workflow_id = tvWorkflow(sel); }
+      if (tvBase(sel) === '__new__') {   // the user opened the new-item fields: their words win
+        const ne = document.getElementById('triage-name-' + it.triage_id), se = document.getElementById('triage-site-' + it.triage_id);
+        if (ne && ne.value.trim()) dn.name = ne.value.trim();
+        if (se && se.value.trim()) dn.location = se.value.trim();
+      }
+      fresh[it.triage_id] = dn;
+    });
+    const r = await fetch('/api/triage/approve-all', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                       body: JSON.stringify({ create_new: true, new: fresh }) });
     if (r.status !== 404 && r.status !== 405) {
       const j = await r.json().catch(() => ({}));
       if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
       const n = v => Array.isArray(v) ? v.length : (parseInt(v, 10) || 0);
-      const a = n(j.approved), sk = n(j.skipped_unmatched), f = n(j.failed);
+      const a = n(j.approved), c = n(j.created), sk = n(j.skipped_unmatched), f = n(j.failed);
       await loadTriageItems(); await loadData();
-      toast(`Added ${a}` + (sk ? `, ${sk} left for you (no match yet)` : '') + (f ? `, ${f} failed` : ''));
+      toast(`Added ${a}, created ${c} new` + (sk ? `, ${sk} left for you` : '') + (f ? `, ${f} failed` : ''));
       return;
     }
   } catch (e) { toast('Add all failed: ' + e.message); return; }
@@ -2217,7 +2367,7 @@ function buildCard(p) {
     style="position:relative"
     data-on-dragstart='{"f":"onDragStart","a":[{"$":"event"}]}' data-on-dragend='{"f":"onDragEnd","a":[{"$":"event"}]}'
     data-on-click="${EH(null, EK('openPanel', String(p.id)))}">
-    <span class="card-urgency${_changedIds[p.id]?' badge-changed':''}" title="Urgency score ${Math.round(uScore)}" style="background:${uc?uc.bg:'var(--c-0c1a2a)'};color:${uc?uc.text:'var(--c-4fc3f7)'}">${isPinned ? '📌' : esc(dueWord(nearestDue(p)))}</span>${p.snoozed_until && daysUntil(p.snoozed_until) > 0 ? `<span class="card-snooze-badge">⏸ ${p.snoozed_until.slice(5)}</span>` : ''}
+    <span class="card-urgency${_changedIds[p.id]?' badge-changed':''}" title="Urgency score ${Math.round(uScore)}" style="background:${uc?uc.bg:'var(--c-0c1a2a)'};color:${uc?uc.text:'var(--c-4fc3f7)'}">${isPinned ? '📌' : esc((() => { const nd = nearestDueInfo(p); return nd.word || dueWord(nd.days); })())}</span>${p.snoozed_until && daysUntil(p.snoozed_until) > 0 ? `<span class="card-snooze-badge">⏸ ${p.snoozed_until.slice(5)}</span>` : ''}
     <div class="card-actions">
       <button class="card-btn ${isFlagged?'flagged':''}" data-on-click="${EH({sp:1}, EK('toggleFlag', String(p.id)))}" title="${isFlagged?'Unflag':'Flag'}">&#9873;</button>
     </div>
@@ -3131,6 +3281,7 @@ function renderBoard() {
   // Quick Task + View toggle
   mHtml += `<button class="type-pill quick-task-btn" data-on-click='{"f":"showQuickTaskForm"}' title="Add a standalone task">+ TASK</button>`;
   mHtml += `<button class="type-pill quick-project-btn" data-on-click='{"f":"showNewProjectForm"}' title="Create a new ${escA(ent('project').toLowerCase())}">+ ${esc(ent('project').toUpperCase())}</button>`;
+  mHtml += `<button class="type-pill csv-import-btn" id="csv-import-btn" data-on-click='{"f":"openCsvImport"}' title="Add many ${escA(ent('projects').toLowerCase())} at once from a spreadsheet saved as CSV">Add many from a spreadsheet</button>`;
   mHtml += '<div class="m-sep"></div>';
   mHtml += `<div class="view-toggle">
     <button class="view-btn ${currentView==='today'?'active':''}" data-on-click='{"f":"setView","a":["today"]}'>TODAY</button>
@@ -3138,7 +3289,7 @@ function renderBoard() {
     <button class="view-btn ${currentView==='kanban'?'active':''}" data-on-click='{"f":"setView","a":["kanban"]}'>KANBAN</button>
     ${feat('analytics') ? `<button class="view-btn ${currentView==='analytics'?'active':''}" data-on-click='{"f":"setView","a":["analytics"]}'>ANALYTICS</button>` : ''}
     ${mailClientOn() ? `<button class="view-btn ${currentView==='mail'?'active':''}" data-on-click='{"f":"setView","a":["mail"]}'>MAIL</button>` : ''}
-    <button class="view-btn ${currentView==='drafts'?'active':''}" data-on-click='{"f":"setView","a":["drafts"]}'>DRAFTS</button>
+    <button class="view-btn ${currentView==='drafts'?'active':''}" id="drafts-view-btn" data-on-click='{"f":"setView","a":["drafts"]}'>DRAFTS${_draftCount ? `<span class="eb-badge" id="drafts-badge">${_draftCount}</span>` : ''}</button>
   </div>`;
   mHtml += '</div>';
 
@@ -3604,7 +3755,7 @@ function renderPanel(id, opts) {
   html += renderFields(p, 'drawer');
 
   // Contacts
-  html += `<div class="panel-section"><div class="panel-label">${esc(ent('contact'))}s</div><div class="panel-value">`;
+  html += `<div class="panel-section"><div class="panel-label">${esc(entPlural('contact'))}</div><div class="panel-value">`;
   (p.contacts||[]).forEach(c => {
     html += `<div class="contact-row">
       <span class="contact-name">${esc(c.name || c.email || '')}</span>
@@ -3660,8 +3811,8 @@ function renderPanel(id, opts) {
           </div>` : ''}
         </div>
         <div style="display:flex;align-items:center;gap:12px;margin-top:8px;font-family:'JetBrains Mono',monospace;font-size: max(11px, var(--fs-min, 0px));flex-wrap:wrap">
-          ${p.quote_sent_date ? `<span style="color:var(--t3)">Sent: ${esc(p.quote_sent_date)}</span>` : ''}
-          ${p.sold_date ? `<span style="color:var(--c-c0dd97)">Won: ${esc(p.sold_date)}</span>` : ''}
+          ${p.quote_sent_date && isSalesFlow(p) ? `<span style="color:var(--t3)">Sent: ${esc(formatShortDate(p.quote_sent_date))}</span>` : ''}
+          ${p.sold_date && isSalesFlow(p) ? `<span style="color:var(--c-c0dd97)">Won: ${esc(formatShortDate(p.sold_date))}</span>` : ''}
           <span style="color:var(--t3)">Emails sent: <span style="color:var(--c-85b7eb)">${p.emails_sent||0}</span></span>
         </div>
       </div>`;
@@ -3682,7 +3833,7 @@ function renderPanel(id, opts) {
 
   html += `<div class="panel-section">
     <div class="panel-label">Last Activity</div>
-    <div class="panel-value">${esc(p.last_activity || 'None')}</div>
+    <div class="panel-value">${esc(fmtDateTime(p.last_activity) || 'None')}</div>
   </div>`;
   // ── OPEN QUESTIONS (the assistant's decision queue) ──
   html += `<div class="panel-section" id="q-section-${p.id}">
@@ -3698,13 +3849,13 @@ function renderPanel(id, opts) {
   // Dump zone: paste text or drop files onto the project
   html += `<div class="panel-section" id="dump-section-${p.id}">
     <div class="panel-label" style="display:flex;justify-content:space-between;align-items:center">
-      <span>Dump zone</span>
+      <span>Paste notes</span>
       <span id="dump-count-${p.id}" style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3)">${_dumpCountTxt[p.id] || ''}</span>
     </div>
     <textarea class="note-input pf-wide" id="dump-text-${p.id}" rows="2" placeholder="Paste notes, a forwarded message, anything about this ${escA(ent('project').toLowerCase())}..."
       data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'></textarea>
     <div style="display:flex;gap:6px;align-items:center;margin:6px 0">
-      <button class="est-add-btn" data-on-click="${EH(null, EK('submitDumpText', String(p.id)))}">DUMP TEXT</button>
+      <button class="est-add-btn" data-on-click="${EH(null, EK('submitDumpText', String(p.id)))}">ADD NOTES</button>
       <div class="est-drop-zone" style="flex:1;padding:6px;font-size: max(10px, var(--fs-min, 0px));cursor:pointer"
         data-on-dragover="${EH(null, EK('dumpDragOver', $E, String(p.id)))}" data-on-dragleave="${EH(null, EK('dumpDragLeave', $E, String(p.id)))}"
         data-on-drop="${EH(null, EK('dumpDrop', $E, String(p.id)))}" data-on-click="${EH(null, EK('dumpClickUpload', String(p.id)))}">drop files here or click</div>
@@ -3763,14 +3914,14 @@ function renderPanel(id, opts) {
       const slaHrs = st.sla_hours || PROF.sla_hours || 4;
       const slaLabel = isResponse ? `${slaElapsed.toFixed(1)}/${slaHrs}h` : '';
       // SLA toggle shows on any pending subtask: arm/disarm the response clock
-      const slaEligible = !isDone;
+      const slaEligible = !isDone && advancedDetails();
       html += `<div class="subtask-item" style="flex-wrap:wrap;gap:4px">
         <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
           <input type="checkbox" class="subtask-check" ${isDone ? 'checked' : ''}
             data-on-change="${EH(null, EK('toggleSubtask', String(p.id), String(st.id), $C))}"
             ${isBlocked ? 'disabled' : ''}>
-          ${!isDone ? `<span class="card-urgency" style="position:static;display:inline-block;font-size: max(9px, var(--fs-min, 0px));min-width:20px;text-align:center;background:${stc.bg};color:${stc.text}">${stScore}</span>` : ''}
-          ${isResponse ? `<span style="font-size: max(8px, var(--fs-min, 0px));padding:1px 4px;border-radius:2px;background:${stc.bg};color:${stc.text};border:1px solid ${stc.border};white-space:nowrap">${slaLabel}</span>` : ''}
+          ${!isDone && advancedDetails() ? `<span class="card-urgency" style="position:static;display:inline-block;font-size: max(9px, var(--fs-min, 0px));min-width:20px;text-align:center;background:${stc.bg};color:${stc.text}">${stScore}</span>` : ''}
+          ${isResponse && advancedDetails() ? `<span style="font-size: max(8px, var(--fs-min, 0px));padding:1px 4px;border-radius:2px;background:${stc.bg};color:${stc.text};border:1px solid ${stc.border};white-space:nowrap">${slaLabel}</span>` : ''}
           ${slaEligible ? `<label title="On = ${PROF.sla_hours || 4} biz-hr SLA clock. Off = normal follow-up." style="display:inline-flex;align-items:center;gap:2px;font-size: max(8px, var(--fs-min, 0px));color:var(--t2);white-space:nowrap;cursor:pointer">
             <input type="checkbox" ${isResponse ? 'checked' : ''} style="margin:0;width:11px;height:11px"
               data-on-change="${EH({sp:1}, EK('toggleSLASubtask', String(p.id), String(st.id), $C))}">SLA</label>` : ''}
@@ -3780,7 +3931,7 @@ function renderPanel(id, opts) {
         ${!isDone ? `<div style="display:flex;align-items:center;gap:4px;margin-left:22px">
           <select style="background:var(--bg0);color:var(--t1);border:1px solid var(--line2b);border-radius:3px;font-size: max(10px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace;padding:2px 4px"
             data-on-change="${EH(null, EK('updateSubtaskDate', String(p.id), String(st.id), null, $V))}">
-            ${dateTypes().filter(d => d.id !== 'sla' || stType === 'sla').map(d => `<option value="${escA(d.id)}" ${stType===d.id?'selected':''}>${esc(d.label)}</option>`).join('')}
+            ${dateTypes().filter(d => (d.id !== 'sla' || stType === 'sla') && (d.id !== 'quote' || stType === 'quote' || isSalesFlow(p))).map(d => `<option value="${escA(d.id)}" ${stType===d.id?'selected':''}>${esc(d.label)}</option>`).join('')}
             ${(stType && !dateTypes().some(d => d.id === stType)) ? `<option value="${escA(stType)}" selected>${esc(stType)}</option>` : ''}
           </select>
           <input type="date" style="background:var(--bg0);color:${fuOverdue?'var(--c-e24b4a)':'var(--t1)'};border:1px solid ${fuOverdue?'var(--c-e24b4a)':'var(--line2b)'};border-radius:3px;font-size: max(10px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace;padding:2px 4px;width:120px"
@@ -3793,7 +3944,7 @@ function renderPanel(id, opts) {
       </div>`;
     });
     html += `<div class="subtask-add-wrap">
-      <input class="subtask-add-input" id="subtask-input-${p.id}" placeholder="Add subtask..."
+      <input class="subtask-add-input" id="subtask-input-${p.id}" placeholder="Add a reminder or to-do"
         data-on-keydown="${EH({g:'enter'}, EK('addSubtask', p.id))}">
       <button class="subtask-add-btn" data-on-click="${EH(null, EK('addSubtask', String(p.id)))}">ADD</button>
     </div></div>`;
@@ -5719,8 +5870,8 @@ function renderHealthBar() {
     ? `Yesterday's best: ${_yesterdayLow} urgency`
     : `Session start: ${_sessionStartHP} urgency`;
   markerEl.setAttribute('data-label', hasYesterday
-    ? `YDAY LOW ${_yesterdayLow.toLocaleString()}`
-    : `START ${_sessionStartHP.toLocaleString()}`);
+    ? `YDAY LOW ${(_yesterdayLow ?? 0).toLocaleString()}`
+    : `START ${(_sessionStartHP ?? 0).toLocaleString()}`);
 
   // GG marker: "go home" threshold (20% below 7-day avg)
   const ggMarkerEl = document.getElementById('health-bar-gg-marker');
@@ -5729,7 +5880,7 @@ function renderHealthBar() {
     ggMarkerEl.style.left = ggMarkerPct + '%';
     ggMarkerEl.className = 'health-bar-gg-marker' + (ggReached ? ' gg-reached' : '');
     ggMarkerEl.title = `GG threshold: ${ggThreshold} urgency (${Math.round(GG_THRESHOLD_PCT * 100)}% below avg)`;
-    ggMarkerEl.setAttribute('data-label', `GG EZ ${ggThreshold.toLocaleString()}`);
+    ggMarkerEl.setAttribute('data-label', `GG EZ ${(ggThreshold ?? 0).toLocaleString()}`);
   } else {
     ggMarkerEl.style.display = 'none';
   }
@@ -5740,7 +5891,7 @@ function renderHealthBar() {
     const avgPct = Math.max(0, Math.min(100, toBossPct(_7dayAvg)));
     avgMarkerEl.style.display = '';
     avgMarkerEl.style.left = avgPct + '%';
-    avgMarkerEl.setAttribute('data-label', `AVG ${_7dayAvg.toLocaleString()}`);
+    avgMarkerEl.setAttribute('data-label', `AVG ${(_7dayAvg ?? 0).toLocaleString()}`);
     avgMarkerEl.title = `7-day average: ${_7dayAvg} urgency`;
   } else {
     avgMarkerEl.style.display = 'none';
@@ -5752,7 +5903,7 @@ function renderHealthBar() {
     const lowPct = Math.max(0, Math.min(100, toBossPct(_dailyLow)));
     lowMarkerEl.style.display = '';
     lowMarkerEl.style.left = lowPct + '%';
-    lowMarkerEl.setAttribute('data-label', `LOW ${_dailyLow.toLocaleString()}`);
+    lowMarkerEl.setAttribute('data-label', `LOW ${(_dailyLow ?? 0).toLocaleString()}`);
     lowMarkerEl.title = `Today's best: ${_dailyLow} urgency`;
   } else {
     lowMarkerEl.style.display = 'none';
@@ -5760,7 +5911,7 @@ function renderHealthBar() {
 
   // HP number: show boss HP (= urgency). Lower = closer to killing the boss
   const hpEl = document.getElementById('health-bar-hp');
-  hpEl.textContent = bossHP.toLocaleString();
+  hpEl.textContent = (bossHP ?? 0).toLocaleString();
   hpEl.className = 'health-bar-hp ' + hpTier;
 
   // Delta: damage dealt to boss vs baseline (positive = boss lost HP = you're winning)
@@ -5780,9 +5931,9 @@ function renderHealthBar() {
   const mins = Math.floor((new Date() - _sessionStartTime) / 60000);
   const sessionTime = mins < 60 ? `${mins}m` : `${Math.floor(mins/60)}h ${mins%60}m`;
   if (_7dayAvg !== null) {
-    timeEl.textContent = `Now: ${currentUrgency.toLocaleString()} · 7d Avg: ${_7dayAvg.toLocaleString()} · GG EZ: ${ggThreshold.toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
+    timeEl.textContent = `Now: ${(currentUrgency ?? 0).toLocaleString()} · 7d Avg: ${(_7dayAvg ?? 0).toLocaleString()} · GG EZ: ${(ggThreshold ?? 0).toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
   } else {
-    timeEl.textContent = `Now: ${currentUrgency.toLocaleString()} · Start: ${_sessionStartHP.toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
+    timeEl.textContent = `Now: ${(currentUrgency ?? 0).toLocaleString()} · Start: ${(_sessionStartHP ?? 0).toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
   }
 
   // Label: boss status (how close to ded)
@@ -6190,6 +6341,24 @@ async function loadHealthBadges() {
     const down = Array.isArray(j.watchers_down) ? j.watchers_down : [];
     const restart = Array.isArray(j.restart_needed) ? j.restart_needed : [];
     let h = '';
+    const m = j.mail || {}, ai = j.ai || {}, lic = j.license || {};
+    const ls = String(lic.status || '').toLowerCase();
+    const licBad = ls && !['ok', 'valid', 'active', 'dev', 'trial'].includes(ls);
+    const badge = (cls, txt, tip, tab) => `<span class="hdr-badge ${cls}" title="${escA(tip)}" style="cursor:pointer" data-on-click="${EH(null, EK('openSettings', String(tab)))}">${esc(txt)}</span>`;
+    if (!feat('game_layer')) {
+      // Plain mode: one chip that names what is wrong in its tooltip and
+      // opens the Settings tab for the first problem. No jargon in the header.
+      const probs = [];
+      if (m.provider && m.provider !== 'none' && (m.ok === false || m.error)) probs.push(['mail', 'Mail is not coming in']);
+      if (ai.provider && ai.provider !== 'none' && (ai.ok === false || ai.budget_hit)) probs.push(['ai', ai.budget_hit ? 'The AI daily spending limit is reached' : 'Email Boss AI is not answering']);
+      if (down.length) probs.push(['general', 'A background check has stopped']);
+      if (restart.length) probs.push(['general', 'Restart Email Boss to finish an update']);
+      if (licBad) probs.push(['license', 'Your license needs attention']);
+      if (probs.length) h += badge('warn', 'Needs attention', probs.map(x => x[1]).join('. ') + '.', probs[0][0]);
+      if (ls === 'dev') h += badge('dim', 'LICENSE DEV', 'Developer license', 'license');
+      el.innerHTML = h;
+      return;
+    }
     if (down.length) {
       h += `<span class="hdr-badge" title="${escA(down.join(', '))}: a watcher with no heartbeat. Absent evidence is DOWN, not fine.">${down.length} WATCHER${down.length > 1 ? 'S' : ''} DOWN</span>`;
     }
@@ -6199,23 +6368,20 @@ async function loadHealthBadges() {
     }
     // Mail / AI / License badges (DESIGN.md section 4 health shape). Click opens
     // the matching Settings tab.
-    const m = j.mail || {}, ai = j.ai || {}, lic = j.license || {};
-    const badge = (cls, txt, tip, tab) => `<span class="hdr-badge ${cls}" title="${escA(tip)}" style="cursor:pointer" data-on-click="${EH(null, EK('openSettings', String(tab)))}">${esc(txt)}</span>`;
     if (m.provider && m.provider !== 'none') {
       h += badge(m.ok ? 'ok' : '', 'MAIL ' + (m.ok ? 'OK' : 'DOWN'),
-        `${m.provider}${m.last_fetch ? ' \u00b7 last fetch ' + m.last_fetch : ''}${m.error ? ' \u00b7 ' + m.error : ''}`, 'mail');
+        `${m.provider}${m.last_fetch ? ' · last fetch ' + m.last_fetch : ''}${m.error ? ' · ' + m.error : ''}`, 'mail');
     } else {
       h += badge('dim', 'NO MAIL', 'No mail provider configured. Open Settings > Mail.', 'mail');
     }
     if (ai.provider && ai.provider !== 'none') {
       const spent = ai.today_cost_usd != null ? `$${Number(ai.today_cost_usd).toFixed(2)}` : '';
       h += badge(ai.budget_hit ? 'warn' : (ai.ok === false ? '' : 'ok'), 'AI ' + (ai.budget_hit ? 'BUDGET' : (ai.ok === false ? 'DOWN' : 'OK')),
-        `${ai.provider}${spent ? ' \u00b7 today ' + spent : ''}${ai.budget_usd ? ' of $' + ai.budget_usd : ''}${ai.error ? ' \u00b7 ' + ai.error : ''}`, 'ai');
+        `${ai.provider}${spent ? ' · today ' + spent : ''}${ai.budget_usd ? ' of $' + ai.budget_usd : ''}${ai.error ? ' · ' + ai.error : ''}`, 'ai');
     }
-    const ls = String(lic.status || '').toLowerCase();
-    if (ls && ls !== 'ok' && ls !== 'valid' && ls !== 'active') {
+    if (ls === 'dev' || licBad) {
       h += badge(ls === 'dev' ? 'dim' : 'warn', 'LICENSE ' + ls.toUpperCase(),
-        `${lic.plan ? lic.plan + ' \u00b7 ' : ''}${lic.expires ? 'expires ' + lic.expires : ''}${lic.grace_days_left != null ? ' \u00b7 ' + lic.grace_days_left + ' grace days left' : ''}`, 'license');
+        `${lic.plan ? lic.plan + ' · ' : ''}${lic.expires ? 'expires ' + lic.expires : ''}${lic.grace_days_left != null ? ' · ' + lic.grace_days_left + ' grace days left' : ''}`, 'license');
     }
     el.innerHTML = h;
   } catch (e) { el.innerHTML = ''; }
@@ -6238,6 +6404,7 @@ async function fullRefresh() {
   await loadTriageItems();
   loadAlerts();
   loadHealthBadges();
+  loadDraftCount();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -6486,7 +6653,7 @@ async function submitDumpText(projId) {
   const textarea = document.getElementById('dump-text-' + projId);
   if (!textarea) return;
   const content = textarea.value.trim();
-  if (!content) { toast('Nothing to dump'); return; }
+  if (!content) { toast('Nothing to add'); return; }
 
   const dumpBtn = textarea.closest('.panel-section')?.querySelector('.est-add-btn[data-on-click*="submitDumpText"]');
   if (dumpBtn) { dumpBtn.textContent = 'PROCESSING...'; dumpBtn.disabled = true; }
@@ -6539,7 +6706,7 @@ async function submitDumpText(projId) {
     _dumpHideStatus(projId, 5000);
   }
   finally {
-    if (dumpBtn) { dumpBtn.textContent = 'DUMP TEXT'; dumpBtn.disabled = false; }
+    if (dumpBtn) { dumpBtn.textContent = 'ADD NOTES'; dumpBtn.disabled = false; }
   }
 }
 
@@ -6586,7 +6753,7 @@ async function uploadDumpFile(projId, file) {
     });
     const data = await resp.json();
     if (!data.ok) throw new Error(data.error || 'Upload failed');
-    toast('File dumped: ' + file.name);
+    toast('File added: ' + file.name);
   } catch(e) { toast('Upload error: ' + e.message); }
 }
 
@@ -7282,7 +7449,7 @@ function sfxCombat(changes) {
 
 // ── settings panel ──
 let _setTab = 'general';
-const SET_TABS = [['general', 'General'], ['display', 'Display'], ['fields', 'Fields'], ['workflows', 'Stages'], ['mail', 'Mail'], ['ai', 'AI'], ['license', 'License']];
+const SET_TABS = [['general', 'General'], ['display', 'Display'], ['fields', 'Fields'], ['workflows', 'Stages'], ['mail', 'Mail'], ['ai', 'AI'], ['privacy', 'Privacy'], ['license', 'License']];
 function openSettings(tab) {
   if (tab) _setTab = tab;
   document.getElementById('set-overlay').classList.add('open');
@@ -7515,7 +7682,7 @@ function wfMoveWorkflow(wi, dir) { wfMove(_wfDraft.workflows, wi, dir); renderWf
 function wfAddStage(wi) {
   const w = _wfDraft.workflows[wi]; if (!w) return;
   if (!Array.isArray(w.stages)) w.stages = [];
-  w.stages.push({ id: 'stage_' + (w.stages.length + 1), label: 'New stage', column: true });
+  w.stages.push(Object.assign({ id: 'stage_' + (w.stages.length + 1), label: 'New stage', column: true }, _wfAdvanced ? {} : { role: 'waiting' }));
   renderWfEditor();
 }
 function wfDelStage(wi, si) {
@@ -7650,6 +7817,8 @@ function renderWfEditor() {
       <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStageProjects', String(_wfBlocked.stage)))}">MOVE THEM</button>
     </div>`;
   }
+
+  if (!_wfAdvanced) { el.innerHTML = h + renderWfBasic(d, box); return; }
 
   // ── workflows ──
   d.workflows.forEach((w, wi) => {
@@ -7811,6 +7980,7 @@ function renderSettings() {
   else if (_setTab === 'mail') h = renderSettingsMail();
   else if (_setTab === 'ai') h = renderSettingsAI();
   else if (_setTab === 'license') h = renderSettingsLicense();
+  else if (_setTab === 'privacy') h = renderSettingsPrivacy();
   else h = renderSettingsGeneral();
   el.innerHTML = h;
   if (_setTab === 'workflows') renderWfEditor();
@@ -7949,16 +8119,113 @@ function renderSettingsGeneral() {
   return h;
 }
 
+let _wfAdvanced = false;
+function setWfAdvanced(on) { _wfAdvanced = !!on; renderSettings(); }
 function renderSettingsWorkflows() {
   return `<div class="set-sec">
-    <div class="set-sec-lbl">Workflows: stages, tabs, tasks</div>
+    <div class="set-sec-lbl">Stages</div>
     <div class="set-row-sub" style="margin-bottom:6px">
-      Stage ids are the ${esc(ent('project').toLowerCase())} statuses. Each stage has a role that tells the
+      ${_wfAdvanced
+        ? `Stage ids are the ${esc(ent('project').toLowerCase())} statuses. Each stage has a role that tells the
       board what it means: To do, Waiting on someone, Sent, awaiting answer, Won, In progress, Done,
-      Gone quiet or Hidden. Unlimited workflows, stages, extra tasks and tabs. Nothing is written until SAVE.
+      Gone quiet or Hidden. Unlimited workflows, stages, extra tasks and tabs. Nothing is written until SAVE.`
+        : `Rename stages, put them in order, and choose when to be reminded to follow up. Nothing is saved until you press SAVE.`}
     </div>
+    <label class="set-row-sub" style="display:inline-flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" id="wf-advanced" ${_wfAdvanced ? 'checked' : ''} data-on-change='{"f":"setWfAdvanced","a":[{"$":"checked"}]}'>Advanced</label>
     <div id="set-wf-body"></div>
   </div>`;
+}
+// Basic mode: "Follow up after N days" sets the stage's own reminder.
+function wfFollowUpDays(wi, si, val) {
+  const s = ((_wfDraft.workflows[wi] || {}).stages || [])[si];
+  if (!s) return;
+  const n = parseFloat(val);
+  if (isNaN(n) || n <= 0) {
+    if (s.owning_task && (s.owning_task.date_type || 'follow_up') === 'follow_up') delete s.owning_task.days;
+    return;
+  }
+  if (!s.owning_task) s.owning_task = { text: 'Follow up', date_type: 'follow_up' };
+  s.owning_task.days = n;
+}
+function renderWfBasic(d, box) {
+  let h = '';
+  d.workflows.forEach((w, wi) => {
+    h += `<div class="wf-card wf-basic">
+      <div class="wf-head">
+        ${box(w.label, EH(null, EK('wfEdit', wi, 'label', $V)), 'wide', 'name')}
+      </div>`;
+    (w.stages || []).forEach((s, si) => {
+      const t = s.owning_task || {};
+      const isSla = t.date_type === 'sla';
+      h += `<div class="wf-stage wf-stage-basic">
+        ${box(s.label, EH(null, EK('wfStageEdit', wi, si, 'label', $V)), 'wide', 'stage name')}
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStage', wi, si, -1))}" title="Move up">▲</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStage', wi, si, 1))}" title="Move down">▼</button>
+        ${isSla
+          ? `<span class="wf-lbl">Reply within ${esc(String(t.sla_hours || PROF.sla_hours || 4))} h</span>`
+          : `<span class="wf-lbl">Follow up after</span>${box(t.days == null ? '' : t.days, EH(null, EK('wfFollowUpDays', wi, si, $V)), 'narrow', '-')}<span class="wf-lbl">days</span>`}
+      </div>`;
+    });
+    h += `<div class="wf-stage"><button class="set-btn" data-on-click="${EH(null, EK('wfAddStage', wi))}">+ STAGE</button></div>`;
+    h += `</div>`;
+  });
+  h += `<div class="wf-stage" style="border-top:none">
+    <button class="set-btn primary" data-on-click='{"f":"wfSave"}'>SAVE</button>
+    <button class="set-btn" data-on-click='{"f":"wfRevert"}'>REVERT</button>
+  </div>`;
+  return h;
+}
+
+// ── PRIVACY TAB ───────────────────────────────────────────────────────────
+function dataFolder() {
+  const H = HEALTH || {}, C = APP_CONFIG || {};
+  return H.data_root || (H.paths && H.paths.data_root) || C.data_root || (C.paths && C.paths.data_root) || '';
+}
+function renderSettingsPrivacy() {
+  const prov = (HEALTH && HEALTH.ai && HEALTH.ai.provider) || (APP_CONFIG && APP_CONFIG.ai && APP_CONFIG.ai.provider) || 'none';
+  const aiOn = prov && prov !== 'none';
+  const own = aiOn && prov !== 'emailboss';
+  const folder = dataFolder();
+  let h = `<div class="set-sec"><div class="set-sec-lbl">Where your data lives</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Data folder</div>
+      <div class="set-row-sub" id="privacy-folder" style="word-break:break-all">${folder ? esc(folder) : 'Not reported yet.'}</div>
+      <div class="set-row-sub">Your board, your mail copies, drafts and backups are kept here, on this computer.</div>
+    </div></div></div>`;
+  h += `<div class="set-sec"><div class="set-sec-lbl">What leaves this computer</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Email Boss AI${aiOn ? (own ? ' (your own key)' : ' (on)') : ' (off)'}</div>
+      <div class="set-row-sub">${aiOn
+        ? `The text of each new email, so it can be sorted, and the one email you ask it to write a reply or draft for. ${own ? 'With your own key that text goes to the provider you chose.' : 'It is used to answer and is not stored.'}`
+        : 'Nothing. With AI off, sorting runs on this computer by rules.'}</div>
+    </div></div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">License check</div>
+      <div class="set-row-sub">A machine fingerprint, so your license is tied to this computer. It is not your mail and not your name.</div>
+    </div></div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Nothing else</div>
+      <div class="set-row-sub">No tracking, no analytics, no copies of your board.</div>
+    </div></div></div>`;
+  h += `<div class="set-sec"><div class="set-sec-lbl">What never leaves</div>
+    <div class="set-row"><div class="set-row-main"><div class="set-row-sub">
+      Your mailbox password and keys (kept in this computer's password store), your board, your notes, your contacts,
+      attachments, and every email the AI was not asked to read.</div></div></div></div>`;
+  h += `<div class="set-sec"><div class="set-sec-lbl">AI</div>
+    <div class="set-row"><div class="set-row-main"><div class="set-row-sub">${aiOn ? 'Turn AI off and no email text leaves this computer. Sorting keeps working by rules.' : 'AI is off. You can turn it on in Settings > AI.'}</div></div>
+    ${aiOn ? `<button class="set-btn" id="privacy-ai-off" data-on-click='{"f":"privacyAiOff"}'>Turn AI off</button>`
+           : `<button class="set-btn" data-on-click='{"f":"setSettingsTab","a":["ai"]}'>Open Settings &gt; AI</button>`}
+    </div></div>`;
+  return h;
+}
+async function privacyAiOff() {
+  try {
+    await putConfig({ ai: { provider: 'none' } });
+    if (HEALTH && HEALTH.ai) HEALTH.ai.provider = 'none';
+    toast('AI is off');
+    _aiProviders = null; loadHealthBadges(); renderSettings();
+  } catch (e) { toast('Could not save: ' + e.message); }
 }
 
 // ── MAIL TAB ──────────────────────────────────────────────────────────────
@@ -8102,7 +8369,41 @@ function helperSentence(sm) {
   const s = parts.join(', ');
   return s.charAt(0).toUpperCase() + s.slice(1) + '.';
 }
-const _OUTCOME_WORDS = { drafted: 'Wrote a draft', deferred: 'Left for you', acted: 'Done', asked: 'Asked you', question: 'Asked you',
+// Reason codes the helper leaves behind, as sentences a person can act on.
+const _REASON_SENTENCES = {
+  no_rule: 'No rule covers this yet, so it is waiting for you.',
+  no_inbound_text: 'There is no email text on it to read, so it is waiting for you.',
+  multi_project: 'This mail could belong to more than one {p}. Pick the right one.',
+  no_project: 'No {p} matches this mail yet. Add it to the board or set it aside.',
+  needs_human: 'This needs your decision.',
+  ambiguous: 'This mail could belong to more than one {p}. Pick the right one.',
+};
+function reasonSentence(code) {
+  const k = String(code || '').toLowerCase().replace(/^left:\s*/, '').trim();
+  const t = _REASON_SENTENCES[k];
+  return t ? t.replace('{p}', ent('project').toLowerCase()) : '';
+}
+// One log row in plain words. A row that did something never reads
+// "Nothing needed doing".
+function helperRowSentence(r) {
+  const d = (r && r.detail && typeof r.detail === 'object') ? r.detail : {};
+  const rs = reasonSentence(d.reason) || reasonSentence(d.result);
+  if (rs) return rs;
+  if (d.counts || d.summary || d.message) {
+    const s0 = helperSentence(d);
+    if (!(s0 === 'Nothing needed doing.' && r.outcome && r.outcome !== 'summary' && r.outcome !== 'skipped')) return s0;
+  }
+  const res = typeof d.result === 'string' ? d.result.trim() : '';
+  if (res) {
+    const t = res.replace(/\bproj_\w+\b\s*/g, '').replace(/->/g, 'to').replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+    return t.charAt(0).toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? '' : '.');
+  }
+  if (typeof d === 'string') return d;
+  const fallback = { acted: 'Made a change.', drafted: 'Wrote a draft for you.', deferred: 'Left it for you to decide.',
+                     asked: 'Asked you a question.', question: 'Asked you a question.', question_posted: 'Asked you a question.', subtask_added: 'Added a reminder.' };
+  return fallback[r && r.outcome] || helperSentence(d);
+}
+const _OUTCOME_WORDS = { drafted: 'Wrote a draft', deferred: 'Left for you', subtask_added: 'Added a reminder', summary: 'Checked', acted: 'Done', asked: 'Asked you', question: 'Asked you', question_posted: 'Asked you',
                          skipped: 'Skipped', error: 'Problem', failed: 'Problem', triaged: 'Sorted', approved: 'Sorted' };
 function renderSettingsAI() {
   const cur = _aiCurrent();
@@ -8123,7 +8424,7 @@ function renderSettingsAI() {
   if (kind === 'builtin') {
     const month = u.month || {};
     h += `<div class="set-row"><div class="set-row-main">
-        <div class="set-row-name">Credits left: ${bal.balance != null ? esc(String(bal.balance)) : (cur === 'emailboss' ? 'checking...' : '-')}${bal.low ? '<span class="set-chip bad">running low</span>' : ''}${bal.credits_exhausted ? '<span class="set-chip bad">empty</span>' : ''}</div>
+        <div class="set-row-name">Credits left: ${bal.balance != null ? esc(String(bal.balance)) : (cur === 'emailboss' ? (_aiBalance === null ? 'checking...' : 'unknown') : '-')}${bal.low ? '<span class="set-chip bad">running low</span>' : ''}${bal.credits_exhausted ? '<span class="set-chip bad">empty</span>' : ''}</div>
         <div class="set-row-sub">Used this month: ${month.calls != null ? pl0(month.calls, 'request') + (month.credits != null ? ', ' + month.credits + ' credits' : '') : 'nothing yet'}.</div>
       </div>
       ${cur !== 'emailboss' ? `<button class="set-btn primary" data-on-click='{"f":"setAIProvider","a":["emailboss"]}'>TURN ON</button>` : ''}
@@ -8164,26 +8465,81 @@ function renderSettingsAI() {
     </div>
     <button class="set-btn primary" id="set-ai-run" data-on-click='{"f":"runAssistantNow"}' ${st.installed === false ? 'disabled' : ''}>Check my inbox and board now</button>
     </div>
+    ${digestRowHtml()}
     <div id="set-ai-run-result" class="set-row-sub" style="${_helperResult.bad ? 'color:var(--c-e06c6c)' : (_helperResult.text ? 'color:var(--c-97dda5)' : '')}">${esc(_helperResult.text || '')}</div>
     <div class="set-row" style="flex-direction:column;align-items:stretch">
       <div class="set-row-name" style="margin-bottom:4px">What the helper did<span class="set-chip">${log.length}</span></div>
       <div class="set-log">${log.length ? log.slice(0, 60).map(r => {
           const p = r.project_id ? projById(r.project_id) : null;
           const what = p ? p.name : (r.project_id ? ent('project') : (r.item_type === 'triage' ? 'New mail' : ''));
-          return `<div class="set-log-row">
+          const pid = r.project_id && p ? String(r.project_id) : '';
+          return `<div class="set-log-row${pid ? ' set-log-link' : ''}" ${pid ? `title="Open ${escA(p.name)}" data-on-click="${EH(null, EK('closeSettings'), EK('openPanel', pid))}"` : ''}>
           <span class="set-log-ts">${esc(String(r.ts || '').slice(5, 16).replace('T', ' '))}</span>
           <span class="set-log-outcome o-${escA(r.outcome || '')}">${esc(_OUTCOME_WORDS[r.outcome] || String(r.outcome || '').replace(/_/g, ' '))}</span>
           <span class="set-log-item">${esc(what)}</span>
-          <span class="set-log-detail">${esc(helperSentence(r.detail))}</span>
+          <span class="set-log-detail">${esc(helperRowSentence(r))}</span>
         </div>`; }).join('') : '<div class="set-row-sub">Nothing yet.</div>'}</div>
     </div>
   </div>`;
   return h;
 }
+// Weekly summary: assistant.digest_weekday (0 = Monday) and digest_hour.
+const _WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+let _digestEdit = false;
+function _digestCfg() {
+  const a = (APP_CONFIG && APP_CONFIG.assistant) || {};
+  let wd = a.digest_weekday;
+  const off = wd !== undefined && wd !== null && /^(off|none|false|-1)$/i.test(String(wd));
+  if (typeof wd === 'string' && !off) { const i = _WEEKDAYS.findIndex(d => d.slice(0, 3).toLowerCase() === wd.slice(0, 3).toLowerCase()); wd = i < 0 ? 0 : i; }
+  wd = off ? -1 : ((parseInt(wd, 10) || 0) % 7);
+  const hr = Math.max(0, Math.min(23, parseInt(a.digest_hour != null ? a.digest_hour : 7, 10) || 0));
+  return { wd, hr };
+}
+function digestRowHtml() {
+  const c = _digestCfg();
+  const when = c.wd < 0 ? 'Off' : `${_WEEKDAYS[c.wd]} ${c.hr}:00`;
+  let h = `<div class="set-row" id="set-digest-row"><div class="set-row-main">
+      <div class="set-row-name">Weekly summary: <span id="set-digest-when">${esc(when)}</span></div>
+      <div class="set-row-sub">A short summary of your week, left in Drafts for you. Nothing is sent.</div></div>
+      <button class="set-btn" id="set-digest-change" data-on-click='{"f":"toggleDigestEdit"}'>${_digestEdit ? 'cancel' : 'change'}</button></div>`;
+  if (_digestEdit) {
+    h += `<div class="set-row" style="gap:6px;flex-wrap:wrap">
+      <select id="set-digest-day" class="pf-input" style="max-width:160px">
+        ${_WEEKDAYS.map((d, i) => `<option value="${i}" ${i === c.wd ? 'selected' : ''}>${d}</option>`).join('')}
+        <option value="off" ${c.wd < 0 ? 'selected' : ''}>Off</option>
+      </select>
+      <select id="set-digest-hour" class="pf-input" style="max-width:120px">
+        ${Array.from({ length: 24 }, (_, i) => `<option value="${i}" ${i === c.hr ? 'selected' : ''}>${i}:00</option>`).join('')}
+      </select>
+      <button class="set-btn primary" id="set-digest-save" data-on-click='{"f":"saveDigestSchedule"}'>SAVE</button></div>`;
+  }
+  return h;
+}
+function toggleDigestEdit() { _digestEdit = !_digestEdit; renderSettings(); }
+async function saveDigestSchedule() {
+  const d = document.getElementById('set-digest-day'), hEl = document.getElementById('set-digest-hour');
+  if (!d || !hEl) return;
+  const wd = d.value === 'off' ? 'off' : parseInt(d.value, 10);
+  const hr = parseInt(hEl.value, 10) || 0;
+  try {
+    await putConfig({ assistant: { digest_weekday: wd, digest_hour: hr } });
+    APP_CONFIG = APP_CONFIG || {};
+    APP_CONFIG.assistant = Object.assign({}, APP_CONFIG.assistant || {}, { digest_weekday: wd, digest_hour: hr });
+    _digestEdit = false; renderSettings();
+    toast(wd === 'off' ? 'Weekly summary is off' : `Weekly summary set for ${_WEEKDAYS[wd]} ${hr}:00`);
+  } catch (e) { toast('Could not save: ' + e.message); }
+}
 function pl0(c, one) { return `${c} ${c === 1 ? one : one + 's'}`; }
 async function loadAISettings(force) {
   if (_aiProviders && !force) return;
-  const get = async (u) => { try { const r = await fetch(u + (u.includes('?') ? '&' : '?') + Date.now()); return r.ok ? await r.json() : null; } catch (e) { return null; } };
+  // Each read gives up after 8 s so a slow credit server never leaves
+  // "checking..." on screen: it falls back to "unknown".
+  const get = async (u) => {
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const t = ac ? setTimeout(() => ac.abort(), 8000) : null;
+    try { const r = await fetch(u + (u.includes('?') ? '&' : '?') + Date.now(), ac ? { signal: ac.signal } : {}); return r.ok ? await r.json() : null; }
+    catch (e) { return null; } finally { if (t) clearTimeout(t); }
+  };
   const [pv, us, lg, st, bl] = await Promise.all([get('/api/ai/providers'), get('/api/ai/usage'), get('/api/assistant/log'), get('/api/assistant/status'), get('/api/ai/balance')]);
   _aiProviders = pv || {}; _aiUsage = us || {}; _assistantLog = (lg && (lg.log || lg.entries)) || []; _assistantStatus = st || {}; _aiBalance = bl || {};
   if (_setTab === 'ai') renderSettings();
@@ -8357,16 +8713,33 @@ function applyRefreshInterval() {
 // ── urgency words ──────────────────────────────────────────────────────────
 // Nearest pending date on a project: the earliest open subtask date, falling
 // back to the project's own follow-up date. null = nothing dated.
-function nearestDue(p) {
-  let best = null;
+// A response SLA runs on business hours, not on its follow-up date.
+function slaInfo(s) {
+  if (!s || s.status === 'complete' || !(s.date_type === 'sla' || s.sla_type === 'response')) return null;
+  const hours = +(s.sla_hours || PROF.sla_hours || 4) || 4;
+  const elapsed = calcBizHoursElapsed(s.sla_created || s.created);
+  const over = elapsed >= hours;
+  return { hours, elapsed, over,
+           left: Math.max(1, Math.ceil(hours - elapsed)),
+           late: Math.max(1, Math.round(elapsed - hours)) };
+}
+function slaWord(si) { return si.over ? `Reply overdue by ${si.late} h` : `Reply within ${si.left} h`; }
+function nearestDueInfo(p) {
+  let best = null, word = null;
   (p.subtasks || []).forEach(s => {
-    if (s.status === 'complete' || !s.follow_up_date) return;
-    const d = daysUntil(s.follow_up_date);
-    if (d !== null && (best === null || d < best)) best = d;
+    if (s.status === 'complete') return;
+    const si = slaInfo(s);
+    let d;
+    if (si) d = si.over ? -1 : 0;
+    else if (s.follow_up_date) d = daysUntil(s.follow_up_date);
+    else return;
+    if (d === null) return;
+    if (best === null || d < best || (d === best && si && !word)) { best = d; word = si ? slaWord(si) : null; }
   });
   if (best === null && p.follow_up_date) best = daysUntil(p.follow_up_date);
-  return best;
+  return { days: best, word };
 }
+function nearestDue(p) { return nearestDueInfo(p).days; }
 function dueWord(days, ds) {
   if (days === null || days === undefined) return 'No date';
   if (days < 0) return `${-days} day${days === -1 ? '' : 's'} late`;
@@ -8377,8 +8750,9 @@ function dueWord(days, ds) {
   return 'Due ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 function urgencyWordHtml(p, score, rc) {
-  const days = nearestDue(p);
-  const word = dueWord(days);
+  const nd = nearestDueInfo(p);
+  const days = nd.days;
+  const word = nd.word || dueWord(days);
   const late = days !== null && days < 0;
   const bg = late ? 'var(--c-2a1515)' : (rc ? rc.bg : 'var(--c-0c1a2a)');
   const fg = late ? 'var(--c-f09595)' : (rc ? rc.text : 'var(--c-4fc3f7)');
@@ -8438,6 +8812,7 @@ async function setDisplay(key, val) {
   try {
     await putConfig({ display: { [key]: val } });
     applyDisplayModes(); renderSettings();
+    _panelSig = null; if (openProjectId) renderPanel(openProjectId, { force: true });
   } catch (e) { toast('Could not save: ' + e.message); }
 }
 function renderSettingsDisplay() {
@@ -8452,6 +8827,7 @@ function renderSettingsDisplay() {
   h += `</div><div class="set-sec"><div class="set-sec-lbl">Look</div>`;
   h += row('Large text', 'Bigger, easier to read text everywhere.', !!displayPref('large_text'), EH(null, EK('setDisplay', 'large_text', $C)));
   h += row('Light theme', 'Dark text on a light background.', lightOn, EH(null, EK('setDisplay', 'light_theme', $C)));
+  h += row('Advanced details', 'Urgency numbers, reply-clock chips and the SLA switch on each reminder.', advancedDetails(), EH(null, EK('setDisplay', 'advanced_details', $C)));
   h += `</div>`;
   return h;
 }
@@ -8516,8 +8892,12 @@ function renderSettingsFields() {
   const fs = Array.isArray(PROF.fields) ? PROF.fields : [];
   const tl = { text: 'Text', date: 'Date', money: 'Money', enum: 'Pick from a list', id: 'Reference', url: 'Link' };
   let h = `<div class="set-sec"><div class="set-sec-lbl">Fields on each ${esc(ent('project').toLowerCase())}</div>`;
-  h += fs.length ? fs.map(f => `<div class="set-row"><div class="set-row-main"><div class="set-row-name">${esc(f.label || f.key)}</div>
-      <div class="set-row-sub">${esc(tl[f.type] || f.type || 'Text')}${(f.show_on || []).includes('card') ? ' · shown on the card' : ''}</div></div>
+  h += fs.length ? fs.map(f => `<div class="set-row cf-row" data-key="${escA(f.key)}"><div class="set-row-main">
+      <input class="pf-input cf-name" value="${escA(f.label || f.key)}" title="Rename this field" style="max-width:260px"
+        data-on-change="${EH(null, EK('renameField', String(f.key), $V))}">
+      <div class="set-row-sub">${esc(tl[f.type] || f.type || 'Text')}${(f.show_on || []).includes('card') ? ' · shown on the card' : ''}${f.hidden ? ' · hidden' : ''}</div></div>
+      <label class="set-row-sub" style="display:flex;align-items:center;gap:4px" title="Untick to hide this field everywhere"><input type="checkbox" class="cf-show" ${f.hidden ? '' : 'checked'}
+        data-on-change="${EH(null, EK('setFieldHidden', String(f.key), $C))}">Show</label>
       ${f.custom ? `<button class="set-btn" data-on-click="${EH(null, EK('removeCustomField', String(f.key)))}">REMOVE</button>` : ''}</div>`).join('')
     : '<div class="set-row-sub">No fields yet.</div>';
   h += `</div><div class="set-sec"><div class="set-sec-lbl">Add a field</div>
@@ -8556,6 +8936,28 @@ async function addCustomField() {
   try { await putProfessionOverrides(over); toast('Field added: ' + label); renderSettings(); if (openProjectId) renderPanel(openProjectId, { force: true }); }
   catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
 }
+// Built-in fields are renamed or hidden by sending the whole field list
+// back as overrides.fields: a field with the same key replaces the template's.
+async function _saveFieldList(mut, msg) {
+  const fs = (Array.isArray(PROF.fields) ? PROF.fields : []).map(f => Object.assign({}, f));
+  mut(fs);
+  const over = currentOverrides();
+  over.fields = fs;
+  try {
+    await putProfessionOverrides(over); toast(msg); renderSettings();
+    _metricsHtml = ''; renderBoard();
+    if (openProjectId) renderPanel(openProjectId, { force: true });
+  } catch (e) { toast('Could not save: ' + e.message); }
+}
+async function renameField(key, label) {
+  label = String(label || '').trim();
+  if (!label) { renderSettings(); return; }
+  await _saveFieldList(fs => { const f = fs.find(x => x.key === key); if (f) f.label = label; }, 'Field renamed to ' + label);
+}
+async function setFieldHidden(key, show) {
+  await _saveFieldList(fs => { const f = fs.find(x => x.key === key); if (f) { if (show) delete f.hidden; else f.hidden = true; } },
+                       show ? 'Field shown' : 'Field hidden');
+}
 async function removeCustomField(key) {
   const f = (PROF.fields || []).find(x => x.key === key);
   if (!f || !confirm(`Remove the field "${f.label || key}"? Values already typed stay in the data.`)) return;
@@ -8566,13 +8968,14 @@ async function removeCustomField(key) {
 
 // ── Mark won / lost (drawer) ───────────────────────────────────────────────
 function wonLostButtons(p) {
+  if (!isSalesFlow(p)) return '';
   const wid = projectWorkflowId(p);
   const won = stageWithRole('won', wid, true);
   const lost = stageWithRole('closed', wid, true);
   if (!won && !lost) return '';
   const r = projRole(p);
-  return `${won && r !== 'won' ? `<button class="eb-btn" data-on-click="${EH(null, EK('changeStatus', String(p.id), String(won)))}">Mark won</button>` : ''}
-          ${lost && r !== 'closed' ? `<button class="eb-btn" data-on-click="${EH(null, EK('confirmLost', p.id, lost, stageLabel(lost)))}">Mark lost</button>` : ''}`;
+  return `${won && r !== 'won' ? `<button class="eb-btn" data-on-click="${EH(null, EK('changeStatus', String(p.id), String(won)))}">Won</button>` : ''}
+          ${lost && r !== 'closed' ? `<button class="eb-btn" data-on-click="${EH(null, EK('confirmLost', p.id, lost, stageLabel(lost)))}">Lost</button>` : ''}`;
 }
 function drawerActionsHtml(p) {
   return `<div class="panel-section"><div class="panel-label">Quick actions</div>
@@ -8594,6 +8997,11 @@ function aiState() {
 }
 let _aiNote = '';
 function aiGate(state) {
+  if (state === 'offline') {
+    // AI is on but the service did not answer: nothing to turn on, just wait.
+    showAiPanel({ title: 'Email Boss AI is not answering', text: "Email Boss AI can't be reached right now. Try again in a minute." });
+    return;
+  }
   _aiNote = state === 'nocredits' ? 'Out of AI credits. Buy credits to keep using Email Boss AI.' : 'Turn on Email Boss AI to use this button.';
   openSettings('ai');
 }
@@ -8609,7 +9017,13 @@ async function aiFetch(url, body, method) {
     j = await r.json().catch(() => ({}));
   } catch (e) { showAiPanel({ title: 'Could not reach Email Boss', text: String(e.message || e) }); return null; }
   const err = String((j && (j.error || j.message)) || '');
-  if (r.status === 503 || /offline|turned off/i.test(err)) { closeAiPanel(); aiGate('off'); return null; }
+  if (r.status === 503 || /offline|turned off|unreachable|not reachable/i.test(err)) {
+    const prov = (HEALTH && HEALTH.ai && HEALTH.ai.provider) || (APP_CONFIG && APP_CONFIG.ai && APP_CONFIG.ai.provider) || 'none';
+    // Off only when the engine says AI is turned off; a provider that is on but
+    // failed is an outage, not a setting.
+    if (prov && prov !== 'none' && !/turned off|ai is off/i.test(err)) { aiGate('offline'); return null; }
+    closeAiPanel(); aiGate('off'); return null;
+  }
   if (r.status === 402 && j.error !== 'license_required' || /credit/i.test(err)) { closeAiPanel(); aiGate('nocredits'); return null; }
   if (r.status === 402) { closeAiPanel(); return null; }
   if (!r.ok || j.ok === false) { showAiPanel({ title: 'That did not work', text: err || ('HTTP ' + r.status) }); return null; }
@@ -8665,8 +9079,19 @@ async function aiTriageReply(tid) {
   showAiPanel({ title: 'Reply draft', text: j.draft || '', editable: true, draft: { project_id: pid, to: it.from_email || '', subject: subj } });
 }
 async function aiWeeklyDigest() {
-  const j = await aiFetch('/api/ai/weekly-digest', {}, 'POST');
-  if (!j) return;
+  // Works with AI off too: the engine answers with a plain-numbers summary.
+  showAiPanel({ title: 'Working on it...', text: '', busy: true });
+  let j = null;
+  try {
+    const r = await fetch('/api/ai/weekly-digest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) {
+      if (r.status === 402 && j.error !== 'license_required') { closeAiPanel(); aiGate('nocredits'); return; }
+      if (r.status === 402) { closeAiPanel(); return; }
+      if (r.status === 503) { aiGate('offline'); return; }
+      showAiPanel({ title: 'That did not work', text: j.error || ('HTTP ' + r.status) }); return;
+    }
+  } catch (e) { showAiPanel({ title: 'Could not reach Email Boss', text: String(e.message || e) }); return; }
   showAiPanel({ title: 'Your week', text: j.text || j.digest || '', items: j.items || [],
                 draft: { project_id: '', to: (PROF.user && PROF.user.email) || '', subject: 'My week' } });
 }
@@ -8690,9 +9115,12 @@ async function aiAsk(q) {
     const r = await fetch('/api/ai/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { showAiPanel({ title: 'That did not work', text: j.error || ('HTTP ' + r.status) }); return; }
-    const items = j.items || (j.results || []).map(p => ({ project_id: p.id, label: p.name, detail: p.location || '' }));
-    const text = j.text || (items.length ? `Found ${items.length}.` : 'Nothing matched.');
-    showAiPanel({ title: q, text, items });
+    const raw = Array.isArray(j.items) ? j.items : (j.results || []).map(p => ({ id: p.id, name: p.name, why: p.location || '' }));
+    const items = raw.map(it => ({ id: it.id || it.project_id || '', name: it.name || it.label || '', why: it.why || it.detail || '' }))
+                     .filter(it => it.id || it.name);
+    const plural = items.length === 1 ? '1 match' : `${items.length} matches`;
+    let text = items.length ? (j.text && !/nothing/i.test(j.text) ? j.text : `Found ${plural}.`) : 'Nothing matches.';
+    showAiPanel({ title: q, text, items, ask: true });
   } catch (e) { showAiPanel({ title: 'That did not work', text: String(e.message || e) }); }
 }
 
@@ -8707,9 +9135,11 @@ function showAiPanel(st) {
     ${st.draft && st.draft.to ? `<div class="sub">To: ${esc(st.draft.to)}${st.draft.subject ? ' · ' + esc(st.draft.subject) : ''}</div>` : ''}
     ${st.busy ? '' : (st.editable ? `<textarea class="eb-textarea" id="ai-text">${esc(st.text || '')}</textarea>`
                                    : `<div class="eb-note" style="white-space:pre-wrap;color:var(--t1)">${esc(st.text || '')}</div>`)}
-    ${items.length ? `<div style="margin-top:8px">${items.map(it => {
-        const pid = it.project_id || it.id || '';
-        return `<div class="today-row" ${pid ? `data-on-click="${EH(null, EK('closeAiPanel'), EK('openPanel', pid))}"` : ''}><div class="what"><div class="t">${esc(it.label || it.name || it.text || '')}</div>${it.detail ? `<div class="s">${esc(it.detail)}</div>` : ''}</div></div>`;
+    ${items.length ? `<div class="ai-items" style="margin-top:8px">${items.map(it => {
+        const pid = String(it.project_id || it.id || '');
+        const sub = it.why || it.detail || '';
+        const open = pid ? EH(null, EK('closeAiPanel'), EK('openPanel', pid)) : '';
+        return `<div class="today-row ai-item" ${pid ? `data-pid="${escA(pid)}" data-on-click="${open}"` : ''}><div class="what"><div class="t">${esc(it.label || it.name || it.text || '')}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ''}</div>${pid && st.ask ? `<button class="eb-btn primary" data-on-click="${EH({sp:1}, EK('closeAiPanel'), EK('openPanel', pid))}">Open</button>` : ''}</div>`;
       }).join('')}</div>` : ''}
     <div class="eb-row">
       ${st.busy ? '' : `<button class="eb-btn" data-on-click='{"f":"aiCopy"}'>Copy</button>`}
@@ -8739,13 +9169,83 @@ async function aiSaveDraft() {
       body: JSON.stringify({ project_id: st.draft.project_id || '', to: st.draft.to || '', subject: st.draft.subject || '', body: _aiText(), created_by: 'user' }) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
-    closeAiPanel(); toast('Saved to Drafts'); _draftsCache = null;
+    closeAiPanel(); toast('Saved to Drafts'); _draftsCache = null; loadDraftCount();
     if (currentView === 'drafts') renderDrafts();
   } catch (e) { if (note) { note.className = 'eb-note bad'; note.textContent = 'Could not save: ' + e.message; } }
 }
 
+// ── CSV import ("Add many from a spreadsheet") ───────────────────────────────
+const CSV_SAMPLE = 'name,client,contact email,stage,due date,notes\n'
+  + 'Website refresh,Acme Corp,priya@acme.example,,2026-12-01,Send the first draft\n'
+  + 'Annual renewal,Birch Dental,tom@birchdental.example,,,Call before the renewal date\n';
+let _csvResult = null, _csvBusy = false;
+function openCsvImport() { _csvResult = null; _csvBusy = false; renderCsvImport(); document.getElementById('csv-overlay').classList.add('open'); }
+function closeCsvImport() { const o = document.getElementById('csv-overlay'); if (o) o.classList.remove('open'); }
+function renderCsvImport() {
+  const m = document.getElementById('csv-modal');
+  if (!m) return;
+  const r = _csvResult;
+  const pl = (n, one) => `${n} ${n === 1 ? one : pluralize(one)}`;
+  let res = '';
+  if (r && r.error) res = `<div class="eb-note bad" id="csv-result">${esc(r.error)}</div>`;
+  else if (r) {
+    const errs = Array.isArray(r.errors) ? r.errors : [];
+    res = `<div class="eb-note" id="csv-result" style="color:var(--t1)">Added ${pl(r.created || 0, ent('project').toLowerCase())}. Skipped ${r.skipped || 0} already on the board.${errs.length ? ` ${pl(errs.length, 'row')} could not be read:` : ''}</div>
+      ${errs.length ? `<div class="eb-note" id="csv-errors">${errs.slice(0, 20).map(e => `Row ${esc(String(e.row))}: ${esc(e.error === 'no name' ? 'no name' : String(e.error || ''))}`).join('<br>')}</div>` : ''}`;
+  }
+  m.innerHTML = `<h3>Add many from a spreadsheet</h3>
+    <div class="sub">Save your spreadsheet as CSV with these columns: name, client, contact email, stage, due date, notes. Only name is required. Anything already on the board is skipped.</div>
+    <div class="eb-row" style="flex-wrap:wrap">
+      <input type="file" id="csv-file" accept=".csv,text/csv" ${_csvBusy ? 'disabled' : ''}>
+      <button class="eb-btn primary" id="csv-upload" data-on-click='{"f":"uploadCsvImport"}' ${_csvBusy ? 'disabled' : ''}>${_csvBusy ? 'Adding...' : 'Add them'}</button>
+      <button class="eb-btn" data-on-click='{"f":"downloadSampleCsv"}'>Download a sample</button>
+    </div>
+    ${res}
+    <div class="eb-row"><button class="eb-btn" data-on-click='{"f":"closeCsvImport"}'>Close</button></div>`;
+}
+function downloadSampleCsv() {
+  const blob = new Blob([CSV_SAMPLE], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'email-boss-sample.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+async function uploadCsvImport() {
+  const inp = document.getElementById('csv-file');
+  const f = inp && inp.files && inp.files[0];
+  if (!f) { _csvResult = { error: 'Pick a CSV file first.' }; renderCsvImport(); return; }
+  const fd = new FormData();
+  fd.append('file', f, f.name);
+  _csvBusy = true; renderCsvImport();
+  try {
+    const r = await fetch('/api/projects/import-csv', { method: 'POST', body: fd });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+    _csvResult = j;
+    if (j.created) await loadData();
+  } catch (e) { _csvResult = { error: 'Could not add them: ' + e.message }; }
+  _csvBusy = false; renderCsvImport();
+}
+
 // ── Drafts tab ─────────────────────────────────────────────────────────────
-let _draftsCache = null, _draftFocus = null;
+let _draftsCache = null, _draftFocus = null, _draftCount = 0;
+// The DRAFTS button carries a count badge; refreshed with the board.
+function setDraftCount(n) {
+  n = parseInt(n, 10) || 0;
+  if (n === _draftCount) return;
+  _draftCount = n;
+  _metricsHtml = '';
+  if (DATA) renderBoard();
+}
+async function loadDraftCount() {
+  try {
+    const r = await fetch('/api/drafts');
+    if (!r.ok) return;
+    const j = await r.json();
+    setDraftCount(j.count != null ? j.count : (Array.isArray(j.drafts) ? j.drafts.length : 0));
+  } catch (e) { /* keep the last count */ }
+}
 async function renderDrafts() {
   const el = document.getElementById('drafts-view');
   if (!el) return;
@@ -8755,6 +9255,7 @@ async function renderDrafts() {
       const r = await fetch('/api/drafts');
       const j = r.ok ? await r.json() : {};
       _draftsCache = Array.isArray(j.drafts) ? j.drafts : [];
+      setDraftCount(_draftsCache.length);
     } catch (e) { _draftsCache = []; }
   }
   const ds = _draftsCache;
@@ -8764,7 +9265,7 @@ async function renderDrafts() {
     ${ds.length ? ds.map(d => `<div class="draft-row" id="draft-${escA(d.id)}" ${_draftFocus === d.id ? 'style="outline:2px solid var(--c-4fc3f7)"' : ''}>
         <div class="subj">${esc(d.subject || '(no subject)')}</div>
         <div class="to">To: ${esc(d.to || 'nobody yet')}${d.project_id && pname(d.project_id) ? ' · ' + esc(pname(d.project_id)) : ''}${d.created_by === 'assistant' ? ' · written by the helper' : ''}</div>
-        <div class="pv">${esc(String(d.body || '').slice(0, 400))}</div>
+        <div class="pv">${esc(draftText(d).slice(0, 400))}</div>
         <div class="eb-row">
           <button class="eb-btn" data-on-click="${EH(null, EK('copyDraft', String(d.id)))}">Copy</button>
           ${mailClientOn() ? `<button class="eb-btn" data-on-click="${EH(null, EK('openDraftInMail', String(d.id)))}">Open in my mail</button>` : ''}
@@ -8776,15 +9277,28 @@ async function renderDrafts() {
   if (_draftFocus) { const x = document.getElementById('draft-' + _draftFocus); if (x) x.scrollIntoView({ block: 'center' }); }
 }
 function _draft(id) { return (_draftsCache || []).find(d => d.id === id); }
+// A draft body may be HTML (saved from the mail composer) or plain text.
+// Shown and handed on as text: tags dropped, line breaks kept.
+function htmlToText(x) {
+  let t = String(x || '');
+  if (!/<\/?[a-z][\s\S]*?>/i.test(t)) return t;
+  t = t.replace(/<(script|style|head|title)[^>]*>[\s\S]*?<\/\1>/gi, '')
+       .replace(/<br\s*\/?>/gi, '\n')
+       .replace(/<\/(div|p|li|tr|h[1-6]|blockquote)\s*>/gi, '\n')
+       .replace(/<li[^>]*>/gi, '- ');
+  const doc = new DOMParser().parseFromString('<body>' + t + '</body>', 'text/html');
+  return (doc.body.textContent || '').replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+function draftText(d) { return htmlToText(d && (d.body != null && d.body !== '' ? d.body : d.body_html)); }
 async function copyDraft(id) {
   const d = _draft(id); if (!d) return;
-  const txt = (d.to ? 'To: ' + d.to + '\n' : '') + (d.subject ? 'Subject: ' + d.subject + '\n\n' : '') + (d.body || '');
+  const txt = (d.to ? 'To: ' + d.to + '\n' : '') + (d.subject ? 'Subject: ' + d.subject + '\n\n' : '') + draftText(d);
   toast((await copyText(txt)) ? 'Copied' : 'Could not copy');
 }
 function openDraftInMail(id) {
   const d = _draft(id); if (!d || !window.PBMail) return;
   setView('mail');
-  const html = esc(String(d.body || '')).replace(/\r?\n/g, '<br>');
+  const html = esc(draftText(d)).replace(/\r?\n/g, '<br>');
   setTimeout(() => PBMail.compose({ to: d.to || '', cc: d.cc || '', subject: d.subject || '', body_html: html, project_id: d.project_id || '' }), 200);
 }
 async function deleteDraft(id) {
@@ -8794,6 +9308,7 @@ async function deleteDraft(id) {
     const r = await fetch(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     _draftsCache = (_draftsCache || []).filter(x => x.id !== id);
+    setDraftCount(_draftsCache.length);
     renderDrafts(); toast('Draft deleted');
   } catch (e) { toast('Could not delete: ' + e.message); }
 }
@@ -8886,33 +9401,52 @@ async function submitDecision(q, answer) {
 }
 
 // ── Today view ─────────────────────────────────────────────────────────────
-function _todayRow(p, text, days, ds) {
-  const w = dueWord(days, ds);
+function _todayRow(p, text, days, ds, whenText, late) {
+  const w = whenText || dueWord(days, ds);
+  const isLate = late != null ? late : (days !== null && days < 0);
   return `<div class="today-row" data-pid="${escA(p.id)}" data-on-click="${EH(null, EK('openPanel', String(p.id)))}">
     <div class="what"><div class="t">${esc(p.name)}</div><div class="s">${esc(text || '')}</div></div>
-    <div class="when ${days !== null && days < 0 ? 'late' : ''}">${esc(w)}</div></div>`;
+    <div class="when ${isLate ? 'late' : ''}">${esc(w)}</div></div>`;
+}
+// A follow-up nudge: a dated follow-up, never the owning "Prepare and send..." work.
+function isNudgeTask(s) {
+  const dt = s.date_type || 'follow_up';
+  if (dt !== 'follow_up') return false;
+  return !/^\s*prepare and send\b/i.test(s.text || '');
 }
 function renderToday() {
   const el = document.getElementById('today-view');
   if (!el || !DATA) return;
   const live = (DATA.projects || []).filter(p => !p.archived && !isClosedStage(p.status, projectWorkflowId(p)) && !isMutedStatus(p.status, projectWorkflowId(p)));
-  const reply = [], nudge = [], overdue = [];
+  const reply = [], nudge = [], overdue = [], soon = [];
   live.forEach(p => {
     (p.subtasks || []).filter(s => s.status !== 'complete').forEach(s => {
+      const si = slaInfo(s);
+      if (si) {
+        const item = { p, s, days: si.over ? -1 : 0, when: slaWord(si), late: si.over, key: si.over ? -1000 - si.late : 0 };
+        (si.over ? overdue : reply).push(item);
+        return;
+      }
       const days = s.follow_up_date ? daysUntil(s.follow_up_date) : null;
-      const item = { p, s, days };
-      if (days !== null && days < 0) overdue.push(item);
-      else if (s.date_type === 'sla' || s.sla_type === 'response') reply.push(item);
-      else if (days === 0) nudge.push(item);
+      if (days === null) return;
+      const item = { p, s, days, key: days };
+      if (days < 0) overdue.push(item);
+      else if (s.date_type === 'deadline' && days <= 7) soon.push(item);
+      else if (days === 0 && isNudgeTask(s)) nudge.push(item);
     });
   });
-  overdue.sort((a, b) => a.days - b.days);
+  overdue.sort((a, b) => a.key - b.key);
+  reply.sort((a, b) => (slaInfo(a.s).left) - (slaInfo(b.s).left));
+  soon.sort((a, b) => a.days - b.days);
   const pending = (TRIAGE_ITEMS || []).filter(i => i.status === 'pending').length;
-  const sec = (title, rows, empty, extra) => `<div class="today-sec"><div class="today-sec-h">${title} <span class="n">${rows.length}</span><span class="sp"></span>${extra || ''}</div>
+  const sec = (title, rows, empty, extra, cls) => `<div class="today-sec${cls ? ' ' + cls : ''}"><div class="today-sec-h">${title} <span class="n">${rows.length}</span><span class="sp"></span>${extra || ''}</div>
     ${rows.length ? rows.join('') : `<div class="today-empty">${empty}</div>`}</div>`;
+  const row = x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date, x.when, x.late);
   let h = '';
-  h += sec('Reply today', reply.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'No one is waiting on a reply.');
-  h += sec('Nudge today', nudge.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'No follow-ups due today.');
+  h += sec('Overdue', overdue.map(row), 'Nothing is late.', '', overdue.length ? 'today-overdue' : '');
+  h += sec('Reply today', reply.map(row), 'No one is waiting on a reply.');
+  h += sec('Nudge today', nudge.map(row), 'No follow-ups due today.');
+  h += sec('Coming up (7 days)', soon.map(row), 'No deadlines in the next 7 days.');
   h += sec('Decisions for you', _openQList.map(q => {
       const p = projById(q.project_id);
       return `<div class="today-row" data-on-click="${EH(null, EK('openDecisions', String(q.id)))}"><div class="what"><div class="t">${esc(q.question || '')}</div>
@@ -8921,7 +9455,6 @@ function renderToday() {
   h += `<div class="today-sec"><div class="today-sec-h">New mail to sort <span class="n">${pending}</span><span class="sp"></span>
       ${pending ? `<button class="eb-btn primary" data-on-click='{"f":"focusTriage"}'>Sort mail</button>` : ''}</div>
     <div class="today-empty">${pending ? `${pending} new email${pending === 1 ? '' : 's'} to add to the board or set aside.` : 'All sorted.'}</div></div>`;
-  h += sec('Overdue', overdue.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'Nothing is late.');
   el.innerHTML = h;
 }
 function focusTriage() {
@@ -8966,9 +9499,14 @@ function renderMailBanner() {
   const prov = m.provider || (APP_CONFIG && APP_CONFIG.mail && APP_CONFIG.mail.provider) || 'none';
   let msg = '';
   if (!prov || prov === 'none') msg = 'Mail not connected. Email Boss cannot see new mail yet.';
+  else if (prov === 'pa_folder' && (m.ok === false || m.error || m.stale)) {
+    msg = (m.folder_exists === false)
+      ? 'Mail not connected. Email Boss reads new mail from a folder that another program fills, and that folder cannot be found. Check the folder in Settings, or connect your mailbox directly instead.'
+      : 'No new mail is arriving. Email Boss reads new mail from a folder that another program fills, and nothing new has landed there for a while. Check that the program is still running, or connect your mailbox directly instead.';
+  }
   else if (m.ok === false || m.error) msg = 'Mail not connected right now' + (m.error ? ': ' + String(m.error).slice(0, 120) : '.');
   el.classList.toggle('show', !!msg);
-  el.innerHTML = msg ? `<span>${esc(msg)}</span><a data-on-click='{"f":"openSettings","a":["mail"]}'>Connect mail in Settings</a>` : '';
+  el.innerHTML = msg ? `<span>${esc(msg)}</span><a data-on-click='{"f":"openSettings","a":["mail"]}'>Open Settings &gt; Mail</a>` : '';
 }
 
 // ── keyboard: j/k move, a/n/h triage, e open, ? cheat sheet ────────────────
@@ -9020,6 +9558,8 @@ document.addEventListener('keydown', e => {
   }
   const ai = document.getElementById('ai-overlay');
   if (ai && ai.classList.contains('open')) { if (e.key === 'Escape') closeAiPanel(); return; }
+  const cv = document.getElementById('csv-overlay');
+  if (cv && cv.classList.contains('open')) { if (e.key === 'Escape') closeCsvImport(); return; }
   const kb = document.getElementById('kbd-overlay');
   if (kb && kb.classList.contains('open')) { if (e.key === 'Escape' || e.key === '?') kb.classList.remove('open'); return; }
   if (t && t.id === 'search' && _askMode && e.key === 'Enter') { e.preventDefault(); aiAsk(t.value); return; }

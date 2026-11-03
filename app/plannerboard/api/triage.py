@@ -127,40 +127,99 @@ def api_approve_triage(triage_id):
     return jsonify(result)
 
 
+def _default_work_type(profession: dict, card: dict, workflows: list) -> dict:
+    """The work type a create-new card lands as: the card's own suggestion,
+    else a sales-shaped type for a quote request, else the first type."""
+    wts = [w for w in (profession or {}).get("work_types") or [] if isinstance(w, dict) and w.get("id")]
+    sug = card.get("suggestion") if isinstance(card.get("suggestion"), dict) else {}
+    want = card.get("suggested_work_type") or sug.get("work_type") or ""
+    for w in wts:
+        if w["id"] == want:
+            return w
+    if card.get("is_quote_request") and wts:
+        sales = {wf.get("id") for wf in workflows or []
+                 if any((st or {}).get("role") in ("out", "won") for st in wf.get("stages") or [])}
+        for w in wts:
+            if w.get("workflow_id") in sales:
+                return w
+    return wts[0] if wts else {}
+
+
+def new_card_defaults(profession: dict, card: dict, workflows: list | None = None) -> dict:
+    """Name / location / work type for creating a new item from an unmatched
+    card: the suggestion's name, else the sender's display name."""
+    sug = card.get("suggestion") if isinstance(card.get("suggestion"), dict) else {}
+    name = (card.get("new_project_name") or sug.get("name") or card.get("from_name")
+            or (card.get("from_email") or "").split("@")[0] or card.get("subject") or "New").strip()
+    loc = (card.get("new_project_location") or sug.get("location") or sug.get("client") or "").strip()
+    wt = _default_work_type(profession, card, workflows or [])
+    return {"name": name[:120], "location": loc[:120], "work_type": wt.get("id"), "workflow_id": wt.get("workflow_id")}
+
+
 @bp.route("/api/triage/approve-all", methods=["POST"])
 def api_approve_all_triage():
     """Approve every pending card that already names an existing project.
-    Unmatched cards are skipped (never guessed). Body (optional): {ids: [...]}
-    limits the batch. Returns {ok, approved, skipped_unmatched, failed,
-    failures: [{id, error}], remaining}."""
+    Unmatched cards are skipped (never guessed) unless the body says
+    {create_new: true}: then each unmatched email card becomes a new item
+    named from its suggestion (or the sender's display name), with the
+    card's suggested work type. {new: {triage_id: {name, location,
+    work_type, workflow_id}}} overrides those per card. Body (optional):
+    {ids: [...]} limits the batch. Returns {ok, approved, created,
+    skipped_unmatched, failed, failures: [{id, error}], remaining}."""
     db = store()
     data = body()
     only = set(data.get("ids") or []) if isinstance(data.get("ids"), list) else None
+    create_new = bool(data.get("create_new"))
+    per_card = data.get("new") if isinstance(data.get("new"), dict) else {}
     r = rt()
-    approved = skipped = failed = 0
+    approved = created = skipped = failed = 0
     failures = []
+    prof = None
+    wfs = None
     for card in db.list_triage("pending"):
         tid = card.get("triage_id")
         if only is not None and tid not in only:
             continue
         pid = (card.get("matched_project") or "").strip()
+        is_new = False
+        kw = {}
         if not pid or not db.project_exists(pid):
-            skipped += 1
-            continue
+            if not create_new or (card.get("card_type") or "email") != "email":
+                skipped += 1
+                continue
+            if prof is None:
+                try:
+                    prof = r.profession() or {}
+                except Exception:
+                    prof = {}
+                try:
+                    wfs = (db.wf_doc() or {}).get("workflows") or []
+                except Exception:
+                    wfs = []
+            dflt = new_card_defaults(prof, card, wfs)
+            over = per_card.get(tid) if isinstance(per_card.get(tid), dict) else {}
+            dflt.update({k: v for k, v in over.items() if v not in (None, "") and k in dflt})
+            pid, is_new = "__new__", True
+            kw = {"new_name": dflt["name"], "new_location": dflt["location"],
+                  "work_type": dflt["work_type"], "workflow_id": dflt["workflow_id"]}
         try:
-            result = db.approve_triage(tid, pid, actor="user")
-            if isinstance(result, dict) and not result.get("already_approved"):
+            result = db.approve_triage(tid, pid, actor="user", **kw)
+            real = ((result or {}).get("project") or {}).get("id") if isinstance(result, dict) else None
+            if isinstance(result, dict) and not result.get("already_approved") and (real or not is_new):
                 try:
                     from ..triage.pipeline import after_approve
-                    after_approve(db, r.config.doc, r.profession(), db.get_triage_card(tid) or {}, pid)
+                    after_approve(db, r.config.doc, r.profession(), db.get_triage_card(tid) or {}, real or pid)
                 except Exception:
                     pass
-            approved += 1
+            if is_new:
+                created += 1
+            else:
+                approved += 1
         except Exception as e:
             failed += 1
             failures.append({"id": tid, "error": f"{type(e).__name__}: {e}"[:200]})
-    return jsonify({"ok": failed == 0, "approved": approved, "skipped_unmatched": skipped, "failed": failed,
-                    "failures": failures, "remaining": db.count_pending_triage()})
+    return jsonify({"ok": failed == 0, "approved": approved, "created": created, "skipped_unmatched": skipped,
+                    "failed": failed, "failures": failures, "remaining": db.count_pending_triage()})
 
 
 @bp.route("/api/triage/<triage_id>", methods=["DELETE"])

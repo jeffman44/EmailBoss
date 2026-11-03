@@ -3101,6 +3101,8 @@
     pointer-events: none;
   }
   .toast.show { opacity: 1; }
+  .toast.actionable { pointer-events: auto; display: flex; align-items: center; gap: 10px; }
+  .toast .toast-btn { padding: 3px 10px; }
 
   /* $/EMAIL STAT */
   .stat-email .num { color: var(--c-85b7eb); }
@@ -3261,6 +3263,8 @@
   .set-log { max-height: 260px; overflow-y: auto; border: 1px solid var(--line1); border-radius: 6px; background: var(--c-0d0d0f); font-family: 'JetBrains Mono', monospace; font-size: max(10px, var(--fs-min, 0px)); }
   .set-log-row { display: grid; grid-template-columns: 78px 92px 1fr 2fr; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--bg2); color: var(--t2); }
   .set-log-ts { color: var(--t3); }
+  .set-log-row.set-log-link { cursor: pointer; }
+  .set-log-row.set-log-link:hover { background: var(--bg2); }
   .set-log-outcome { text-transform: uppercase; font-weight: 600; }
   .set-log-outcome.o-acted, .set-log-outcome.o-drafted { color: var(--c-97dda5); }
   .set-log-outcome.o-question_posted, .set-log-outcome.o-subtask_added { color: var(--c-fac775); }
@@ -3336,7 +3340,7 @@
     font-size: max(11px, var(--fs-min, 0px)); padding: 4px 9px; cursor: pointer; white-space: nowrap;
   }
   .eb-hdr-btn:hover { border-color: var(--line4); color: var(--t0); }
-  .eb-hdr-btn .eb-badge { display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 5px; border-radius: 8px;
+  .eb-hdr-btn .eb-badge, .view-btn .eb-badge { display: inline-block; min-width: 16px; padding: 0 5px; margin-left: 5px; border-radius: 8px;
     background: var(--c-fac775); color: var(--bg0); font-weight: 600; text-align: center; }
   .eb-ask-toggle { font-size: max(10px, var(--fs-min, 0px)); }
   .eb-ask-toggle.active { border-color: var(--c-4fc3f7); color: var(--c-4fc3f7); }
@@ -3556,6 +3560,9 @@
   <div class="eb-modal" id="dec-modal" role="dialog" aria-modal="true" aria-label="Decisions for you"></div>
 </div>
 <!-- AI RESULT: draft / status / digest / ask answer, with Copy and Save as draft -->
+<div class="eb-overlay" id="csv-overlay" data-on-click='{"f":"closeCsvImport","g":"self"}'>
+  <div class="eb-modal" id="csv-modal" role="dialog" aria-modal="true" aria-label="Add many from a spreadsheet"></div>
+</div>
 <div class="eb-overlay" id="ai-overlay" data-on-click='{"f":"closeAiPanel","g":"self"}'>
   <div class="eb-modal" id="ai-modal" role="dialog" aria-modal="true" aria-label="Email Boss AI"></div>
 </div>
@@ -3569,7 +3576,7 @@
       <kbd>e</kbd><span>Open the selected item</span>
       <kbd>a</kbd><span>Add the selected mail to the board</span>
       <kbd>n</kbd><span>Not now (skip the selected mail)</span>
-      <kbd>h</kbd><span>Not work, hide the selected mail</span>
+      <kbd>h</kbd><span>Not for me: hide the selected mail</span>
       <kbd>/</kbd><span>Search</span>
       <kbd>?</kbd><span>Show this list</span>
       <kbd>Esc</kbd><span>Close</span>

@@ -69,9 +69,21 @@ def test_board_desktop_zero_console_errors(server, browser):
     # Today is the default view: the five sections, rows open the drawer
     assert page.evaluate("() => currentView") == "today"
     today = page.inner_text("#today-view")
-    for sec in ("Reply today", "Nudge today", "Decisions for you", "New mail to sort", "Overdue"):
+    for sec in ("Reply today", "Nudge today", "Coming up (7 days)", "Decisions for you", "New mail to sort", "Overdue"):
         assert sec in today, f"{sec!r} missing from Today"
     assert "Birch Dental Insurance renewal" in today and "1 day late" in today
+    # Overdue comes first; Coming up lists deadlines in the next 7 days
+    heads = page.evaluate("() => [...document.querySelectorAll('#today-view .today-sec-h')].map(e => e.firstChild.textContent.trim())")
+    assert heads[0] == "Overdue", heads
+    secs = page.evaluate("""() => Object.fromEntries([...document.querySelectorAll('#today-view .today-sec')].map(
+        s => [s.querySelector('.today-sec-h').firstChild.textContent.trim(), s.innerText]))""")
+    assert "Follow up on proposal" in secs["Overdue"]
+    assert "File the renewal" in secs["Coming up (7 days)"]
+    # Nudge today: follow-ups only, never the "Prepare and send..." work
+    assert "Call Lee about the kickoff" in secs["Nudge today"] and "Prepare and send" not in secs["Nudge today"]
+    # the reply clock runs on business hours: "Reply within N h" or, past it, Overdue
+    reply_txt = secs["Reply today"] + secs["Overdue"]
+    assert "Respond to Tom Nguyen" in reply_txt and ("Reply within" in reply_txt or "Reply overdue by" in reply_txt)
     assert page.inner_text("#brand") == "Email Boss" and "PLANNER" not in page.inner_text(".header").upper()
     assert page.inner_text("#decisions-badge") == "1"
     page.click("#today-view .today-row >> nth=0")
@@ -117,7 +129,7 @@ def test_board_desktop_zero_console_errors(server, browser):
     page.wait_for_timeout(600)
     assert "EMAIL ANALYTICS" in page.inner_text("#analytics-view")
     page.click("text=LIST")
-    for tab in ("general", "workflows", "mail", "ai", "license"):
+    for tab in ("general", "workflows", "mail", "ai", "privacy", "license"):
         page.evaluate(f"() => openSettings('{tab}')")
         page.wait_for_timeout(500)
         assert page.evaluate("() => document.getElementById('set-overlay').classList.contains('open')")
@@ -181,7 +193,14 @@ def test_setup_wizard_posts_expected_body(server, browser):
     page.fill("#email", "sam@example.com")
     page.evaluate("() => pickProvider('yahoo')")
     page.fill("#imap_password", "app-pass")
+    page.evaluate("() => step(1)")                  # not tested yet: Next explains and stays
+    assert "Paste your app password, then press Test" in page.inner_text("#err-you")
+    assert page.evaluate("() => STEPS[cur]") == "you"
+    page.click("#pw-block button:text-is(\"Test\")")
+    page.wait_for_timeout(500)
+    assert "Connected" in page.inner_text("#mailmsg")
     page.evaluate("() => step(1)")
+    assert page.evaluate("() => STEPS[cur]") == "work"
     page.evaluate("() => pickProfession('legal')")
     page.evaluate("() => step(1)")
     page.evaluate("() => { document.getElementById('ai_own').checked = true; aiModeChanged(); "
@@ -283,7 +302,7 @@ def test_mail_view_smoke(server, browser):
     page.click(".mail-actions button:text-is(\"File\")")
     page.wait_for_timeout(500)
     assert "Filed to" in page.inner_text("#mail-note")
-    page.click(".mail-actions button:text-is(\"Triage\")")
+    page.click(".mail-actions button:text-is(\"Add to board\")")
     page.wait_for_timeout(500)
     page.click(".mail-actions button:text-is(\"Archive\")")
     page.wait_for_timeout(500)
@@ -398,6 +417,8 @@ def test_board_13_today_decisions_ai_drafts(server, browser):
     page.keyboard.press("Enter")
     page.wait_for_timeout(600)
     assert "Found 1 match." in page.inner_text("#ai-modal") and "Acme Corp Website refresh" in page.inner_text("#ai-modal")
+    assert page.evaluate("() => [...document.querySelectorAll('#ai-modal .ai-item button')].map(b => b.textContent)") == ["Open"]
+    assert "Nothing matches" not in page.inner_text("#ai-modal")
     page.keyboard.press("Escape")
     page.click("#ask-toggle")
     page.fill("#search", "")
@@ -408,7 +429,7 @@ def test_board_13_today_decisions_ai_drafts(server, browser):
 
     # Triage relabels, leave reason, one quote control, Reply by, AI reply on the card
     tri = page.inner_text("#triage-content")
-    for t in ("Add to board", "Not now", "Not work, hide", "Write a reply", "No matching matter yet", "Needs a quote"):
+    for t in ("Add to board", "Not now", "Not for me", "Write a reply", "No matching matter yet", "Needs a proposal"):
         assert t.lower() in tri.lower(), f"{t!r} missing on triage cards"
     for old in ("APPROVE\n", "IGNORE\n", "$ QR"):
         assert old not in tri
@@ -427,17 +448,20 @@ def test_board_13_today_decisions_ai_drafts(server, browser):
     assert page.evaluate("() => document.getElementById('kbd-overlay').classList.contains('open')")
     page.keyboard.press("Escape")
 
-    # Not work, hide on a card matched to a live project asks first; Cancel only sets the mail aside
+    # Not for me on a card matched to a live project asks first; Cancel only sets the mail aside
     page.once("dialog", lambda d: (d.message.count("Birch Dental") >= 1) and d.dismiss())
     page.evaluate("() => ignoreTriage('tri_003')")
     page.wait_for_timeout(700)
     assert next(p for p in stub.PROJECTS if p["id"] == "proj_002")["status"] == "action_required"
 
-    # Add all: server counts in the toast, unmatched card left
+    # Add all: the unmatched card becomes a new item named from its suggestion
     page.evaluate("() => approveAllTriage()")
     page.wait_for_timeout(900)
-    assert "Added 1, 1 left for you" in page.inner_text("#toast")
-    assert [t["triage_id"] for t in stub.TRIAGE if t["status"] == "pending"] == ["tri_002"]
+    assert "Added 1, created 1 new" in page.inner_text("#toast")
+    assert [t["triage_id"] for t in stub.TRIAGE if t["status"] == "pending"] == []
+    aa = stub.app.last_approve_all
+    assert aa["create_new"] is True and aa["new"]["tri_002"]["name"] == "Annual service"
+    assert aa["new"]["tri_002"]["work_type"] == "deal"     # a quote request lands on the sales-shaped type
 
     # Display: large text + light theme persist through PUT /api/config
     page.evaluate("() => openSettings('display')")
@@ -478,9 +502,13 @@ def test_board_13_today_decisions_ai_drafts(server, browser):
     assert stub.app.last_overrides["business_hours"]["days"] == [0, 1, 2, 3, 4, 5, 6]
     assert stub.app.last_overrides["business_hours"]["end"] == 24
 
-    # Stage editor speaks plain roles
+    # Stage editor: basic mode first, plain roles behind Advanced
     page.evaluate("() => openSettings('workflows')")
     page.wait_for_timeout(500)
+    assert page.evaluate("() => document.querySelectorAll('#set-wf-body select').length") == 0
+    assert "Follow up after" in page.inner_text("#set-wf-body")
+    page.check("#wf-advanced")
+    page.wait_for_timeout(400)
     roles = page.evaluate("() => [...document.querySelectorAll('#set-wf-body option')].map(o => o.textContent)")
     assert "Waiting on someone" in roles and "Gone quiet" in roles
     page.evaluate("() => closeSettings()")
@@ -583,4 +611,157 @@ def test_reading_pane_body_prep_drops_active_and_css_tricks(server, browser):
         assert "color:green" in out.replace(" ", "") and "color:blue" in out.replace(" ", "")
     assert r["held"]["blocked"] >= 2 and 'data-pb-src="https://img.example/p.png"' in r["held"]["html"]
     assert 'src="data:image/png;base64,AAAA"' in r["loaded"]["html"] and r["loaded"]["blocked"] == 0
+    page.close()
+
+
+def test_board_round3_surfaces(server, browser, tmp_path):
+    """Round-3 fixes: Privacy tab, CSV import, Stages basic mode, drafts badge
+    and HTML drafts as text, drawer advanced details, cascade toasts, the
+    weekly summary row, plain helper log, AI outage wording, and the plain
+    header chip when the game layer is off."""
+    import copy
+    stub.app.unknown.clear()
+    fields_before = copy.deepcopy(stub.PROFESSION["fields"])
+    stub.DRAFTS.insert(0, {"id": "draft_html", "project_id": "proj_001", "to": "priya@acme.example", "cc": "",
+                           "subject": "Re: Lobby", "body": "<div>Hi Priya,</div><div>Photos are in.<br>Thanks</div>",
+                           "status": "draft", "created_by": "user", "created_at": stub.ts(-1)})
+    errors = []
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    _collect(page, errors)
+    page.goto(server + "/", wait_until="networkidle")
+    page.wait_for_timeout(1200)
+
+    # DRAFTS carries a count badge; an HTML body shows as text with its line breaks
+    n_drafts = len([d for d in stub.DRAFTS if d.get("status") == "draft"])
+    assert page.inner_text("#drafts-badge") == str(n_drafts)
+    page.evaluate("() => setView('drafts')")
+    page.wait_for_timeout(600)
+    pv = page.inner_text("#draft-draft_html .pv")
+    assert "<div>" not in pv and "Hi Priya," in pv and "Photos are in.\nThanks" in pv
+
+    # CSV import: the button sits next to the add button and posts multipart
+    page.evaluate("() => setView('list')")
+    page.wait_for_timeout(400)
+    assert page.is_visible("#csv-import-btn") and page.inner_text("#csv-import-btn") == "Add many from a spreadsheet"
+    page.click("#csv-import-btn")
+    page.wait_for_timeout(300)
+    assert "name, client, contact email, stage, due date, notes" in page.inner_text("#csv-modal")
+    with page.expect_download() as dl:
+        page.click("#csv-modal >> text=Download a sample")
+    sample = (tmp_path / "s.csv")
+    dl.value.save_as(str(sample))
+    assert sample.read_text().splitlines()[0] == "name,client,contact email,stage,due date,notes"
+    up = tmp_path / "up.csv"
+    up.write_text("name,client,contact email,stage,due date,notes\nRoof check,Acme,a@b.example,,,\n,No name,,,,\n")
+    page.set_input_files("#csv-file", str(up))
+    page.click("#csv-upload")
+    page.wait_for_timeout(600)
+    res = page.inner_text("#csv-modal")
+    assert "Added 1 matter" in res and "Skipped 0" in res and "Row 3: no name" in res
+    assert "Roof check" in stub.app.last_import
+    page.keyboard.press("Escape")
+
+    # drawer: advanced details hidden by default; plain labels
+    page.evaluate("() => openPanel('proj_001')")
+    page.wait_for_timeout(700)
+    body = page.inner_text("#panel-body")
+    assert "paste notes" in body.lower() and "dump" not in body.lower()
+    assert page.get_attribute("#panel-body .subtask-add-input[id^='subtask-input-']", "placeholder") == "Add a reminder or to-do"
+    assert page.evaluate("() => document.querySelectorAll('#panel-body .subtask-item .card-urgency').length") == 0
+    assert "Won" in body and "Lost" in body and "Mark lost" not in body
+    last = page.evaluate("() => [...document.querySelectorAll('#panel-body .panel-section')].find(s => /last activity/i.test(s.innerText)).querySelector('.panel-value').textContent")
+    assert not last.startswith("20") and "\u2014" not in last and "Called back about the scope" in last   # date formatted, words kept
+    # cascade: a quote amount that moves the stage says so
+    page.evaluate("() => { const p = DATA.projects.find(x => x.id === 'proj_001'); p.status = 'lead'; }")
+    stub.PROJECTS[0]["status"] = "lead"
+    page.evaluate("() => saveMoney('proj_001', 'quote_amount', '1200')")
+    page.wait_for_timeout(500)
+    assert "Status set to Proposal Sent" in page.inner_text("#toast")
+    stub.PROJECTS[0]["status"] = "proposal_sent"
+    page.evaluate("() => apiPut('proj_002', {key_details: {due_on: '2030-01-15'}})")
+    page.wait_for_timeout(900)
+    assert "Reminder set for" in page.inner_text("#toast")
+    # a work-order shaped workflow (no out / won stage) hides won/lost
+    page.keyboard.press("Escape")
+    page.evaluate("() => openPanel('proj_002')")
+    page.wait_for_timeout(600)
+    b2 = page.inner_text("#panel-body")
+    assert "Won" not in page.inner_text("#panel-body .eb-ai-row") and "Lost" not in page.inner_text("#panel-body .eb-ai-row")
+    page.evaluate("() => setDisplay('advanced_details', true)")
+    page.wait_for_timeout(500)
+    assert page.evaluate("() => document.querySelectorAll('#panel-body .subtask-item .card-urgency').length") > 0
+    page.evaluate("() => setDisplay('advanced_details', false)")
+    page.wait_for_timeout(300)
+    page.evaluate("() => closePanel()")
+
+    # Privacy tab: data folder, what leaves, Turn AI off
+    page.evaluate("() => openSettings('privacy')")
+    page.wait_for_timeout(400)
+    priv = page.text_content("#set-body")
+    for t in ("/tmp/pb", "What leaves this computer", "machine fingerprint", "What never leaves", "Turn AI off"):
+        assert t in priv, t
+    page.click("#privacy-ai-off")
+    page.wait_for_timeout(500)
+    assert stub.CONFIG["ai"]["provider"] == "none"
+    stub.CONFIG["ai"]["provider"] = "anthropic"
+    page.evaluate("() => { HEALTH.ai.provider = 'anthropic'; }")
+
+    # Settings > AI > Helper: weekly summary row; log reasons in plain words, rows open the project
+    page.evaluate("() => openSettings('ai')")
+    page.wait_for_timeout(700)
+    assert "Weekly summary: Monday 7:00" in page.inner_text("#set-body")
+    page.click("#set-digest-change")
+    page.wait_for_timeout(200)
+    page.select_option("#set-digest-day", "2")
+    page.select_option("#set-digest-hour", "9")
+    page.click("#set-digest-save")
+    page.wait_for_timeout(500)
+    assert stub.CONFIG["assistant"]["digest_weekday"] == 2 and stub.CONFIG["assistant"]["digest_hour"] == 9
+    assert "Weekly summary: Wednesday 9:00" in page.inner_text("#set-body")
+    log = page.inner_text(".set-log")
+    assert "needs_human" not in log and "This needs your decision." in log
+    page.click(".set-log-row.set-log-link >> nth=0")
+    page.wait_for_timeout(600)
+    assert page.evaluate("() => document.getElementById('detail-panel').classList.contains('open')")
+    page.evaluate("() => closePanel()")
+
+    # AI on but the service fails: an outage, not "turn on"
+    page.evaluate("""() => { const orig = window.fetch; window.__of = orig; window.fetch = (u, o) => String(u).includes('/api/ai/draft-follow-up')
+        ? Promise.resolve(new Response(JSON.stringify({ok: false, error: 'AI provider is offline'}), {status: 503})) : orig(u, o); }""")
+    page.evaluate("() => aiFollowUp('proj_001')")
+    page.wait_for_timeout(600)
+    assert "Email Boss AI can't be reached right now. Try again in a minute." in page.inner_text("#ai-modal")
+    page.evaluate("() => { window.fetch = window.__of; closeAiPanel(); }")
+
+    # Stages basic mode: name, order, follow-up days only
+    page.evaluate("() => openSettings('workflows')")
+    page.wait_for_timeout(500)
+    wf = page.inner_text("#set-wf-body")
+    assert "Follow up after" in wf and "won moves" not in wf and "done, go to" not in wf
+    assert page.evaluate("() => document.querySelectorAll('#set-wf-body select').length") == 0
+
+    # Fields: built-in fields can be renamed and hidden through overrides.fields
+    page.evaluate("() => openSettings('fields')")
+    page.wait_for_timeout(300)
+    page.fill(".cf-row[data-key='reference_no'] .cf-name", "Case #")
+    page.press(".cf-row[data-key='reference_no'] .cf-name", "Tab")
+    page.wait_for_timeout(600)
+    assert next(f for f in stub.app.last_overrides["fields"] if f["key"] == "reference_no")["label"] == "Case #"
+    page.uncheck(".cf-row[data-key='portal_url'] .cf-show")
+    page.wait_for_timeout(600)
+    assert next(f for f in stub.app.last_overrides["fields"] if f["key"] == "portal_url")["hidden"] is True
+    page.evaluate("() => closeSettings()")
+
+    # game layer off: one plain "Needs attention" chip, no jargon
+    page.evaluate("""() => { PROF.features.game_layer = false; HEALTH.mail.ok = false; HEALTH.watchers_down = ['triage_loop'];
+        window.fetch = ((orig) => (u, o) => String(u).startsWith('/api/health') ? Promise.resolve(new Response(JSON.stringify(HEALTH))) : orig(u, o))(window.fetch); }""")
+    page.evaluate("() => loadHealthBadges()")
+    page.wait_for_timeout(400)
+    chips = page.inner_text("#health-badges")
+    assert "Needs attention" in chips and "WATCHER" not in chips and "MAIL DOWN" not in chips and "LICENSE" not in chips
+
+    stub.PROFESSION["fields"] = fields_before
+    stub.DRAFTS[:] = [d for d in stub.DRAFTS if d["id"] != "draft_html"]
+    assert errors == [], "\n".join(errors)
+    assert stub.app.unknown == [], f"page hit endpoints the stub does not define: {stub.app.unknown}"
     page.close()
