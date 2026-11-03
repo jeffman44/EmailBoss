@@ -2,7 +2,7 @@
   "id": "real_estate",
   "label": "Real Estate Agent",
   "description": "Seller listings and buyer clients from lead response through contract and closing.",
-  "icon": "🏠",
+  "icon": "\ud83c\udfe0",
   "entity": {
     "project": "Deal",
     "projects": "Deals",
@@ -58,7 +58,8 @@
       ],
       "searchable": false,
       "group": "Details",
-      "source": "key_details"
+      "source": "key_details",
+      "reminder": true
     },
     {
       "key": "showing_date",
@@ -70,7 +71,8 @@
       ],
       "searchable": false,
       "group": "Details",
-      "source": "key_details"
+      "source": "key_details",
+      "reminder": true
     },
     {
       "key": "lender",
@@ -247,7 +249,7 @@
       {
         "id": "listing",
         "label": "Listing",
-        "icon": "🏠",
+        "icon": "\ud83c\udfe0",
         "color": "#f0b429",
         "stages": [
           {
@@ -360,7 +362,7 @@
       {
         "id": "buyer",
         "label": "Buyer",
-        "icon": "🔑",
+        "icon": "\ud83d\udd11",
         "color": "#4fc3f7",
         "stages": [
           {
@@ -443,7 +445,7 @@
       {
         "id": "general",
         "label": "General Task",
-        "icon": "📋",
+        "icon": "\ud83d\udccb",
         "color": "#a0a0a0",
         "stages": [
           {

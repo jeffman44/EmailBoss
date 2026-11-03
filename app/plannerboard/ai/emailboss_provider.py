@@ -84,14 +84,20 @@ class EmailBossProvider:
                 data = {}
             return e.code, data if isinstance(data, dict) else {}
 
-    def _auth(self, path: str = "/v1/ai/complete") -> dict:
-        """Identity plus, when the license client offers it, a proof of
-        possession (HMAC over lid|fingerprint|ts|path with the device secret)."""
+    def _auth(self, path: str = "/v1/ai/complete", extra: dict | None = None) -> dict:
+        """Identity plus ``extra`` (the rest of the request body) plus, when
+        the license client offers it, a proof of possession bound to the path,
+        a nonce and the hash of the whole body. Everything in the returned
+        dict is sent as is."""
         c = self.creds()
-        out = {"lid": c["lid"], "fingerprint": c["fingerprint"], "activation": c["activation"]}
+        out = {"lid": c["lid"], "fingerprint": c["fingerprint"], "activation": c["activation"], **(extra or {})}
         if c.get("sign"):
             try:
-                out.update(c["sign"](path) or {})
+                try:
+                    proof = c["sign"](path, dict(out))
+                except TypeError:   # a signer that only takes the path
+                    proof = c["sign"](path)
+                out.update(proof or {})
             except Exception:  # noqa: BLE001
                 pass
         return out
@@ -115,7 +121,7 @@ class EmailBossProvider:
         if not self.available():
             return "", "license not active"
         try:
-            code, data = self._post("/v1/ai/checkout", {**self._auth("/v1/ai/checkout"), "pack": pack}, timeout=20)
+            code, data = self._post("/v1/ai/checkout", self._auth("/v1/ai/checkout", {"pack": pack}), timeout=20)
         except (URLError, OSError, socket.timeout, TimeoutError) as e:
             return "", f"{ERR_NETWORK}: {getattr(e, 'reason', e)}"
         if code == 200 and data.get("url"):
@@ -131,10 +137,11 @@ class EmailBossProvider:
         if not self.available():
             self.last_error_code = ERR_LICENSE
             return LLMResult.failure(f"{ERR_LICENSE}: Email Boss AI needs an active license", model=label)
-        body = {**self._auth("/v1/ai/complete"), "task": task or "", "tier": tier, "system": system or "",
-                "user": user, "max_tokens": int(max_tokens), "temperature": float(temperature)}
+        extra = {"task": task or "", "tier": tier, "system": system or "",
+                 "user": user, "max_tokens": int(max_tokens), "temperature": float(temperature)}
         if json_schema:
-            body["json_schema"] = json_schema
+            extra["json_schema"] = json_schema
+        body = self._auth("/v1/ai/complete", extra)
         t0 = time.monotonic()
         try:
             code, data = self._post("/v1/ai/complete", body)

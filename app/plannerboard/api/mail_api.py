@@ -117,16 +117,52 @@ def api_mail_status():
     if runner is not None and getattr(runner, "threads", None):
         out = runner.health_summary()
         out["ok"] = bool(out.get("ok"))
-        return jsonify({"ok": True, **out})
+        prov_id = (cfg.get("mail") or {}).get("provider") or out.get("provider") or "none"
+        cred = _credential_check(prov_id, cfg)
+        if cred:
+            out.update(cred)
+        return jsonify({**out, "ok": out["ok"]} if cred else {"ok": True, **out})
     provider = (cfg.get("mail") or {}).get("provider") or "none"
     if provider == "none":
         return jsonify({"ok": True, "provider": "none", "last_fetch": None, "error": None, "providers": {}})
     try:
         prov = _build(cfg, provider, None)
         h = prov.health()
+        h.update(_credential_check(provider, cfg))
     except Exception as e:
         h = {"provider": provider, "ok": False, "error": f"{type(e).__name__}: {e}"}
     return jsonify({"ok": True, **h, "provider": provider, "thread": "not started"})
+
+
+def _credential_check(provider: str, cfg: dict) -> dict:
+    """"ok" must not read true when no credential was ever saved (the wizard
+    can be finished without one). Plain-language error for the banner."""
+    try:
+        from ..mail import secrets as _sec
+    except Exception:
+        return {}
+    mcfg = (cfg.get("mail") or {})
+    if provider == "imap":
+        st = mcfg.get("imap") or {}
+        if (st.get("auth_mode") or "password") == "password":
+            pw, _ = _sec.get_secret("imap_password", account=st.get("user"))
+            if not pw:
+                pw, _ = _sec.get_secret("imap_password")
+            if not pw:
+                return {"ok": False, "error": "No app password saved yet. Open Settings > Mail and paste it."}
+        else:
+            tok, _ = _sec.get_secret("imap_oauth_token", account=st.get("user"))
+            if not tok:
+                return {"ok": False, "error": "Not signed in yet. Open Settings > Mail and sign in."}
+    elif provider in ("gmail", "graph"):
+        try:
+            from ..mail.oauth import TokenCache
+            doc = TokenCache(f"{provider}_token").load() or {}
+        except Exception:
+            doc = {}
+        if not doc.get("refresh_token") and not doc.get("access_token"):
+            return {"ok": False, "error": "Not signed in yet. Open Settings > Mail and sign in."}
+    return {}
 
 
 @bp.route("/api/mail/run", methods=["POST"])

@@ -121,11 +121,14 @@ def _issued(app, email="dev@example.test", plan="solo", seats=2):
     return issue_license(app, acct, plan, seats=seats)
 
 
-def _dproof(secret, lid, fp, path, ts=None):
-    import time
-    from licserver.licenses import compute_proof, secret_hash
-    ts = int(time.time()) if ts is None else ts
-    return {"ts": ts, "proof": compute_proof(secret_hash(secret), lid, fp, ts, path)}
+def _dproof(secret, lid, fp, path, body=None, ts=None, nonce=None):
+    """The full request body (lid, fingerprint, + extras) with ts, nonce and proof."""
+    from tests.conftest import sign_body
+    d = dict(body or {})
+    d.setdefault("fingerprint", fp)
+    if path != "/v1/activate":
+        d.setdefault("lid", lid)
+    return sign_body(secret, lid, fp, path, d, ts=ts, nonce=nonce)
 
 
 def test_activate_heartbeat_seat_limit_deactivate(client, app):
@@ -143,10 +146,17 @@ def test_activate_heartbeat_seat_limit_deactivate(client, app):
     row = app.state.db.get_activation(lic["lid"], FP1)
     assert row["secret_hash"] and body["device_secret"] not in json.dumps(row)
 
-    # same device again: idempotent, no new seat (and a fresh secret)
+    # same device again with only the key: refused, the seat is bound to its device
     r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1})
-    assert r.status_code == 200
-    s1 = r.json()["device_secret"]
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "device_bound"
+    assert client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1,
+                                              **_dproof(body["device_secret"], lic["lid"], FP1, "/v1/heartbeat")}
+                       ).status_code == 200                       # the victim's secret still works
+    # with the device's own proof: idempotent, no new seat, secret kept
+    r = client.post("/v1/activate", json=_dproof(body["device_secret"], lic["lid"], FP1, "/v1/activate",
+                                                 {"key": lic["key"]}))
+    assert r.status_code == 200 and "device_secret" not in r.json()
+    s1 = body["device_secret"]
     # second device fills the license
     r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP2})
     assert r.status_code == 200
@@ -158,14 +168,12 @@ def test_activate_heartbeat_seat_limit_deactivate(client, app):
     # heartbeat refreshes the activation for a known device
     r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1, "app_version": "1.0.1"})
     assert r.status_code == 403 and r.json()["detail"]["code"] == "proof_invalid"     # no proof
-    r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1,
-                                           **_dproof(body["device_secret"], lic["lid"], FP1, "/v1/heartbeat")})
-    assert r.status_code == 403                                                        # rotated secret
-    r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1, "key": lic["key"],
-                                           **_dproof(s1, lic["lid"], FP1, "/v1/deactivate")})
+    r = client.post("/v1/heartbeat", json=_dproof(s1, lic["lid"], FP1, "/v1/heartbeat",
+                                                  {"key": lic["key"]}, nonce="short"))
+    assert r.status_code == 403                                                        # nonce too short
+    r = client.post("/v1/heartbeat", json=_dproof(s1, lic["lid"], FP1, "/v1/deactivate", {"key": lic["key"]}))
     assert r.status_code == 403                                                        # wrong path; key is not a bypass
-    r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1, "app_version": "1.0.1",
-                                           **_dproof(s1, lic["lid"], FP1, "/v1/heartbeat")})
+    r = client.post("/v1/heartbeat", json=_dproof(s1, lic["lid"], FP1, "/v1/heartbeat", {"app_version": "1.0.1"}))
     assert r.status_code == 200 and verify_token(r.json()["activation"], app.state.signer.public_key)["fingerprint"] == FP1
     assert "device_secret" not in r.json()
     # heartbeat from an unknown device is refused
@@ -174,8 +182,7 @@ def test_activate_heartbeat_seat_limit_deactivate(client, app):
 
     # release a seat, third device gets in
     assert client.post("/v1/deactivate", json={"lid": lic["lid"], "fingerprint": FP2}).status_code == 403
-    r = client.post("/v1/deactivate", json={"lid": lic["lid"], "fingerprint": FP2,
-                                            **_dproof(s2, lic["lid"], FP2, "/v1/deactivate")})
+    r = client.post("/v1/deactivate", json=_dproof(s2, lic["lid"], FP2, "/v1/deactivate"))
     assert r.status_code == 200 and r.json()["released"] is True
     assert client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP3}).status_code == 200
     r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP2})
@@ -280,11 +287,11 @@ def test_seat_claim_is_atomic_under_concurrency(app):
     [t.join() for t in ts]
     assert results.count(200) == 2 and results.count(409) == 10, results
     assert len(app.state.db.active_activations(lic["lid"])) == 2
-    # a device that already holds a seat re-activates fine even when full
+    # a device that already holds a seat is bound: bare re-activation is refused even when full
     c = TestClient(app)
     winner = [fp for fp in (chr(97 + i) * 64 for i in range(12))
               if app.state.db.get_activation(lic["lid"], fp) and not app.state.db.get_activation(lic["lid"], fp)["revoked"]][0]
-    assert c.post("/v1/activate", json={"key": lic["key"], "fingerprint": winner}).status_code == 200
+    assert c.post("/v1/activate", json={"key": lic["key"], "fingerprint": winner}).status_code == 409
 
 
 def test_activation_carries_expires_and_renewal_reaches_old_key(client, app):
@@ -297,10 +304,9 @@ def test_activation_carries_expires_and_renewal_reaches_old_key(client, app):
     assert newer > lic["expires"]
     # heartbeat (and activate with the OLD key string) both carry the renewed expiry
     sec = r.json()["device_secret"]
-    r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1,
-                                           **_dproof(sec, lic["lid"], FP1, "/v1/heartbeat")})
+    r = client.post("/v1/heartbeat", json=_dproof(sec, lic["lid"], FP1, "/v1/heartbeat"))
     assert r.status_code == 200 and r.json()["payload"]["expires"] == newer
-    r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1})
+    r = client.post("/v1/activate", json=_dproof(sec, lic["lid"], FP1, "/v1/activate", {"key": lic["key"]}))
     assert r.status_code == 200 and r.json()["payload"]["expires"] == newer
     act = verify_token(r.json()["activation"], app.state.signer.public_key)
     assert act["expires"] == newer
@@ -383,8 +389,7 @@ def test_legacy_activation_upgrades_once_with_key(client, app):
     sec = r.json()["device_secret"]
     # upgraded: key-only no longer works, proof does
     assert client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1, "key": lic["key"]}).status_code == 403
-    r = client.post("/v1/heartbeat", json={"lid": lic["lid"], "fingerprint": FP1,
-                                           **_dproof(sec, lic["lid"], FP1, "/v1/heartbeat")})
+    r = client.post("/v1/heartbeat", json=_dproof(sec, lic["lid"], FP1, "/v1/heartbeat"))
     assert r.status_code == 200
 
 
@@ -438,3 +443,63 @@ def test_password_reset_verifies_and_promotes(client, portal, app):
     token = app.state.db.create_reset(acct["id"])
     portal.post(f"/reset/{token}", password="newpassword123", password2="newpassword123")
     assert app.state.db.get_account(acct["id"])["is_admin"] == 1
+
+
+def test_bare_activate_cannot_rebind_a_bound_device(client, app):
+    lic = _issued(app, email="bound@example.test", seats=2)
+    r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1})
+    sec = r.json()["device_secret"]
+    r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1})
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "device_bound"
+    # a wrong proof is refused too, and the real secret is untouched
+    bad = _dproof("0" * 64, lic["lid"], FP1, "/v1/activate", {"key": lic["key"]})
+    assert client.post("/v1/activate", json=bad).status_code == 403
+    assert client.post("/v1/heartbeat", json=_dproof(sec, lic["lid"], FP1, "/v1/heartbeat")).status_code == 200
+    # a proof for another path cannot be used to re-activate
+    assert client.post("/v1/activate", json=_dproof(sec, lic["lid"], FP1, "/v1/heartbeat",
+                                                    {"key": lic["key"]})).status_code == 403
+    # after a portal release the device can activate again and gets a new secret
+    app.state.db.revoke_activation(lic["lid"], FP1)
+    r = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1})
+    assert r.status_code == 200 and r.json()["device_secret"] != sec
+
+
+def test_proof_nonce_is_single_use_and_body_bound(client, app):
+    lic = _issued(app, email="nonce@example.test")
+    sec = client.post("/v1/activate", json={"key": lic["key"], "fingerprint": FP1}).json()["device_secret"]
+    hb = _dproof(sec, lic["lid"], FP1, "/v1/heartbeat", {"app_version": "1"})
+    assert client.post("/v1/heartbeat", json=hb).status_code == 200
+    assert client.post("/v1/heartbeat", json=hb).status_code == 403            # replay
+    other = dict(_dproof(sec, lic["lid"], FP1, "/v1/heartbeat", {"app_version": "1"}), app_version="2")
+    assert client.post("/v1/heartbeat", json=other).status_code == 403         # body changed after signing
+    stale = _dproof(sec, lic["lid"], FP1, "/v1/heartbeat", ts=int(__import__("time").time()) - 301)
+    assert client.post("/v1/heartbeat", json=stale).status_code == 403
+    # a captured deactivate proof cannot be replayed to release the seat twice
+    d = _dproof(sec, lic["lid"], FP1, "/v1/deactivate")
+    assert client.post("/v1/deactivate", json=d).status_code == 200
+    assert client.post("/v1/deactivate", json=d).status_code in (200, 403)
+
+
+def test_webhook_claim_released_when_the_mailer_fails(client, app):
+    event = {"id": "evt_mailfail", "type": "checkout.session.completed",
+             "data": {"object": {"id": "cs_1", "customer_details": {"email": "retry@example.test"},
+                                 "subscription": "sub_retry", "metadata": {"plan": "solo"}}}}
+    raw = json.dumps(event).encode()
+    hdr = lambda: {"stripe-signature": sign_for_test(raw, "whsec_test"), "content-type": "application/json"}
+    orig = mailer.SENDER
+    def boom(to, subject, body):
+        raise RuntimeError("smtp down")
+    mailer.SENDER = boom
+    try:
+        from starlette.testclient import TestClient
+        r = TestClient(app, raise_server_exceptions=False).post("/webhooks/stripe", content=raw, headers=hdr())
+    finally:
+        mailer.SENDER = orig
+    assert r.status_code == 500
+    lic = app.state.db.get_license_by_stripe_sub("sub_retry")
+    assert lic is not None                                     # issued before the mail step
+    r = client.post("/webhooks/stripe", content=raw, headers=hdr())     # Stripe retries
+    assert r.status_code == 200 and r.json()["issued"] == lic["lid"]    # same license, not a second one
+    assert any(m["to"] == "retry@example.test" and lic["key"] in m["body"] for m in mailer.SENT)
+    assert len([l for l in app.state.db.list_licenses() if l["stripe_sub_id"] == "sub_retry"]) == 1
+    assert client.post("/webhooks/stripe", content=raw, headers=hdr()).json()["ignored"] == "duplicate event"

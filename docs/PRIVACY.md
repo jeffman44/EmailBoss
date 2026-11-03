@@ -19,7 +19,12 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
 Secrets (mailbox password, OAuth tokens, AI API key) are stored in the
 operating system keyring (Windows Credential Manager, macOS Keychain, Secret
 Service on Linux) under service `EmailBoss`. They are never written to
-the config file, the database or the logs.
+the config file, the database or the logs. The one exception is the license:
+your license key and the per-device license secret are kept in the app's
+`app_meta` table inside `plannerboard.db` (they are not mailbox or vendor
+credentials, and the secret only proves this device to the license server).
+Deleting the data root removes them; deactivating the device in the
+portal invalidates them.
 
 The web UI is served on `127.0.0.1` only. If you change `server.bind`, every
 API request needs the bearer token the app generates, and you are responsible

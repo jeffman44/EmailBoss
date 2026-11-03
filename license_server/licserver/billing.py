@@ -95,12 +95,27 @@ def _handle_ai_credits(app, session: dict) -> dict:
 
 
 def handle_event(app, event: dict) -> dict:
-    db, settings = app.state.db, app.state.settings
+    """Claim the event id (so a concurrent duplicate is ignored), process it,
+    and RELEASE the claim if processing raises, so Stripe's retry runs again
+    instead of being swallowed as a duplicate (a mailer outage must not lose a
+    license). Processing is idempotent per subscription / session id."""
+    db = app.state.db
     etype = event.get("type", "")
-    obj = (event.get("data") or {}).get("object") or {}
-    db.audit("stripe.event", actor="stripe", target=event.get("id", ""), detail={"type": etype})
-    if not db.claim_webhook_event(str(event.get("id") or ""), etype):
+    eid = str(event.get("id") or "")
+    db.audit("stripe.event", actor="stripe", target=eid, detail={"type": etype})
+    if not db.claim_webhook_event(eid, etype):
         return {"ok": True, "ignored": "duplicate event"}
+    try:
+        return _process_event(app, event, etype)
+    except Exception:
+        db.release_webhook_event(eid)
+        log.exception("stripe event %s (%s) failed; claim released for retry", eid, etype)
+        raise
+
+
+def _process_event(app, event: dict, etype: str) -> dict:
+    db, settings = app.state.db, app.state.settings
+    obj = (event.get("data") or {}).get("object") or {}
 
     if etype == "checkout.session.completed" and (obj.get("metadata") or {}).get("kind") == "ai_credits":
         return _handle_ai_credits(app, obj)
@@ -115,7 +130,12 @@ def handle_event(app, event: dict) -> dict:
             acct, temp = create_account(app, email, actor="stripe")
         plan, seats = _plan_for(obj, settings.stripe_plan_map)
         sub_id = obj.get("subscription") if isinstance(obj.get("subscription"), str) else None
-        lic = issue_license(app, acct, plan, seats=seats, stripe_sub_id=sub_id, actor="stripe")
+        # Idempotent across a retried event: reuse the license this subscription
+        # (or, for a one-time payment, this checkout session) already got.
+        ref = sub_id or (str(obj.get("id")) if obj.get("id") else None)
+        lic = db.get_license_by_stripe_sub(ref) if ref else None
+        if not lic:
+            lic = issue_license(app, acct, plan, seats=seats, stripe_sub_id=ref, actor="stripe")
         if temp:
             mailer.send_welcome(email, settings.product_name, settings.base_url, temp_password=temp)
         mailer.send_license_key(email, settings.product_name, plan, lic["key"], settings.base_url)

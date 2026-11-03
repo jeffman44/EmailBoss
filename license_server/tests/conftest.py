@@ -72,3 +72,16 @@ class Portal:
 @pytest.fixture
 def portal(client):
     return Portal(client)
+
+
+def sign_body(secret: str, lid: str, fingerprint: str, path: str, body: dict, *, ts=None, nonce=None) -> dict:
+    """Return ``body`` plus ts, nonce and a device proof bound to path and body."""
+    import secrets as _secrets
+    import time as _time
+    from licserver.licenses import body_sha256, compute_proof, secret_hash
+    ts = int(_time.time()) if ts is None else ts
+    nonce = nonce or _secrets.token_hex(8)
+    out = {k: v for k, v in body.items() if k not in ("ts", "nonce", "proof")}
+    out.update(ts=ts, nonce=nonce,
+               proof=compute_proof(secret_hash(secret), lid, fingerprint, ts, path, nonce, body_sha256(out)))
+    return out

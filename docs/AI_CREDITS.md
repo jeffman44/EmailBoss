@@ -19,8 +19,8 @@ changes: same prompt registry, same guards, same drafts-only rules.
   `AI_MIN_CREDITS_PER_CALL` (default 1). `AI_MARKUP` default 4.0, i.e. a
   Sonnet triage call that costs the vendor ~0.4 cents charges 2 credits.
   Haiku-tier calls are usually the 1-credit minimum. The markup is the margin.
-- `AI_TRIAL_CREDITS` (default 300) are granted when a license is first
-  activated. Admins can grant credits from the portal.
+- `AI_TRIAL_CREDITS` (default 300) are granted once per account, when the
+  account's email is confirmed (never by `/v1/trial` itself). Admins can grant credits from the portal.
 - The wallet can't go negative: a call is refused with 402 `no_credits` when
   the balance is below the reserve for the requested `max_tokens`; the app
   turns that into a "Buy AI credits" prompt and falls back to rules.
@@ -44,10 +44,14 @@ Endpoints (`/v1/ai/*`, device API, no portal session):
   (`AI_MODEL_FAST`, `AI_MODEL_SMART`); the app never names a vendor model.
   Response `{ok, text, parsed, input_tokens, output_tokens, credits_charged,
   balance, model_tier, latency_ms}` or `{ok:false, error, code}` with
-  402 `no_credits`, 403 `license`, 429 `rate_limited`, 502 `vendor`.
+  402 `no_credits`, 403 `license`, 413 `input_too_large` / `schema_too_large`
+  (`json_schema` is capped at 8 KB and counts toward the input cap and the
+  hold; non-ASCII text is estimated at 1 token per character), 429
+  `rate_limited` / `daily_cap` (holds still in flight count toward the cap),
+  502 `vendor`.
   Prompt and completion text are NEVER stored or logged; the ledger holds
   metadata only.
-- `GET /v1/ai/balance?lid=&fingerprint=&activation=` -> `{balance, trial_granted,
+- `GET /v1/ai/balance?lid=&fingerprint=&activation=` -> `{balance, trial_granted, pending_verification,
   packs:[{id,label,credits,usd_cents}], checkout_url_base}`.
 - `POST /v1/ai/checkout {lid, fingerprint, activation, pack}` -> Stripe
   Checkout session URL (`mode=payment`, `metadata.lid`, `metadata.credits`).

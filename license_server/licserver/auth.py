@@ -94,6 +94,14 @@ def mark_email_verified(app, aid: str) -> dict:
     db = app.state.db
     db.mark_verified(aid)
     db.audit("account.verified", actor=aid, target=aid)
+    # AI trial credits are funded by a confirmed inbox, never earlier (once
+    # per account; ensure_wallet enforces that).
+    credits = app.state.settings.ai_trial_credits
+    if credits > 0:
+        for lic in db.licenses_for_account(aid):
+            if not lic["revoked"]:
+                db.ensure_wallet(lic["lid"], credits, grant_trial=True)
+                break
     return promote_if_listed(app, db.get_account(aid))
 
 

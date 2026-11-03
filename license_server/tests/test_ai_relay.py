@@ -51,16 +51,19 @@ def lic(ai):
     return row
 
 
-def signed(lic, path, fp=FP, ts=None):
-    import time
-    ts = int(time.time()) if ts is None else ts
-    return {"ts": ts, "proof": compute_proof(secret_hash(lic["device_secret"]), lic["lid"], fp, ts, path)}
+def signed(lic, path, body, fp=FP, ts=None, secret=None, nonce=None):
+    """``body`` plus ts, nonce and the proof bound to path and body."""
+    try:
+        from tests.conftest import sign_body
+    except ImportError:  # imported as a top-level module
+        from conftest import sign_body
+    return sign_body(secret or lic["device_secret"], lic["lid"], fp, path, body, ts=ts, nonce=nonce)
 
 
 def auth_body(app, lic, path, **kw):
-    d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic), **signed(lic, path)}
+    d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic)}
     d.update(kw)
-    return d
+    return signed(lic, path, d)
 
 
 def act_token(app, lic, fp=FP):
@@ -69,10 +72,9 @@ def act_token(app, lic, fp=FP):
 
 def body(app, lic, **kw):
     d = {"lid": lic["lid"], "fingerprint": FP, "activation": act_token(app, lic), "task": "triage.classify",
-         "tier": "smart", "system": "sys", "user": PROMPT, "max_tokens": 500, "temperature": 0.2,
-         **signed(lic, "/v1/ai/complete")}
+         "tier": "smart", "system": "sys", "user": PROMPT, "max_tokens": 500, "temperature": 0.2}
     d.update(kw)
-    return d
+    return signed(lic, "/v1/ai/complete", d)
 
 
 def test_happy_path_and_trial_granted_once(client, ai, lic):
@@ -317,13 +319,13 @@ def test_proof_required(client, ai, lic, case):
     import time
     b = body(ai, lic)
     if case == "missing":
-        b.pop("proof"); b.pop("ts")
+        b.pop("proof"); b.pop("ts"); b.pop("nonce")
     elif case == "stale":
-        b.update(signed(lic, "/v1/ai/complete", ts=int(time.time()) - 301))
+        b = signed(lic, "/v1/ai/complete", b, ts=int(time.time()) - 301)
     elif case == "wrong_path":
-        b.update(signed(lic, "/v1/ai/balance"))
+        b = signed(lic, "/v1/ai/balance", b)
     elif case == "wrong_secret":
-        b.update(signed(dict(lic, device_secret="0" * 64), "/v1/ai/complete"))
+        b = signed(lic, "/v1/ai/complete", b, secret="0" * 64)
     elif case == "no_secret":
         ai.state.db.set_activation_secret(lic["lid"], FP, "")
     r = client.post("/v1/ai/complete", json=b)
@@ -379,7 +381,116 @@ def test_trial_credits_once_per_account(client, ai):
     l1, l2 = issue_license(ai, verified, "solo"), issue_license(ai, verified, "solo")
     assert db.ensure_wallet(l1["lid"], s.ai_trial_credits)["balance"] == 300
     assert db.ensure_wallet(l2["lid"], s.ai_trial_credits)["balance"] == 0      # second license, same account
-    # the in-app trial path funds the wallet without verification, still once
+    # the in-app trial path funds nothing until the email is confirmed
     r = client.post("/v1/trial", json={"email": "t@example.test", "fingerprint": "c" * 64})
-    assert r.status_code == 200 and len(r.json()["device_secret"]) == 64
-    assert db.get_wallet(r.json()["license"]["lid"])["balance"] == 300
+    assert r.status_code == 200 and len(r.json()["device_secret"]) == 64 and "key" not in r.json()
+    assert (db.get_wallet(r.json()["license"]["lid"]) or {"balance": 0})["balance"] == 0
+
+
+# ------------------------------------------------------------------ pass 2 hardening
+
+def test_nonce_replay_and_body_binding(client, ai, lic):
+    b = body(ai, lic)
+    assert client.post("/v1/ai/complete", json=b).status_code == 200
+    r = client.post("/v1/ai/complete", json=b)                          # byte for byte replay
+    assert r.status_code == 403 and r.json()["code"] == "proof_invalid"
+    # a captured proof does not carry over to another body
+    b2 = dict(body(ai, lic), user="another prompt", tier="smart", max_tokens=4000)
+    b2["proof"] = b["proof"]
+    assert client.post("/v1/ai/complete", json=b2).status_code == 403
+    # nor to a body with an added or removed field
+    b3 = dict(body(ai, lic)); proof3 = b3["proof"]; b3["json_schema"] = {"type": "object"}; b3["proof"] = proof3
+    assert client.post("/v1/ai/complete", json=b3).status_code == 403
+    assert len(ai.state.ai_transport.calls) == 1
+
+
+def test_nonce_cache_expires_after_600s(ai, lic):
+    db = ai.state.db
+    assert db.claim_nonce(lic["lid"], "n" * 12, 1000) is True
+    assert db.claim_nonce(lic["lid"], "n" * 12, 1500) is False
+    assert db.claim_nonce(lic["lid"], "n" * 12, 1601) is True          # older than 600 s: pruned
+    assert db.claim_nonce("lic_other", "n" * 12, 1601) is True         # per license
+
+
+def test_db_leak_does_not_matter_without_the_nonce_dance(client, ai, lic):
+    """The stored hash is still the MAC key (documented), but a forged proof must now also carry
+    a fresh nonce and the body hash; the old 4-field proof is dead."""
+    act = ai.state.db.get_activation(lic["lid"], FP)
+    ts = int(__import__("time").time())
+    b = body(ai, lic)
+    b["proof"] = compute_proof(act["secret_hash"], lic["lid"], FP, ts, "/v1/ai/complete")
+    b["ts"] = ts
+    assert client.post("/v1/ai/complete", json=b).status_code == 403
+
+
+def test_json_schema_counts_and_is_capped(client, ai, lic):
+    db = ai.state.db
+    db.refund(lic["lid"], 5000)
+    big = {"type": "object", "description": "x" * 9000, "properties": {}}
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="fast", user="hi", system="", json_schema=big))
+    assert r.status_code == 413 and r.json()["code"] == "schema_too_large"
+    # under the schema cap but over the tier's input cap together with the text
+    mid = {"type": "object", "description": "x" * 5000, "properties": {}}
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="fast", user="y" * 36_000, system="", json_schema=mid))
+    assert r.status_code == 413 and r.json()["code"] == "input_too_large"
+    assert ai.state.ai_transport.calls == []
+    # the schema is part of the hold
+    small = {"type": "object", "properties": {"a": {"type": "string", "description": "z" * 4000}}}
+    ai.state.ai_transport = FakeVendor(in_tok=10, out_tok=5, model="claude-haiku-4-5")
+    hold_no = reserve_credits(ai.state.settings, 1, 2, "fast")
+    hold_yes = reserve_credits(ai.state.settings, 1, 2 + len(json.dumps(small)), "fast")
+    assert hold_yes >= hold_no
+
+
+def test_cjk_estimate_is_one_token_per_char():
+    assert ai_relay.estimate_input_tokens("abcd" * 10) == 10
+    assert ai_relay.estimate_input_tokens("中" * 40) == 40
+    assert ai_relay.estimate_input_tokens("ab", "中中", "") == 3
+    s = type("S", (), {"ai_model_fast": "claude-haiku-4-5", "ai_model_smart": "claude-sonnet-4-5",
+                       "ai_markup": 4.0, "ai_min_credits": 1})()
+    cjk = ai_relay.reserve_usd(s, 10, 39_000, "fast", ai_relay.estimate_input_tokens("中" * 39_000))
+    asc = ai_relay.reserve_usd(s, 10, 39_000, "fast", ai_relay.estimate_input_tokens("a" * 39_000))
+    assert cjk > 3.5 * asc
+
+
+def test_cjk_call_holds_enough(client, ai, lic):
+    db = ai.state.db
+    ai.state.ai_transport = FakeVendor(in_tok=39_000, out_tok=10, model="claude-haiku-4-5")
+    r = client.post("/v1/ai/complete", json=body(ai, lic, tier="fast", user="中" * 39_000, system="", max_tokens=10))
+    j = r.json()
+    assert r.status_code == 200 and j["credits_charged"] > 0
+    assert db.ledger_totals(lic["lid"])["ok_calls"] == 1
+    # the ledger error column shows no short charge
+    with db.connect() as c:
+        assert c.execute("SELECT error FROM ai_ledger ORDER BY id DESC LIMIT 1").fetchone()[0] == ""
+
+
+def test_inflight_holds_count_toward_the_daily_cap(ai):
+    inf = ai_relay.InFlight()
+    assert inf.try_add("l", 2.0, 0.0, 5.0)
+    assert inf.try_add("l", 2.0, 0.0, 5.0)
+    assert not inf.try_add("l", 2.0, 0.0, 5.0)          # 4.0 held + 2.0 > 5.0
+    inf.release("l", 2.0)
+    assert inf.try_add("l", 2.0, 0.0, 5.0)
+    assert inf.try_add("other", 4.9, 0.0, 5.0)           # per license
+    assert inf.try_add("l", 99.0, 0.0, 0.0)              # cap 0 = unlimited
+
+
+def test_inflight_hold_released_after_calls(client, ai, lic):
+    ai.state.settings.ai_daily_usd_per_lid = 5.0
+    assert client.post("/v1/ai/complete", json=body(ai, lic)).status_code == 200
+    assert ai_relay._inflight(ai)._usd == {}
+    ai.state.ai_transport = FakeVendor(status=500)
+    assert client.post("/v1/ai/complete", json=body(ai, lic)).status_code == 502
+    assert ai_relay._inflight(ai)._usd == {}
+
+
+def test_concurrent_holds_cannot_exceed_the_cap(client, ai, lic):
+    """A call whose hold alone fits the cap, made while another is in flight, is refused."""
+    s = ai.state.settings
+    want = ai_relay.reserve_usd(s, 500, 3 + len(PROMPT), "smart", ai_relay.estimate_input_tokens("sys", PROMPT))
+    cap = want * 1.5
+    s.ai_daily_usd_per_lid = cap
+    assert ai_relay._inflight(ai).try_add(lic["lid"], want, 0.0, cap)    # first call "in flight"
+    r = client.post("/v1/ai/complete", json=body(ai, lic))
+    assert r.status_code == 429 and r.json()["code"] == "daily_cap"

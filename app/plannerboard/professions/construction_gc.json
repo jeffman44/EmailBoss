@@ -2,7 +2,7 @@
   "id": "construction_gc",
   "label": "General Contractor",
   "description": "Bids through award and preconstruction, change orders, RFIs and submittals.",
-  "icon": "🏗️",
+  "icon": "\ud83c\udfd7\ufe0f",
   "entity": {
     "project": "Project",
     "projects": "Projects",
@@ -102,7 +102,8 @@
       ],
       "searchable": false,
       "group": "Details",
-      "source": "key_details"
+      "source": "key_details",
+      "reminder": true
     },
     {
       "key": "quote_amount",
@@ -295,7 +296,7 @@
       {
         "id": "bid",
         "label": "Bid",
-        "icon": "🏗️",
+        "icon": "\ud83c\udfd7\ufe0f",
         "color": "#f0b429",
         "stages": [
           {
@@ -397,7 +398,7 @@
       {
         "id": "change_order",
         "label": "Change Order",
-        "icon": "📝",
+        "icon": "\ud83d\udcdd",
         "color": "#c678dd",
         "stages": [
           {
@@ -454,7 +455,7 @@
       {
         "id": "rfi",
         "label": "RFI / Submittal",
-        "icon": "❓",
+        "icon": "\u2753",
         "color": "#4fc3f7",
         "stages": [
           {
@@ -497,7 +498,7 @@
       {
         "id": "general",
         "label": "General Task",
-        "icon": "📋",
+        "icon": "\ud83d\udccb",
         "color": "#a0a0a0",
         "stages": [
           {

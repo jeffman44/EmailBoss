@@ -51,6 +51,8 @@ python -m pytest -q
 | `LIC_ADMIN_EMAILS` | empty | comma list; those accounts are admins. Empty = first signup is admin |
 | `TRIAL_ENABLED` | `0` | `1` issues a trial license at signup |
 | `TRIAL_DAYS` | `14` | trial length |
+| `AI_TRIAL_PER_DAY` | `200` | in-app trials per UTC day, whole server (429 `trial_budget`) |
+| `TRIAL_PER_IP_DAY` | `5` | in-app trials per UTC day per /24 (IPv4) or /64 (IPv6) |
 | `LIC_ACTIVATION_DAYS` | `30` | activation `valid_until` horizon (client grace is 14 days past it) |
 | `LIC_LOGIN_RATE_LIMIT` / `LIC_LOGIN_RATE_WINDOW` | `10` / `300` | attempts per IP per window (in memory, per process) |
 | `STRIPE_WEBHOOK_SECRET` | empty | `/webhooks/stripe` verifies `Stripe-Signature` with it; while empty the endpoint answers 503 (fail closed) |

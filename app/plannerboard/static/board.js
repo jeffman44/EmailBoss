@@ -1,0 +1,9558 @@
+const REFRESH_INTERVAL = 30000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BEARER TOKEN (DESIGN.md section 2)
+// When the server is bound off loopback it injects <meta name="pb-token"> at
+// GET /. Every /api/* request carries it as Authorization: Bearer. One wrapper
+// around fetch so no caller can forget it.
+// ═══════════════════════════════════════════════════════════════════════════
+const PB_TOKEN = (() => {
+  try { const m = document.querySelector('meta[name="pb-token"]'); return (m && m.content) || ''; }
+  catch (e) { return ''; }
+})();
+(function () {
+  const raw = window.fetch.bind(window);
+  window.fetch = function (url, opts) {
+    try {
+      const u = typeof url === 'string' ? url : (url && url.url) || '';
+      if (PB_TOKEN && u.startsWith('/api/')) {
+        opts = Object.assign({}, opts || {});
+        const h = new Headers(opts.headers || {});
+        if (!h.has('Authorization')) h.set('Authorization', 'Bearer ' + PB_TOKEN);
+        opts.headers = h;
+      }
+    } catch (e) {}
+    // 402 license_required from ANY /api call: the board is read-only. Open
+    // Settings > License with a plain banner instead of failing silently.
+    return raw(url, opts).then(resp => {
+      try {
+        const u = typeof url === 'string' ? url : (url && url.url) || '';
+        if (resp.status === 402 && u.startsWith('/api/')) {
+          resp.clone().json().then(j => {
+            if (j && j.error === 'license_required' && typeof window.ebLicenseGate === 'function') window.ebLicenseGate(j);
+          }).catch(() => {});
+        }
+      } catch (e) {}
+      return resp;
+    });
+  };
+})();
+
+// One-time localStorage migration: every per-origin setting used to live under
+// the legacy single-user prefix; the product uses `pb_`. Old keys are copied once and removed.
+(function migrateLocalStorageKeys() {
+  try {
+  const LEGACY_LS_PREFIX = ['a','m','s','_'].join('');
+    if (localStorage.getItem('pb_keys_migrated')) return;
+    const olds = [];
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith(LEGACY_LS_PREFIX)) olds.push(k); }
+    olds.forEach(k => {
+      const nk = 'pb_' + k.slice(4);
+      if (localStorage.getItem(nk) === null) localStorage.setItem(nk, localStorage.getItem(k));
+      localStorage.removeItem(k);
+    });
+    localStorage.setItem('pb_keys_migrated', '1');
+  } catch (e) {}
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROFESSION LAYER (DESIGN.md section 3)
+// GET /api/profession is the effective template: entity names, work types,
+// fields, id patterns, date types, teams, business hours, money, plus `user`
+// and `features`. Everything below that used to be a domain constant reads
+// PROF instead. PROF_DEFAULT keeps the page alive before the fetch lands or
+// if it fails; it is deliberately bare so nothing domain-specific leaks in.
+// ═══════════════════════════════════════════════════════════════════════════
+const PROF_DEFAULT = {
+  id: 'general', label: 'General',
+  entity: { project: 'Project', projects: 'Projects', client: 'Client',
+            location: 'Location', contact: 'Contact', quote: 'Proposal' },
+  work_types: [], fields: [], id_patterns: [],
+  date_types: [{ id: 'follow_up', label: 'Follow-up' }, { id: 'deadline', label: 'Deadline' }, { id: 'sla', label: 'SLA' }],
+  teams: [],
+  business_hours: { tz: '', start: 8, end: 17, days: [0, 1, 2, 3, 4] },
+  sla_hours: 4,
+  money: { currency: 'USD', annual_goal: null },
+  user: { name: '', email: '', aliases: [], company: '', role: '' },
+  features: { money: true, game_layer: true, analytics: true }
+};
+let PROF = JSON.parse(JSON.stringify(PROF_DEFAULT));
+let PROF_STATE = 'init';   // 'init' | 'live' | 'absent'
+
+async function loadProfession() {
+  try {
+    const r = await fetch('/api/profession?' + Date.now());
+    if (!r.ok) { PROF_STATE = 'absent'; return null; }
+    const j = await r.json();
+    const p = (j && j.profession && typeof j.profession === 'object') ? j.profession : j;
+    if (!p || typeof p !== 'object') { PROF_STATE = 'absent'; return null; }
+    PROF = Object.assign({}, PROF_DEFAULT, p);
+    PROF.entity = Object.assign({}, PROF_DEFAULT.entity, p.entity || {});
+    PROF.user = Object.assign({}, PROF_DEFAULT.user, p.user || {});
+    PROF.features = Object.assign({}, PROF_DEFAULT.features, p.features || {});
+    PROF.business_hours = Object.assign({}, PROF_DEFAULT.business_hours, p.business_hours || {});
+    PROF.money = Object.assign({}, PROF_DEFAULT.money, p.money || {});
+    ['work_types', 'fields', 'id_patterns', 'teams'].forEach(k => { if (!Array.isArray(PROF[k])) PROF[k] = []; });
+    if (!Array.isArray(PROF.date_types) || !PROF.date_types.length) PROF.date_types = PROF_DEFAULT.date_types.slice();
+    PROF_STATE = 'live';
+    applyProfessionChrome();
+    return PROF;
+  } catch (e) { PROF_STATE = 'absent'; return null; }
+}
+
+// Entity label helper: ent('project') -> "Project", ent('projects') -> "Projects".
+function ent(k) { return (PROF.entity && PROF.entity[k]) || PROF_DEFAULT.entity[k] || k; }
+
+// Static chrome that carries entity names (search placeholder, list header,
+// the title). Everything rendered per-cycle reads ent() directly.
+function applyProfessionChrome() {
+  try {
+    const sb = document.getElementById('search');
+    if (sb) sb.placeholder = `Search ${ent('projects').toLowerCase()}, ${ent('contact').toLowerCase()}s, ${ent('location').toLowerCase()}s...`;
+    document.title = (PROF.user && PROF.user.company ? PROF.user.company + ' ' : '') + 'Email Boss';
+    document.body.classList.toggle('no-money', !feat('money'));
+    document.body.classList.toggle('no-game', !feat('game_layer'));
+    applyDisplayModes();
+    if (typeof window.dpsmGate === 'function') window.dpsmGate();
+    else { const dl = document.getElementById('dpsm-launch'); if (dl) dl.style.display = feat('game_layer') ? 'block' : 'none'; }
+  } catch (e) {}
+}
+
+// ── Work types ──────────────────────────────────────────────────────────
+function workTypes() { return Array.isArray(PROF.work_types) ? PROF.work_types : []; }
+function workTypeDef(id) { return workTypes().find(w => w.id === id) || null; }
+function workTypePill(id, cls) {
+  const wt = workTypeDef(id);
+  if (!wt) return id ? `<span class="tag ${cls || ''}">${esc(String(id).toUpperCase())}</span>` : '';
+  const col = wt.color || '#8899aa';
+  return `<span class="tag ${cls || ''}" style="background:${esc(col)}22;color:${esc(col)};border:1px solid ${esc(col)}55" title="${escA(wt.label || wt.id)}">${esc(wt.short || (wt.label || wt.id).toUpperCase())}</span>`;
+}
+
+// ── Teams (replaces the team roster) ────────────────────────────────────
+function teams() { return Array.isArray(PROF.teams) ? PROF.teams : []; }
+function teamDef(id) { return teams().find(t => (t.id || t) === id) || null; }
+function teamDot(team) {
+  const t = teamDef(team);
+  if (!t) return '';
+  const col = t.color || '#8899aa', label = t.label || t.id || String(team);
+  return `<span class="team-dot" style="background:${esc(col)}" title="${escA(label + (t.members ? ' - ' + t.members : ''))}"></span>`;
+}
+
+// ── Date types ──────────────────────────────────────────────────────────
+function dateTypes() { return Array.isArray(PROF.date_types) && PROF.date_types.length ? PROF.date_types : PROF_DEFAULT.date_types; }
+function dateTypeLabel(id) { const d = dateTypes().find(x => x.id === id); return d ? d.label : (id || ''); }
+function dateTypeShort(id) {
+  if (id === 'deadline') return 'DL';
+  if (id === 'sla') return 'SLA';
+  if (!id || id === 'follow_up') return 'FU';
+  return String(id).slice(0, 3).toUpperCase();
+}
+
+// ── Business hours (replaces the hardcoded M-F 7a-5p clock) ─────────────
+function bizHours() {
+  const b = PROF.business_hours || {};
+  const start = Number.isFinite(+b.start) ? +b.start : 8;
+  const end = Number.isFinite(+b.end) ? +b.end : 17;
+  const days = Array.isArray(b.days) && b.days.length ? b.days : [0, 1, 2, 3, 4];
+  // Template days are Monday=0 .. Sunday=6 (python weekday()); JS getDay is Sunday=0.
+  const jsDays = new Set(days.map(d => (d + 1) % 7));
+  return { start, end: Math.max(start + 1, end), jsDays, tz: b.tz || '' };
+}
+function isBizDay(d) { return bizHours().jsDays.has(d.getDay()); }
+function bizHoursText() {
+  const b = bizHours();
+  const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const ds = [...b.jsDays].sort((a, c) => a - c);
+  let dayTxt;
+  if (ds.length === 5 && ds.join() === '1,2,3,4,5') dayTxt = 'M-F';
+  else dayTxt = ds.map(d => names[d]).join('/');
+  const h = n => { const hh = n % 24; const ap = hh >= 12 ? 'p' : 'a'; return ((hh + 11) % 12 + 1) + ap; };
+  return `${dayTxt} ${h(b.start)}-${h(b.end)}${b.tz ? ' ' + b.tz : ''}`;
+}
+
+// ── Identity (replaces every hardcoded owner reference) ─────────────────
+function userAliases() {
+  const u = PROF.user || {};
+  const out = new Set();
+  (u.aliases || []).forEach(a => a && out.add(String(a).toLowerCase().trim()));
+  if (u.email) { out.add(u.email.toLowerCase()); out.add(u.email.toLowerCase().split('@')[0]); }
+  if (u.name) {
+    const n = u.name.toLowerCase().trim();
+    out.add(n);
+    const parts = n.split(/\s+/);
+    if (parts.length > 1) { out.add(parts.join('')); out.add(parts[parts.length - 1] + ',' + parts[0]); out.add(parts[parts.length - 1] + ', ' + parts[0]); }
+  }
+  return out;
+}
+function isSelf(email, name) {
+  email = (email || '').toLowerCase().trim();
+  name = (name || '').toLowerCase().trim();
+  const al = userAliases();
+  if (email && (al.has(email) || al.has(email.split('@')[0]))) return true;
+  if (name && al.has(name)) return true;
+  return false;
+}
+
+// ── Money ───────────────────────────────────────────────────────────────
+function currencySymbol() {
+  const c = (PROF.money && PROF.money.currency) || 'USD';
+  return { USD: '$', CAD: '$', AUD: '$', NZD: '$', EUR: '€', GBP: '£', JPY: '¥', INR: '₹', CHF: 'CHF ' }[c] || (c + ' ');
+}
+function fmtMoney(n, opts) {
+  if (n === null || n === undefined || n === '' || isNaN(+n)) return '';
+  const o = opts || {};
+  return currencySymbol() + (+n).toLocaleString('en-US', { minimumFractionDigits: o.min != null ? o.min : 0, maximumFractionDigits: o.max != null ? o.max : (o.min != null ? o.min : 0) });
+}
+function annualGoal() {
+  const g = PROF.money && PROF.money.annual_goal;
+  if (g && +g > 0) return +g;
+  const ls = parseFloat(localStorage.getItem('pb_annual_goal'));
+  return (!isNaN(ls) && ls > 0) ? ls : 1000000;
+}
+
+// ── Generic project fields (DESIGN.md section 3, `fields`) ─────────────
+// A field is {key, label, type: text|money|date|enum|url|id, show_on: [card|drawer|list],
+// source: column|key_details, options?: [] (enum), group?}. Money fields are
+// hidden entirely when features.money is off.
+function profFields(where) {
+  return (Array.isArray(PROF.fields) ? PROF.fields : []).filter(f => {
+    if (!f || !f.key) return false;
+    if (f.type === 'money' && !feat('money')) return false;
+    if (!where) return true;
+    const on = Array.isArray(f.show_on) ? f.show_on : ['card', 'drawer', 'list'];
+    return on.includes(where);
+  });
+}
+function fieldValue(p, f) {
+  if (!p || !f) return undefined;
+  if (f.source === 'key_details') return (p.key_details || {})[f.key];
+  if (p[f.key] !== undefined && p[f.key] !== null) return p[f.key];
+  return (p.key_details || {})[f.key];
+}
+// Legacy ids sometimes arrive as floats ('882430.0'); strip the tail for display.
+function fmtIdVal(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v).trim();
+  const m = s.match(/^(\d+)\.0*$/);
+  if (m) return m[1];
+  if (/^\d+\.\d+$/.test(s)) return s.split('.')[0];
+  return s;
+}
+function fmtFieldValue(f, v) {
+  if (v === null || v === undefined || v === '') return '';
+  switch (f.type) {
+    case 'money': return fmtMoney(v);
+    case 'date': return formatShortDate(String(v).slice(0, 10)) || String(v);
+    case 'id': return fmtIdVal(v);
+    case 'enum': {
+      const o = (f.options || []).find(x => (typeof x === 'string' ? x : x.id) === v);
+      return o ? (typeof o === 'string' ? o : (o.label || o.id)) : String(v);
+    }
+    case 'url': return String(v);
+    default: return String(v);
+  }
+}
+// card | list: compact inline chips. drawer: an editable grid.
+function renderFields(p, where) {
+  const fs = profFields(where);
+  if (!fs.length) return '';
+  if (where === 'drawer') {
+    const groups = {};
+    fs.forEach(f => { (groups[f.group || 'Details'] = groups[f.group || 'Details'] || []).push(f); });
+    let h = '';
+    Object.keys(groups).forEach(g => {
+      h += `<div class="panel-section"><div class="panel-label">${esc(g)}</div><div class="pf-grid">`;
+      groups[g].forEach(f => {
+        const v = fieldValue(p, f);
+        const id = `pf-${escA(f.key)}-${escA(p.id)}`;
+        let input;
+        const common = `id="${id}" data-key="${escA(f.key)}" data-type="${escA(f.type || 'text')}" data-source="${escA(f.source || 'column')}"
+          data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}' data-on-change="${EH(null, EK('saveField', String(p.id), $T))}"`;
+        if (f.type === 'enum') {
+          const opts = (f.options || []).map(o => {
+            const oid = typeof o === 'string' ? o : o.id, ol = typeof o === 'string' ? o : (o.label || o.id);
+            return `<option value="${escA(oid)}" ${String(v) === String(oid) ? 'selected' : ''}>${esc(ol)}</option>`;
+          }).join('');
+          input = `<select class="pf-input" ${common}><option value="">-</option>${opts}</select>`;
+        } else if (f.type === 'money') {
+          input = `<div class="money-input-wrap"><span class="money-prefix">${esc(currencySymbol().trim())}</span><input class="pf-input money-input" type="number" step="0.01" min="0" value="${escA(v == null ? '' : v)}" placeholder="0.00" ${common}></div>`;
+        } else if (f.type === 'date') {
+          input = `<input class="pf-input" type="date" value="${escA(v ? String(v).slice(0, 10) : '')}" ${common}>`;
+        } else if (f.type === 'url') {
+          input = `<div class="pf-url"><input class="pf-input" type="url" value="${escA(v == null ? '' : v)}" placeholder="https://" ${common}>${v ? `<a href="${escA(v)}" target="_blank" rel="noopener" class="pf-link" title="open">&#8599;</a>` : ''}</div>`;
+        } else {
+          input = `<input class="pf-input" type="text" value="${escA(v == null ? '' : v)}" ${common}>`;
+        }
+        h += `<label class="pf-field"><span class="pf-lbl">${esc(f.label || f.key)}</span>${input}</label>`;
+      });
+      h += '</div></div>';
+    });
+    return h;
+  }
+  const chips = [];
+  fs.forEach(f => {
+    const v = fieldValue(p, f);
+    const txt = fmtFieldValue(f, v);
+    if (!txt) return;
+    const cls = f.type === 'money' ? 'pf-chip-money' : f.type === 'id' ? 'pf-chip-id' : '';
+    if (f.type === 'url') chips.push(`<a class="pf-chip ${cls}" href="${escA(v)}" target="_blank" rel="noopener" data-on-click='{"f":"noop","sp":1}' title="${escA(f.label || f.key)}">${esc(f.label || f.key)} &#8599;</a>`);
+    else chips.push(`<span class="pf-chip ${cls}" title="${escA(f.label || f.key)}">${esc(f.label || f.key)} ${esc(txt)}</span>`);
+  });
+  return chips.join('');
+}
+// Drawer field edit -> PUT /api/projects/{id}. Column fields go top-level;
+// key_details fields ride under key_details, which the server spread-merges.
+async function saveField(projId, el) {
+  if (!el) return;
+  const key = el.dataset.key, type = el.dataset.type, source = el.dataset.source;
+  let val = el.value;
+  if (type === 'money') val = val === '' ? null : parseFloat(val);
+  if (val === '') val = null;
+  const body = source === 'key_details' ? { key_details: { [key]: val } } : { [key]: val };
+  try {
+    await apiPut(projId, body);
+    await loadData();
+    toast(`${el.closest('.pf-field')?.querySelector('.pf-lbl')?.textContent || key} saved`);
+  } catch (e) { toast('Error: ' + e.message); }
+}
+// Which searchable text the profession's fields add to the search blob.
+function fieldSearchBlob(p) {
+  return profFields().filter(f => f.searchable !== false).map(f => {
+    const v = fieldValue(p, f);
+    return v == null ? '' : String(v);
+  }).join(' ');
+}
+
+// ── Stage ROLE helpers (DESIGN.md section 3: todo | waiting | out | won |
+//    in_progress | closed | cold | ignored). Every literal status check below
+//    goes through these. ───────────────────────────────────────────────────
+function stageRole(stageId, wid) {
+  if (!stageId) return '';
+  const w = wid ? wfById(wid) : null;
+  const s = (w && wfStages(w).find(x => x.id === stageId)) || wfStageDef(stageId);
+  if (s && s.role) return s.role;
+  if (s && s.closed) return 'closed';
+  if (WORKFLOWS && WORKFLOWS.__roles && WORKFLOWS.__roles[stageId]) return WORKFLOWS.__roles[stageId];
+  return '';
+}
+function projRole(p) { return stageRole(p && p.status, p && p.workflow_id); }
+function roleIs(p, ...roles) { return roles.includes(projRole(p)); }
+// First stage with `role` in the project's workflow (falls back to any workflow).
+function stageWithRole(role, wid, strict) {
+  const w = wid ? wfById(wid) : null;
+  const inW = w ? wfStages(w).find(s => s && s.role === role) : null;
+  if (inW) return inW.id;
+  if (strict && w) return null;
+  const any = wfAllStages().find(s => s.role === role);
+  return any ? any.id : null;
+}
+function isMutedStatus(stageId, wid) { return ['closed', 'cold', 'ignored'].includes(stageRole(stageId, wid)); }
+
+function isDueSoon(p) {
+  if (isClosedStage(p.status)) return false;
+  if ((p.tags||[]).includes('archived')) return false;
+  if (p.follow_up_date) {
+    const d = daysUntil(p.follow_up_date);
+    return d !== null && d > 0 && d <= 2;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKFLOW LAYER
+// Kanban columns, the header tab strip and the triage "new project" list are
+// DATA: GET /api/workflows (the profession's workflows block, stored in
+// <DATA_ROOT>/workflows.json) and GET /api/board-tabs (the precomputed tab
+// list). There is no hardcoded roster any more: with the API absent the board
+// renders empty columns and says so, it never invents stages.
+// ═══════════════════════════════════════════════════════════════════════════
+let WORKFLOWS   = null;    // /api/workflows payload, or null
+let BOARD_TABS  = null;    // /api/board-tabs computed list, or null
+let WF_STATE    = 'init';  // 'init' | 'live' | 'absent'
+let _tabMembers   = {};    // tabId → Set(project id)        (rebuilt each render)
+let _tabDeadlines = {};    // tabId → [{proj, st, days}] nearest-deadline first
+let _tabsComputed = [];    // this render's computed tab rows (see renderBoard)
+
+// Pull the workflow DOCUMENT out of an API response. Both /api/workflows verbs
+// answer `{ok, workflows: <the document>, ...}`: so `j.workflows` is the
+// document, whose own `.workflows` is the array. Accept the document at any of
+// the three plausible depths: the response IS the doc, or it's under
+// `.workflows`, or under `.config`. (The two-branch version this replaced
+// tested `Array.isArray(j.workflows)`, which is false for the shape the server
+// actually returns: it resolved null and left the whole workflow layer reading
+// as 'absent'.)
+function wfDocFrom(j) {
+  return [j, j && j.workflows, j && j.config]
+    .find(c => c && typeof c === 'object' && Array.isArray(c.workflows)) || null;
+}
+
+async function loadWorkflows() {
+  try {
+    const r = await fetch('/api/workflows?' + Date.now());
+    if (!r.ok) { WORKFLOWS = null; WF_STATE = 'absent'; return null; }
+    const j = await r.json();
+    const wf = wfDocFrom(j);
+    if (!wf || !wf.workflows.length) { WORKFLOWS = null; WF_STATE = 'absent'; return null; }
+    // /api/workflows also answers derived.roles {stage_id: role}; keep it for
+    // stageRole() fallbacks on a stage whose own `role` key is missing.
+    try { wf.__roles = (j && j.derived && j.derived.roles) || {}; } catch (e) { wf.__roles = {}; }
+    WORKFLOWS = wf; WF_STATE = 'live';
+    applyThemeSkin();
+    return wf;
+  } catch (e) { WORKFLOWS = null; WF_STATE = 'absent'; return null; }
+}
+
+async function loadBoardTabs() {
+  try {
+    const r = await fetch('/api/board-tabs?' + Date.now());
+    if (!r.ok) { BOARD_TABS = null; return null; }
+    const j = await r.json();
+    const tabs = Array.isArray(j) ? j : (j && Array.isArray(j.tabs) ? j.tabs : null);
+    BOARD_TABS = (tabs && tabs.length) ? tabs : null;
+    return BOARD_TABS;
+  } catch (e) { BOARD_TABS = null; return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE FLAGS: `features` on /api/profession (money, game_layer,
+// analytics), mirrored on /api/config. A missing flag reads as ON so a typo
+// never hides a pane; `money` off removes every currency readout.
+// ═══════════════════════════════════════════════════════════════════════════
+let APP_CONFIG   = null;
+let CFG_STATE    = 'init';   // 'init' | 'live' | 'absent'
+
+function feat(name) {
+  const f = (PROF && PROF.features) || {};
+  let v = f[name];
+  if (v === undefined && APP_CONFIG && APP_CONFIG.features) v = APP_CONFIG.features[name];
+  return v === undefined ? true : !!v;
+}
+// Money is visible only when the profession says so. One helper so a new
+// currency readout can't forget the rule.
+function showMoney() { return feat('money'); }
+// The MAIL view needs a browsing-capable provider and mail.client_enabled.
+function mailClientOn() {
+  const m = (APP_CONFIG && APP_CONFIG.mail) || {};
+  return !!m.provider && m.provider !== 'none' && m.provider !== 'pa_folder' && m.client_enabled !== false;
+}
+
+async function loadAppConfig() {
+  try {
+    const r = await fetch('/api/config?' + Date.now());
+    if (!r.ok) { CFG_STATE = 'absent'; return null; }
+    const j = await r.json();
+    APP_CONFIG = j;
+    CFG_STATE = 'live';
+    applyDisplayModes();
+    if (j && j.setup_required) {
+      // The server says this install has never been configured. Hand over
+      // rather than rendering an empty board.
+      location.href = '/setup';
+      return j;
+    }
+    return j;
+  } catch (e) { CFG_STATE = 'absent'; return null; }
+}
+
+function wfAll()   { return (WORKFLOWS && Array.isArray(WORKFLOWS.workflows)) ? WORKFLOWS.workflows : []; }
+function wfById(id){ return wfAll().find(w => w.id === id) || null; }
+function wfStages(w) { return (w && Array.isArray(w.stages)) ? w.stages : []; }
+
+// Every stage across every workflow, first definition wins, in workflow order.
+function wfAllStages() {
+  const out = [], seen = new Set();
+  wfAll().forEach(w => wfStages(w).forEach(s => {
+    if (!s || !s.id || seen.has(s.id)) return;
+    seen.add(s.id);
+    out.push(Object.assign({}, s, { workflow: w }));
+  }));
+  return out;
+}
+function wfStageDef(stageId) { return wfAllStages().find(s => s.id === stageId) || null; }
+
+// Status label: the workflow document is the only source; an unknown id
+// shows as itself, humanised.
+function stageLabel(stageId) {
+  const s = wfStageDef(stageId);
+  if (s && s.label) return s.label;
+  return String(stageId || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// The status dropdown roster: the project's own workflow first, then every
+// other stage, plus the current status if no workflow names it (so a project
+// sitting on a retired stage never silently shows the wrong pick).
+function stageRoster(p) {
+  const wid = p && p.workflow_id;
+  const w = wid ? wfById(wid) : null;
+  const out = [], seen = new Set();
+  if (w) wfStages(w).forEach(s => { if (s && s.id && !seen.has(s.id)) { seen.add(s.id); out.push([s.id, s.label || s.id]); } });
+  wfAllStages().forEach(s => { if (!seen.has(s.id)) { seen.add(s.id); out.push([s.id, (w ? (s.workflow.label || s.workflow.id) + ' / ' : '') + (s.label || s.id)]); } });
+  if (p && p.status && !seen.has(p.status)) out.push([p.status, stageLabel(p.status)]);
+  return out;
+}
+
+function isClosedStage(stageId, wid) {
+  const s = wfStageDef(stageId);
+  if (s && s.closed) return true;
+  const r = stageRole(stageId, wid);
+  return r === 'closed' || r === 'ignored';
+}
+
+// Kanban columns: every `column: true` stage, in workflow order. With no
+// workflow document there are no columns (renderBoard says so).
+const COL_CSS = ['col-red','col-orange','col-purple','col-cyan','col-amber','col-green'];
+function boardColumns() {
+  const stages = wfAllStages().filter(s => s.column);
+  if (!stages.length) return [];
+  return stages.map((s, i) => ({
+    key: s.id,
+    label: s.label || s.id,
+    css: COL_CSS[i % COL_CSS.length],
+    statuses: [s.id]
+  }));
+}
+
+// ── SORT CONFIG ───────────────────────────────────────────────────────────
+// `sort` in workflows.json. Returns null when the block is ABSENT (an older
+// file, or a server that hasn't been restarted and 404s /api/workflows): and
+// null means "order the board exactly the way it did before this existed".
+// That fallback is the whole safety story: a missing block is never guessed at.
+let _wfSortSrc = undefined, _wfSortMemo = null;   // memo keyed on object identity
+function wfSort() {
+  const s = WORKFLOWS && WORKFLOWS.sort;
+  // A sort is a few thousand comparisons per render; normalising the rule list
+  // on every one of them was pure garbage. Keyed on the object itself, so a
+  // saved edit (a new object) invalidates it for free.
+  if (s === _wfSortSrc) return _wfSortMemo;
+  _wfSortSrc = s;
+  if (!s || typeof s !== 'object') return (_wfSortMemo = null);
+  const mode = (s.mode === 'project') ? 'project' : 'subtask';
+  let rules = Array.isArray(s.priority) ? s.priority.filter(r => r && typeof r === 'object') : [];
+  // The catch-all is guaranteed on the server too; belt and braces, because an
+  // unranked subtask is the bug that only shows on the one type nobody listed.
+  if (!rules.some(r => !r.match || !Object.keys(r.match).length)) {
+    rules = rules.concat([{ id: 'other', label: 'Everything else', match: {} }]);
+  }
+  return (_wfSortMemo = { mode, priority: rules });
+}
+function sortModeIsSubtask() { const s = wfSort(); return !!s && s.mode === 'subtask'; }
+
+// ── TABS ──────────────────────────────────────────────────────────────────
+// Deadline ladder (contract): >14d → 100, 7-14d → 300, 2-7d → 600,
+// ≤2d → 900, past due → 999. Same 0-999 scale as every card, so the card
+// palette (urgencyColors) applies unchanged.
+function deadlineScore(days) {
+  if (days === null || days === undefined) return 100;
+  if (days < 0)   return 999;
+  if (days <= 2)  return 900;
+  if (days <= 7)  return 600;
+  if (days <= 14) return 300;
+  return 100;
+}
+
+// ★ AUTO STAGE TABS ARE NAMESPACED `stage_<status>` (server: api_board_tabs).
+// That prefix is exactly why every stage pill in the strip rendered dead -
+// nothing here stripped it, so the id matched no workflow tab, no stage def and
+// no ladder status, tabFilterFor returned null, and a null filter means: no
+// members (→ no colour, count falls back to the server's number) and no onclick
+// (→ the pill doesn't filter). One line each way. (the user, 2026-09-03.)
+function tabStageIdOf(id) {
+  const s = String(id == null ? '' : id);
+  return s.startsWith('stage_') ? s.slice(6) : s;
+}
+
+function tabFilterFor(id, serverTab) {
+  const wt = (WORKFLOWS && Array.isArray(WORKFLOWS.tabs)) ? WORKFLOWS.tabs.find(t => t.id === id) : null;
+  if (wt && wt.filter) return wt.filter;
+  if (serverTab && serverTab.filter) return serverTab.filter;
+  // The server names the stage outright on a stage tab: trust that first, then
+  // fall back to un-prefixing the id (which is what an older payload gives us).
+  if (serverTab && serverTab.stage_id) return { stage_in: [serverTab.stage_id] };
+  if (wfStageDef(id)) return { stage_in: [id] };
+  const bare = tabStageIdOf(id);
+  if (bare !== id && wfStageDef(bare)) return { stage_in: [bare] };
+  if (id === 'active')    return { closed: false };
+  if (id === 'todo')      return { todo: true };
+  if (id === 'deadlines') return { subtask_date_type: 'deadline', pending: true };
+  if (id === 'questions') return { has_question: true };
+  if (id === 'closed')    return { closed: true };
+  if (id === 'ignored')   return { role_in: ['ignored'] };
+  return null;
+}
+
+function tabMatch(filter, p) {
+  if (!filter) return false;
+  if (filter.todo) return isTodo(p);
+  if (filter.has_question) return _openQ.has(p.id);
+  if (filter.subtask_date_type) {
+    return (p.subtasks || []).some(s => s.status !== 'complete'
+      && (s.date_type || '') === filter.subtask_date_type);
+  }
+  if (Array.isArray(filter.stage_in)) return filter.stage_in.includes(p.status);
+  if (Array.isArray(filter.role_in))  return filter.role_in.includes(projRole(p));
+  if (filter.closed !== undefined)    return isClosedStage(p.status, p.workflow_id) === !!filter.closed;
+  if (Array.isArray(filter.work_type_in)) return filter.work_type_in.includes(p.work_type);
+  if (Array.isArray(filter.workflow_in)) return filter.workflow_in.includes(projectWorkflowId(p));
+  if (filter.workflow_id) return projectWorkflowId(p) === filter.workflow_id;
+  return false;
+}
+
+// Tab DEFINITIONS: server list wins, then the workflow file, then today's strip.
+// A server tab carries no filter, so membership (needed for click-to-filter) is
+// resolved locally by tabFilterFor; a tab we can't resolve still shows its
+// server count but isn't clickable.
+function tabDefs() {
+  if (Array.isArray(BOARD_TABS) && BOARD_TABS.length) {
+    return BOARD_TABS.map(t => ({
+      id: t.id, label: t.label || t.id,
+      kind: t.urgency_kind || t.urgency || 'max',
+      filter: tabFilterFor(t.id, t),
+      serverCount: (typeof t.count === 'number') ? t.count : null,
+      serverScore: (typeof t.urgency_score === 'number') ? t.urgency_score : null
+    }));
+  }
+  if (WORKFLOWS) {
+    const defs = [], seen = new Set();
+    (Array.isArray(WORKFLOWS.tabs) ? WORKFLOWS.tabs : []).forEach(t => {
+      if (!t || !t.id || seen.has(t.id)) return;
+      seen.add(t.id);
+      defs.push({ id: t.id, label: t.label || t.id, kind: t.urgency || 'max',
+                  filter: t.filter || tabFilterFor(t.id, null),
+                  serverCount: null, serverScore: null });
+    });
+    const auto = !WORKFLOWS.tab_rules || WORKFLOWS.tab_rules.auto_stage_tabs !== false;
+    if (auto) {
+      // A stage already inside an explicit tab's stage_in doesn't get a second pill.
+      const covered = new Set();
+      defs.forEach(d => { if (d.filter && Array.isArray(d.filter.stage_in)) d.filter.stage_in.forEach(s => covered.add(s)); });
+      wfAllStages().filter(s => s.column).forEach(s => {
+        if (seen.has(s.id) || covered.has(s.id)) return;
+        seen.add(s.id);
+        defs.push({ id: s.id, label: s.label || s.id, kind: 'max',
+                    filter: { stage_in: [s.id] }, serverCount: null, serverScore: null });
+      });
+    }
+    return defs;
+  }
+  // FALLBACK (no workflow document reachable): the board-native tabs only.
+  return [
+    { id:'active',    label:'active',    kind:'max',      filter:{ closed:false } },
+    { id:'todo',      label:'to do',     kind:'max',      filter:{ todo:true } },
+    { id:'deadlines', label:'deadlines', kind:'deadline', filter:{ subtask_date_type:'deadline', pending:true } },
+    { id:'closed',    label:'closed',    kind:'none',     filter:{ closed:true } }
+  ];
+}
+
+// ── TAB COLOUR = THE TOP PENDING SUBTASK IN THE TAB  ─────
+// "these buttons ... need to be color coded based on the top urgency subtask in
+// each category." So every tab: explicit or auto stage: takes MAX over its
+// members of that project's best pending-subtask score, which is exactly the
+// number the subtask-driven sort ranks on. It is READ from projectSortKey, never
+// re-derived: two copies of that curve would drift, and a pill showing a
+// different number from the card under it is the bug this replaces.
+// `urgency_kind: sum` is deliberately ignored for COLOUR (the sum still rides in
+// the tooltip): a sum tab sat pinned at crimson forever and told the user nothing.
+//
+// A tab whose members have nothing pending is neutral. Closed / Ignored members
+// are muted by getUrgencyScore, so those tabs are neutral too: UNLESS a member
+// still carries a pending DEADLINE, because a date does not stop mattering
+// because the job closed; then the tab colours by that deadline's score.
+function tabTopSubtaskScore(members, memo) {
+  let best = 0;
+  for (const p of members) {
+    let k = memo && memo.get(p.id);
+    if (!k) { k = projectSortKey(p); if (memo) memo.set(p.id, k); }
+    if (k.has && k.score > best) best = k.score;
+  }
+  if (best > 0) return best;
+  // Muted / parked members: a pending deadline still colours the pill.
+  for (const p of members) {
+    for (const st of (p.subtasks || [])) {
+      if (st.status === 'complete') continue;
+      if ((st.date_type || '') !== 'deadline') continue;
+      const sc = deadlineScore(st.follow_up_date ? daysUntil(st.follow_up_date) : null);
+      if (sc > best) best = sc;
+    }
+  }
+  return best;
+}
+
+// Membership, count and urgency for every tab. The sum is still computed and
+// shown in the tooltip; colour is tabTopSubtaskScore above.
+function computeTabs(all, allForStats) {
+  const defs = tabDefs();
+  // QUESTIONS tab is board-native, not a workflow stage: added here so it
+  // exists whichever tab source (server / workflows / fallback) won.
+  if (!defs.some(d => d.id === 'questions')) {
+    const at = defs.findIndex(d => d.id === 'deadlines');
+    defs.splice(at >= 0 ? at + 1 : defs.length, 0,
+      { id:'questions', label:'questions', kind:'max', filter:{ has_question:true },
+        serverCount:null, serverScore:null });
+  }
+  const _keyMemo = new Map();   // one projectSortKey per project per render
+  const _activeIds = new Set(all.map(p => p.id));
+  _tabMembers = {}; _tabDeadlines = {};
+  return defs.map(d => {
+    // The id goes into an onclick attribute and into the `tab:<id>` filter
+    // token, so it is normalised once, here, for both.
+    d.id = String(d.id == null ? '' : d.id).replace(/[^A-Za-z0-9_.-]/g, '_') || 'tab';
+    const wantsClosed = !!(d.filter && (d.filter.closed === true
+      || (Array.isArray(d.filter.stage_in) && d.filter.stage_in.some(isClosedStage))));
+    // MEMBERS ARE ONLY EVER RENDERABLE PROJECTS. Archived rows are not in
+    // DATA.projects, so counting them made the CLOSED pill promise a list that
+    // clicking it could never show. They ride the tooltip instead (rule:
+    // clicking a tab shows exactly what the tab counted).
+    const members = d.filter ? all.filter(p => tabMatch(d.filter, p)) : [];
+    const archivedHits = (wantsClosed && d.filter)
+      ? allForStats.filter(p => !_activeIds.has(p.id) && tabMatch(d.filter, p)).length
+      : 0;
+    _tabMembers[d.id] = new Set(members.map(p => p.id));
+
+    const isDeadline = d.kind === 'deadline'
+      || !!(d.filter && d.filter.subtask_date_type === 'deadline');
+    let count, score = 0, pulse = false, extra = '';
+    if (isDeadline) {
+      const rows = [];
+      members.forEach(p => (p.subtasks || []).forEach(st => {
+        if (st.status === 'complete') return;
+        if ((st.date_type || '') !== 'deadline') return;
+        const d2 = st.follow_up_date ? daysUntil(st.follow_up_date) : null;
+        rows.push({ proj: p, st, days: (d2 === null ? 9999 : d2) });
+      }));
+      rows.sort((a, b) => a.days - b.days);
+      _tabDeadlines[d.id] = rows;
+      count = rows.length;
+      const nearest = rows.length ? rows[0].days : null;
+      score = rows.length ? deadlineScore(nearest === 9999 ? null : nearest) : 0;
+      pulse = rows.length > 0 && nearest !== null && nearest <= 2;
+      extra = !rows.length ? ''
+        : nearest === 9999 ? 'nearest: no date set'
+        : nearest < 0 ? `nearest: ${-nearest}d PAST DUE`
+        : nearest === 0 ? 'nearest: due today'
+        : `nearest: ${nearest}d out`;
+    } else {
+      // Client count when we can resolve membership (always in step with the
+      // board); the server's count only for a tab whose filter we can't
+      // reproduce, which is also the tab that can't be clicked.
+      count = d.filter ? members.length : (d.serverCount != null ? d.serverCount : 0);
+      // EVERY tab, including kind 'none' (closed / ignored) and kind 'sum'.
+      score = tabTopSubtaskScore(members, _keyMemo);
+    }
+    const sum = members.reduce((s, p) => s + Math.max(0, getUrgencyScore(p)), 0);
+    return Object.assign({}, d, { count, score, pulse, extra, sum, archivedHits });
+  });
+}
+
+// ── TAB GROUPS (2026-09-09, the user: "closed and ignored don't really need to be
+// on here - or at least on the end ... maybe think of a way to organize these
+// better") ────────────────────────────────────────────────────────────────
+// The strip is clusters in the order work actually MOVES, not a flat wall of
+// fourteen pills:  SCOPE → ON ME → OUT → EXECUTION → (OTHER) → DONE.
+// Rules this encodes:
+//  · The GROUP hue lives on the cluster header ONLY. Every count keeps the
+//    0-999 urgency palette (the user 2026-09-03: "all of the tabs should change
+//    color based on their urgency score"): that colour is the signal.
+//  · DONE (complete / closed / ignored) starts COLLAPSED behind one muted
+//    pill pinned hard right. Nothing is removed; one click opens it.
+//  · Empty tabs inside a group fold into a single `+N` ghost chip: three
+//    slots were being spent on 0 DEADLINES / 0 NEEDS SETUP / 0 SCHEDULED.
+//  · A tab that IS the active filter is never hidden by either rule, so
+//    clicking a pill can never make it vanish under the cursor.
+//  · Grouping is DATA, like the stage roster: a workflows.json tab or stage
+//    may carry `"group": "<id>"`, which wins over the default map below, so a
+//    workflow the user invents lands where he says. Unknown → the OTHER cluster,
+//    which is visible and honest rather than silently claiming ownership.
+const TAB_GROUPS = [
+  { id:'scope', label:'scope',     color:'#7f77dd' },
+  { id:'mine',  label:'on me',     color:'#ffab33' },
+  { id:'out',   label:'out',       color:'#5aa9ff' },
+  { id:'exec',  label:'execution', color:'#9ccf5f' },
+  { id:'other', label:'other',     color:'#6b6966' },
+  { id:'done',  label:'done',      color:'#4a4845', collapsed:true }
+];
+// Never folded into a `+N` ghost, even at zero: the deadlines tab is the one
+// with an external clock, and "nothing due" is an answer, not an absence.
+const TAB_ALWAYS_SHOW = ['deadlines', 'questions', 'active'];
+// Board-native tab ids map by name; workflow stages map by their ROLE.
+const TAB_GROUP_DEFAULTS = { active:'scope', todo:'mine', deadlines:'mine', questions:'mine', closed:'done', ignored:'done' };
+const ROLE_GROUP = { todo:'mine', waiting:'out', out:'out', cold:'out', won:'exec', in_progress:'exec', closed:'done', ignored:'done' };
+function tabGroupOf(t) {
+  const id = t.id, bare = tabStageIdOf(id);
+  const wt = (WORKFLOWS && Array.isArray(WORKFLOWS.tabs)) ? WORKFLOWS.tabs.find(x => x && x.id === id) : null;
+  if (wt && wt.group) return wt.group;
+  const sd = wfStageDef(bare);
+  if (sd && sd.group) return sd.group;
+  const g = TAB_GROUP_DEFAULTS[id] || TAB_GROUP_DEFAULTS[bare];
+  if (g) return g;
+  const rg = ROLE_GROUP[stageRole(bare)];
+  if (rg) return rg;
+  if (isClosedStage(bare)) return 'done';
+  return 'other';
+}
+
+// Which clusters are open, and which have their empties showing. Per-origin
+// like every other board setting (memory board_localstorage_origin_split).
+let _tabUI = (function () {
+  try {
+    const v = JSON.parse(localStorage.getItem('pb_tab_strip') || '{}') || {};
+    return { open: v.open || {}, zeros: v.zeros || {} };
+  } catch (e) { return { open: {}, zeros: {} }; }
+})();
+function _tabUISave() { try { localStorage.setItem('pb_tab_strip', JSON.stringify(_tabUI)); } catch (e) {} }
+function tabGroupOpen(g) {
+  return Object.prototype.hasOwnProperty.call(_tabUI.open, g.id) ? !!_tabUI.open[g.id] : !g.collapsed;
+}
+function tabZerosOpen(gid) { return !!_tabUI.zeros[gid]; }
+function toggleTabGroup(gid) {
+  const g = TAB_GROUPS.find(x => x.id === gid) || { id: gid };
+  _tabUI.open[gid] = !tabGroupOpen(g); _tabUISave();
+  _tabStripSig = null; renderBoard();
+}
+function toggleTabZeros(gid) {
+  _tabUI.zeros[gid] = !_tabUI.zeros[gid]; _tabUISave();
+  _tabStripSig = null; renderBoard();
+}
+
+// Render gate: the strip is rebuilt on every 30s cycle, so a signature over
+// exactly what it draws (id, count, score, pulse, empty state, which tab is the
+// active filter, and which clusters are open) lets an unchanged strip reuse its
+// markup instead of churning the DOM under the user's cursor. Membership is still
+// recomputed every pass: matchesStatFilter reads _tabMembers and must never
+// serve a stale set.
+let _tabStripSig = null, _tabStripHtml = '', _metricsHtml = '';
+function tabStripSignature(tabs) {
+  return tabs.map(t => [t.id, t.count, t.score, t.pulse ? 1 : 0, t.archivedHits || 0].join(':'))
+             .join('|') + '~' + String(statFilter || '')
+             + '~' + JSON.stringify(_tabUI);
+}
+
+// One pill. Unchanged from the flat strip: colour, tooltip and click all
+// behave exactly as they did; only where it SITS is new.
+function tabPillHtml(t) {
+  const active = statFilter === ('tab:' + t.id);
+  const hot = t.count > 0 && t.score > 0;
+  const c = urgencyColors(hot ? t.score : 0);
+  const cls = ['m-stat', 'm-tab'];
+  if (!t.count) cls.push('m-tab-empty');
+  if (t.pulse)  cls.push('m-tab-pulse');
+  if (active)   cls.push('active');
+  const bits = [`top subtask urgency ${t.score}`];
+  if (t.kind === 'sum' || t.sum !== t.score) bits.push(`sum ${t.sum}`);
+  if (t.archivedHits) bits.push(`+${t.archivedHits} archived (not listed)`);
+  if (t.extra) bits.push(t.extra);
+  if (t.serverScore != null && t.serverScore !== t.score) bits.push(`server ${t.serverScore}`);
+  if (!t.filter) bits.push('not clickable: filter unresolved');
+  const title = `${t.label}: ${t.count} · ${bits.join(' · ')}`;
+  // Tint the border only when it is genuinely hot, and never over the
+  // selected state: .m-stat.active owns the border when a tab is the filter.
+  const border = (!active && hot && t.score >= 150) ? `border-color:${c.border};` : '';
+  const tint   = (!active && hot) ? `--uc-bg:${c.bg};` : '';
+  return `<div class="${cls.join(' ')}" title="${escA(title)}"
+      ${t.filter ? `data-on-click="${EH(null, EK('setStatFilter', 'tab:'+(t.id)))}"` : ''}
+      style="${border}${tint}">
+      <span class="num" style="${hot ? `color:${c.name}` : ''}">${t.count}</span>
+      <span class="lbl" style="${hot ? `color:${c.sub}` : ''}">${esc(t.label)}</span>
+    </div>`;
+}
+
+function renderTabStrip(all, allForStats) {
+  // renderBoard computes the tabs before it filters (membership feeds
+  // matchesFilter); anyone else calling this gets a fresh compute.
+  const tabs = (_tabsComputed && _tabsComputed.length)
+    ? _tabsComputed : computeTabs(all, allForStats);
+  const sig = tabStripSignature(tabs);
+  if (sig === _tabStripSig && _tabStripHtml) return _tabStripHtml;
+
+  const isActive = t => statFilter === ('tab:' + t.id);
+  const byGroup = {};
+  tabs.forEach(t => {
+    const gid = tabGroupOf(t);
+    (byGroup[gid] = byGroup[gid] || []).push(t);
+  });
+  // A group id nobody declared (a workflows.json `group` typo, say) still has
+  // to render: it lands after the known clusters, ahead of DONE.
+  const groups = TAB_GROUPS.slice();
+  Object.keys(byGroup).forEach(gid => {
+    if (groups.some(g => g.id === gid)) return;
+    groups.splice(groups.length - 1, 0, { id: gid, label: gid, color: '#6b6966' });
+  });
+
+  let h = '';
+  groups.forEach(g => {
+    const list = byGroup[g.id];
+    if (!list || !list.length) return;
+    const anyActive = list.some(isActive);
+    const open = tabGroupOpen(g) || anyActive;
+    let body = '';
+    if (!open) {
+      const total = list.reduce((s, t) => s + (t.count || 0), 0);
+      const tip = `${g.label}: ${list.map(t => t.label + ' ' + t.count).join(' · ')} · click to open`;
+      body = `<div class="m-stat m-tab m-tab-fold" title="${escA(tip)}"
+        data-on-click="${EH(null, EK('toggleTabGroup', String(g.id)))}">
+        <span class="num">${total}</span>
+        <span class="lbl">${esc(g.label)} ▸</span>
+      </div>`;
+    } else {
+      const keep  = t => t.count > 0 || isActive(t) || t.pulse
+                       || TAB_ALWAYS_SHOW.indexOf(t.id) >= 0
+                       || TAB_ALWAYS_SHOW.indexOf(tabStageIdOf(t.id)) >= 0;
+      const shown = list.filter(keep);
+      const zeros = list.filter(t => !keep(t));
+      body = shown.map(tabPillHtml).join('');
+      if (zeros.length) {
+        body += tabZerosOpen(g.id)
+          ? zeros.map(tabPillHtml).join('') +
+            `<div class="m-ghost" title="${escA('hide the empty ' + g.label + ' tabs')}"
+              data-on-click="${EH(null, EK('toggleTabZeros', String(g.id)))}">−</div>`
+          : `<div class="m-ghost" title="${escA(zeros.map(t => t.label).join(', ') + ': empty. click to show')}"
+              data-on-click="${EH(null, EK('toggleTabZeros', String(g.id)))}">+${zeros.length}</div>`;
+      }
+      if (g.collapsed) {
+        body += `<div class="m-ghost" title="${escA('collapse ' + g.label)}"
+          data-on-click="${EH(null, EK('toggleTabGroup', String(g.id)))}">◂</div>`;
+      }
+    }
+    h += `<div class="m-group m-group-${esc(g.id)}" style="--gc:${esc(g.color || 'var(--t3)')}">
+      <div class="m-group-hd">${esc(g.label)}</div>
+      <div class="m-group-body">${body}</div>
+    </div>`;
+  });
+  _tabStripSig = sig; _tabStripHtml = h;
+  return h;
+}
+
+// Nearest-deadline-first ordering for the list when the deadlines tab is the
+// active filter (the user: "the panel lists them nearest-deadline-first").
+function activeDeadlineOrder() {
+  if (!statFilter || !String(statFilter).startsWith('tab:')) return null;
+  const rows = _tabDeadlines[String(statFilter).slice(4)];
+  if (!rows || !rows.length) return null;
+  const m = {};
+  rows.forEach(r => {
+    const cur = m[r.proj.id];
+    if (cur === undefined || r.days < cur) m[r.proj.id] = r.days;
+  });
+  return m;
+}
+
+// theme.skin: cosmetic only. The HUD structure is locked ;
+// a skin may repaint, never restructure. `default` is the only one shipped.
+const THEME_SKINS = [['default', 'Default: dark']];
+function applyThemeSkin() {
+  const skin = (WORKFLOWS && WORKFLOWS.theme && WORKFLOWS.theme.skin) || 'default';
+  try { document.body.dataset.skin = skin; } catch (e) {}
+}
+
+// ── TRIAGE DROPDOWN VALUES ────────────────────────────────────────────────
+// A triage "create it" option carries `__new__:<work_type id>`. tvBase strips
+// the suffix (the server gets the sentinel it expects), tvWorkType returns the
+// work type, whose workflow_id rides along in the approve payload.
+// esc() (defined below) covers & < >: enough for text nodes, which is what
+// the rest of the file uses it for. Labels are user-typed and land in HTML
+// ATTRIBUTES, so they need the quotes escaped too.
+function escA(s) { return esc(s == null ? '' : String(s)).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+
+function tvBase(v) { v = String(v == null ? '' : v); const i = v.indexOf(':'); return i < 0 ? v : v.slice(0, i); }
+function tvWorkType(v) { v = String(v == null ? '' : v); const i = v.indexOf(':'); return i < 0 ? '' : v.slice(i + 1); }
+function tvWorkflow(v) { const wt = workTypeDef(tvWorkType(v)); return wt ? (wt.workflow_id || '') : ''; }
+
+// A project's workflow: the stored column wins; a project without one resolves
+// through its work type (PROF.work_types[].workflow_id), then the first workflow.
+function projectWorkflowId(p) {
+  const wid = (p && p.workflow_id) || '';
+  if (wid) return wid;
+  const wt = workTypeDef((p && p.work_type) || '');
+  if (wt && wt.workflow_id) return wt.workflow_id;
+  const all = wfAll();
+  return all.length ? all[0].id : '';
+}
+
+let DATA = null;
+// ── OPEN ASSISTANT QUESTIONS, board-wide (2026-09-23) ──
+// project_id → [question text,...]. Drives the ? flag on each row/card and the
+// QUESTIONS tab. Refreshed with every loadData and after an answer/skip. A
+// failed fetch keeps the last good map rather than blanking every flag.
+let _openQ = new Map();
+async function loadOpenQuestions() {
+  try {
+    const r = await fetch('/api/questions?status=open&' + Date.now());
+    if (!r.ok) return;
+    const d = await r.json();
+    const m = new Map();
+    _openQList = (d.questions || []).filter(q => q && q.id && (q.status || 'open') === 'open');
+    if (typeof updateDecisionsBadge === 'function') updateDecisionsBadge();
+    (d.questions || []).forEach(q => {
+      if (!q || !q.project_id) return;
+      if (!m.has(q.project_id)) m.set(q.project_id, []);
+      m.get(q.project_id).push(q.question || '');
+    });
+    _openQ = m;
+  } catch (e) {}
+}
+function qFlagHtml(p) {
+  const qs = _openQ.get(p.id);
+  if (!qs || !qs.length) return '';
+  const tip = 'Assistant question' + (qs.length > 1 ? 's' : '') + ':\n' + qs.map(t => '• ' + t).join('\n');
+  return `<span class="q-flag" title="${esc(tip)}">?${qs.length > 1 ? qs.length : ''}</span>`;
+}
+let activeFilters = new Set();
+let searchQuery = '';
+let showArchive = false;
+let openProjectId = null;
+let dragProjectId = null;
+let currentView = 'today'; // 'today' | 'list' | 'kanban' | 'analytics' | 'mail' | 'drafts'
+let statFilter = null; // null, 'projects', 'action', 'revenue', 'overdue', 'ignored'
+let showIgnored = false;
+
+// ── UTILS ──
+// Local calendar day as YYYY-MM-DD. toISOString() is UTC and shows tomorrow's
+// date every evening west of Greenwich; every date-only value uses this.
+function ymd(d) {
+  d = d || new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function esc(s) { return s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : ''; }
+function parseLocalDate(ds) {
+  // Parse YYYY-MM-DD as LOCAL midnight, not UTC (avoids timezone shift bug)
+  const m = String(ds).split(' -')[0].replace(/^(\d{4}-\d{2}-\d{2}).*/, '$1').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  return isNaN(d) ? null : d;
+}
+function daysSince(ds) {
+  if (!ds) return null;
+  const d = parseLocalDate(ds);
+  if (!d) return null;
+  const now = new Date(); now.setHours(0,0,0,0);
+  return Math.floor((now - d) / 86400000);
+}
+function daysUntil(ds) {
+  if (!ds) return null;
+  const d = parseLocalDate(ds);
+  if (!d) return null;
+  const now = new Date(); now.setHours(0,0,0,0);
+  return Math.floor((d - now) / 86400000);
+}
+// Fractional days for DoT tick: sub-day score progression
+function fractionalDaysUntil(ds) {
+  if (!ds) return null;
+  const d = parseLocalDate(ds);
+  if (!d) return null;
+  return (d - new Date()) / 86400000;
+}
+
+// ── BUSINESS-DAY CLOCK  ──────────────────────────────────
+// Urgency ages on WORKING time only: Sat/Sun contribute zero. A quote request that lands
+// Friday afternoon reads the same Monday morning as it did when it landed.
+// (The SLA path already used business hours; everything else was on the wall
+// clock, so a card could gain ~330 urgency points over a weekend nobody worked.)
+// Signed fractional business days between two Dates; weekends count as 0.
+function bizDaysBetween(a, b) {
+  let sign = 1;
+  if (b < a) { const t = a; a = b; b = t; sign = -1; }
+  let total = 0, cursor = new Date(a), guard = 0;
+  while (cursor < b && guard++ < 4000) {
+    const nextMidnight = new Date(cursor);
+    nextMidnight.setHours(24, 0, 0, 0);
+    const segEnd = nextMidnight < b ? nextMidnight : b;
+    const dow = cursor.getDay();
+    if (dow !== 0 && dow !== 6) total += (segEnd - cursor) / 86400000;
+    cursor = new Date(segEnd.getTime());
+  }
+  return sign * total;
+}
+// Business days from NOW until a date's midnight. Negative = past (overdue).
+function bizFractionalDaysUntil(ds) {
+  if (!ds) return null;
+  const d = parseLocalDate(ds);
+  if (!d) return null;
+  return bizDaysBetween(new Date(), d);
+}
+function fmtTs(ts) {
+  if (!ts) return 'Never';
+  const d = new Date(ts);
+  return d.toLocaleDateString('en-US',{weekday:'short',month:'numeric',day:'numeric',year:'numeric'})
+    + ' ' + d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+}
+function fmtNow() { return new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',second:'2-digit'}); }
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// ── API ──
+// The product schema names the place `location` and the win date `won_date`.
+// The board's renderers grew up on `site` / `sold_date`; normalise once at the
+// boundary so both spellings read the same everywhere below.
+function normalizeProject(p) {
+  if (!p || typeof p !== 'object') return p;
+  if (p.site === undefined || p.site === null || p.site === '') p.site = p.location || '';
+  if (p.location === undefined) p.location = p.site || '';
+  if (p.sold_date === undefined) p.sold_date = p.won_date || null;
+  if (p.team === undefined) p.team = (p.key_details && p.key_details.team) || '';
+  if (!p.key_details || typeof p.key_details !== 'object') p.key_details = {};
+  if (!Array.isArray(p.tags)) p.tags = [];
+  return p;
+}
+async function apiGet() {
+  const r = await fetch('/api/projects?' + Date.now());
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+  (d.projects || []).forEach(normalizeProject);
+  (d.archived || []).forEach(normalizeProject);
+  return d;
+}
+async function apiPut(id, updates) {
+  const r = await fetch(`/api/projects/${id}`, {
+    method: 'PUT',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(updates)
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.error || ('HTTP ' + r.status));
+  }
+  const d = await r.json();
+  if (d && d.project) normalizeProject(d.project);
+  return d;
+}
+
+async function saveTimer(projId, field, val) {
+  try {
+    await apiPut(projId, { [field]: val || null });
+    await loadData();
+    toast(`Follow-up → ${val || 'cleared'}`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function clearTimers(projId) {
+  try {
+    await apiPut(projId, { follow_up_date: null });
+    await loadData();
+    toast('Timers cleared');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function snoozeFollowUp(projId) {
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  const current = (p.follow_up_date && parseLocalDate(p.follow_up_date)) || new Date();
+  current.setDate(current.getDate() + 3);
+  const newFollowUp = ymd(current);
+  const updates = { follow_up_date: newFollowUp };
+  try {
+    await apiPut(projId, updates);
+    await loadData();
+    toast(`Snoozed → ${newFollowUp}`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ── TRIAGE PANEL ──
+let TRIAGE_ITEMS = [];
+let PREMADE_SCOPE_KEYS = []; // no longer loaded (estimates removed)
+
+async function loadTriageItems() {
+  try {
+    const r = await fetch('/api/triage?' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    TRIAGE_ITEMS = data.items || [];
+    renderTriagePanel();
+    if (currentView === 'today' && typeof renderToday === 'function') renderToday();
+  } catch(e) {
+    // Silent fail: triage panel just shows empty
+    TRIAGE_ITEMS = [];
+    renderTriagePanel();
+  }
+}
+
+function renderTriagePanel() {
+  const el = document.getElementById('triage-content');
+  if (!el) return;
+  // Don't nuke the DOM while the user is editing a field
+  if (isUserEditing()) return;
+  // Hold the triage panel's scroll across the innerHTML swap (2026-08-12)
+  const _triageSnap = snapshotScroll(['.triage-panel']);
+  setTimeout(() => restoreScroll(_triageSnap), 0);
+
+  // Split into pending (actionable) and auto-committed (audit trail)
+  const pendingItems = TRIAGE_ITEMS.filter(i => i.status === 'pending')
+    .sort((a, b) => {
+      // Ack cards always first, sorted by urgency (highest first)
+      const aIsAck = a.card_type === 'acknowledgment' ? 1 : 0;
+      const bIsAck = b.card_type === 'acknowledgment' ? 1 : 0;
+      if (aIsAck !== bIsAck) return bIsAck - aIsAck;
+      if (aIsAck && bIsAck) return (b.ack_urgency || 0) - (a.ack_urgency || 0);
+      return 0; // preserve original order for non-ack cards
+    });
+  const autoItems = TRIAGE_ITEMS.filter(i => i.status === 'auto_committed')
+    .sort((a, b) => (b.staged_at || '').localeCompare(a.staged_at || ''));
+
+  const totalVisible = pendingItems.length + autoItems.length;
+  const panel = document.getElementById('triage-panel');
+  // Hide the entire triage panel when nothing is pending or auto-committed
+  if (panel) {
+    panel.style.display = totalVisible === 0 ? 'none' : 'flex';
+  }
+  const projects = DATA ? (DATA.projects || []) : [];
+
+  let html = `<div class="triage-header">
+    ${pendingItems.length > 0 ? '<div class="dot-pulse"></div>' : ''}
+    <span>New mail to sort</span>
+    <span class="triage-count">${pendingItems.length} pending${autoItems.length ? ` · ${autoItems.length} auto-filed` : ''}</span>
+    <button class="dismissed-archive-btn" data-on-click='{"f":"openDismissedBrowser"}' title="Browse dismissed cards">DISMISSED</button>
+  </div>`;
+
+  if (pendingItems.length === 0 && autoItems.length === 0) {
+    html += '<div class="triage-empty">Nothing pending triage</div>';
+    el.innerHTML = html;
+    return;
+  }
+
+  // Approve all button (pending only)
+  if (pendingItems.length > 1) {
+    html += `<button class="triage-btn triage-btn-approve-all" data-on-click='{"f":"approveAllTriage"}' title="Add every card that already has a match; cards without one stay for you">Add all (${pendingItems.length})</button>`;
+  }
+
+  // Render pending cards
+  pendingItems.forEach(item => {
+    const cardType = item.card_type || 'email';
+    if (cardType === 'acknowledgment') {
+      html += renderAcknowledgmentCard(item, projects);
+    } else if (cardType === 'subtask_proposal') {
+      html += renderSubtaskProposalCard(item, projects);
+    } else if (cardType === 'reassign_subtask') {
+      html += renderReassignSubtaskCard(item, projects);
+    } else {
+      html += renderEmailTriageCard(item, projects);
+    }
+  });
+
+  // Render auto-committed section (collapsed by default)
+  if (autoItems.length > 0) {
+    html += `<div class="triage-auto-section">
+      <button class="triage-auto-toggle" data-on-click='{"f":"toggleAutoFiled"}'>
+        <span id="auto-filed-arrow">▶</span> Auto-Filed (${autoItems.length} emails · last 24h)
+      </button>
+      <div id="auto-filed-list" style="display:none;">
+        ${autoItems.map(item => {
+          const dir = item.direction || 'inbound';
+          const projName = projects.find(p => p.id === item.matched_project)?.name || item.matched_project || '?';
+          return `<div class="triage-auto-card">
+            <span class="triage-direction triage-dir-${dir}" style="font-size: max(9px, var(--fs-min, 0px));padding:1px 5px;">${dir === 'outbound' ? 'SENT' : 'RECV'}</span>
+            <span class="triage-auto-subject" title="${esc(item.subject || '')}">${esc((item.subject || '').substring(0, 50))}</span>
+            <span class="triage-auto-proj" title="${esc(projName)}">→ ${esc(projName.substring(0, 25))}</span>
+            <span class="triage-auto-reason">${esc((item.match_reason || '').replace('Auto-filed: ', ''))}</span>
+            <span class="triage-auto-time">${esc(formatTriageTime(item.received_at))}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+
+  // Post-render: auto-fetch subtask completions for email cards with existing project matches
+  // and completion_signals. Use requestAnimationFrame so DOM is settled.
+  requestAnimationFrame(() => {
+    pendingItems.forEach(item => {
+      if ((item.card_type || 'email') === 'email' && item.matched_project
+          && !String(item.matched_project).startsWith('__')
+          && item.completion_signals && item.completion_signals.length > 0) {
+        fetchAndRenderSubtaskCompletions(item.triage_id, item.matched_project);
+      }
+    });
+  });
+}
+
+function toggleAutoFiled() {
+  const list = document.getElementById('auto-filed-list');
+  const arrow = document.getElementById('auto-filed-arrow');
+  if (list) {
+    const shown = list.style.display !== 'none';
+    list.style.display = shown ? 'none' : 'block';
+    if (arrow) arrow.textContent = shown ? '▶' : '▼';
+  }
+}
+
+function renderEmailTriageCard(item, projects) {
+  const tid = item.triage_id;
+  const dir = item.direction || 'inbound';
+  const dirClass = dir === 'outbound' ? 'triage-outbound' : '';
+  const editedClass = item.edited ? 'triage-edited' : '';
+  const conf = item.confidence || 'low';
+  const matchedProj = item.matched_project || '';
+  const wasCorrected = item.claude_matched_project && item.claude_matched_project !== matchedProj;
+
+  return `<div class="triage-card ${dirClass} ${editedClass}" id="triage-${tid}">
+    <div class="triage-card-header">
+      <span class="triage-direction triage-dir-${dir}">${dir === 'outbound' ? 'SENT' : 'RECV'}</span>
+      <span class="triage-subject" title="${esc(item.subject || '')}">${esc(item.subject || '(no subject)')}</span>
+      <span class="triage-confidence triage-conf-${conf}">${conf}</span>
+    </div>
+
+    <div class="triage-from">
+      ${dir === 'outbound'
+        ? 'To: ' + esc(item.to || '')
+        : esc(item.from_name || item.from_email || 'unknown')}
+      &nbsp;&middot;&nbsp; ${esc(formatTriageTime(item.received_at || item.sent_at))}
+    </div>
+    ${dir === 'inbound' && item.to ? `<div class="triage-to-line">To: ${esc(item.to)}</div>` : ''}
+
+    ${triageBodyBlock(item, tid, null)}
+
+    <div class="triage-meta-row">
+      ${(() => {
+        // ONE control: the checkbox IS the flag. Ticked = it needs a quote.
+        const isQR = !!item.is_quote_request || (item.classification === 'quote_request' && item.is_quote_request !== 0);
+        if (!isQR && !showMoney()) return item.classification ? `<span class="triage-classification cls-${escA(item.classification)}">${esc(String(item.classification).replace(/_/g, ' '))}</span>` : '';
+        return `<label class="qr-check ${isQR ? 'on' : ''}" title="This mail asks for a ${escA(ent('quote').toLowerCase())}"><input type="checkbox" ${isQR ? 'checked' : ''} data-on-change="${EH(null, EK('toggleQuoteRequest', String(tid)))}">Needs a quote</label>`
+          + (item.classification && item.classification !== 'quote_request' ? `<span class="triage-classification cls-${escA(item.classification)}">${esc(String(item.classification).replace(/_/g, ' '))}</span>` : '');
+      })()}
+      ${(showMoney() && item.dollar_amount) ? `<span class="triage-tag" style="background:var(--c-1a150a);color:var(--c-fac775);">${fmtMoney(item.dollar_amount)}</span>` : ''}
+      ${item.has_attachments ? `<span class="triage-tag triage-tag-attach">📎 ${item.attachments ? item.attachments.length + ' file' + (item.attachments.length > 1 ? 's' : '') : 'attachments'}</span>` : ''}
+      ${item.is_self_note ? `<span class="triage-tag triage-tag-selfnote">self-note</span>` : ''}
+      ${buildSignalTags(item)}
+    </div>
+
+    ${buildFactsLine(item)}
+    ${buildMissingPhotoWarning(item)}
+    ${item.leave_reason ? `<div class="triage-leave">${esc(leaveReasonText(item.leave_reason))}</div>` : ''}
+    ${item.match_reason ? `<div class="triage-match-reason">Match: ${esc(item.match_reason)}</div>` : ''}
+    ${item.attachments && item.attachments.length ? `<div style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3);margin-bottom:6px;">${item.attachments.map(a => esc(a.name || a)).join(', ')}</div>` : ''}
+    ${(item.doc_links && item.doc_links.length) ? `<div class="triage-links">${item.doc_links.map(lnk =>
+      `<a class="triage-link" href="${esc(lnk.url)}" target="_blank" rel="noopener" title="${esc(lnk.url)}"><span class="triage-link-icon">${linkIcon(lnk.url)}</span>${esc(lnk.label || linkHost(lnk.url))}</a>`
+    ).join('')}</div>` : ''}
+
+    <div class="triage-field">
+      <div class="triage-field-label">${esc(ent('project'))}${wasCorrected ? ' <span style="color:var(--c-f7a840);font-size: max(9px, var(--fs-min, 0px));margin-left:6px;">auto-corrected</span>' : ''}</div>
+      <select class="triage-select" id="triage-proj-${tid}" data-on-change="${EH(null, EK('onTriageProjectChange', String(tid), $V))}">
+        ${buildTriageProjectOptions(matchedProj, { showNew: true })}
+      </select>
+    </div>
+    ${triageNewProjectFields(item, tid, tvBase(matchedProj) === '__new__', true)}
+
+    <div class="triage-field">
+      <div class="triage-field-label">${item.auto_date_type==='deadline' ? '<span style="color:var(--c-ff8c00)">&#x23F0; Deadline</span>' : (item.auto_date_type==='sla' ? 'Reply by' : 'Follow-up date')}</div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <select class="triage-date-type-select" id="triage-datetype-${tid}"
+          style="background:var(--bg0);color:${item.auto_date_type==='deadline'?'var(--c-ff8c00)':'var(--t1)'};border:1px solid ${item.auto_date_type==='deadline'?'var(--c-ff8c00)':'var(--line2b)'};border-radius:3px;font-size: max(11px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace;padding:4px 6px"
+          data-on-change="${EH(null, EK('updateTriageField', tid, 'auto_date_type', $V), EK('renderTriagePanel'))}">
+          ${dateTypes().map(d => `<option value="${escA(d.id)}" ${(item.auto_date_type||'follow_up')===d.id?'selected':''}>${esc(d.id === 'sla' ? 'Reply by' : d.label)}</option>`).join('')}
+        </select>
+        <input type="date" class="triage-date-input" id="triage-fu-${tid}"
+          value="${item.auto_follow_up || ''}"
+          style="${item.auto_date_type==='deadline'?'border-color:var(--c-ff8c00);color:var(--c-ff8c00)':''}"
+          data-on-change="${EH(null, EK('updateTriageField', String(tid), 'auto_follow_up', $V))}">
+      </div>
+    </div>
+
+    ${showMoney() ? `<div class="triage-field">
+      <div class="triage-field-label">${esc(currencySymbol().trim())} Amount</div>
+      <input type="number" class="triage-action-input" id="triage-dollar-${tid}"
+        step="10" min="0" placeholder="${escA(ent('quote'))} total (if applicable)"
+        value="${item.dollar_amount || ''}"
+        data-on-change="${EH(null, EK('triageDollar', tid, $V))}"
+        style="max-width:200px;">
+    </div>` : ''}
+
+    <div class="triage-field">
+      <div class="triage-field-label">Next Action</div>
+      <textarea class="triage-action-input" id="triage-action-${tid}" rows="4"
+        data-on-change="${EH(null, EK('updateTriageField', String(tid), 'auto_action', $V))}">${esc(item.auto_action || '')}</textarea>
+    </div>
+
+    <div id="triage-subtask-completions-${tid}" class="triage-subtask-completions" style="display:none;"></div>
+
+    <div class="triage-buttons">
+      <button class="triage-btn triage-btn-approve" data-on-click="${EH(null, EK('approveTriage', String(tid)))}" title="Shortcut: a">Add to board</button>
+      <button class="triage-btn triage-btn-dismiss" data-on-click="${EH(null, EK('dismissTriage', String(tid)))}" title="Set this card aside. Shortcut: n">Not now</button>
+      <button class="triage-btn triage-btn-ignore" data-on-click="${EH(null, EK('ignoreTriage', String(tid)))}" title="Hide this mail; it is not work. Shortcut: h">Not work, hide</button>
+      ${dir !== 'outbound' ? `<button class="triage-btn" data-on-click="${EH(null, EK('aiTriageReply', String(tid)))}">Write a reply</button>` : ''}
+    </div>
+  </div>`;
+}
+
+
+function renderAcknowledgmentCard(item, projects) {
+  const tid = item.triage_id;
+  const urgency = item.ack_urgency || 0;
+  const elapsed = (item.ack_elapsed_hours || 0).toFixed(1);
+  const sla = item.ack_sla_hours || 4;
+  const matchedProj = item.matched_project || '';
+
+  // Urgency color: green (0-30) → yellow (30-50) → orange (50-70) → red (70-100)
+  let urgColor, urgLabel;
+  if (urgency <= 30) { urgColor = '#2ecc40'; urgLabel = 'OK'; }
+  else if (urgency <= 50) { urgColor = '#f7a840'; urgLabel = 'DUE'; }
+  else if (urgency <= 70) { urgColor = '#e67e22'; urgLabel = 'LATE'; }
+  else { urgColor = '#e74c3c'; urgLabel = 'OVERDUE'; }
+
+  const pctWidth = Math.min(urgency, 100);
+
+  return `<div class="triage-card triage-ack-card" id="triage-${tid}" style="border-left:4px solid ${urgColor};">
+    <div class="triage-card-header" style="background:${urgColor}15;">
+      <span class="triage-direction" style="background:${urgColor};color:#fff;font-weight:700;padding:2px 8px;border-radius:3px;">⏰ ACK</span>
+      <span class="triage-subject" title="${esc(item.subject || '')}">${esc((item.subject || '').replace('⏰ ACK: ', ''))}</span>
+      <span style="font-size: max(10px, var(--fs-min, 0px));font-weight:700;color:${urgColor};margin-left:auto;">${urgLabel}</span>
+    </div>
+
+    <div class="triage-from">
+      ${esc(item.from_name || item.from_email || 'unknown')}
+      &nbsp;&middot;&nbsp; ${esc(formatTriageTime(item.received_at))}
+    </div>
+
+    <div style="margin:8px 0;">
+      <div style="display:flex;align-items:center;gap:8px;font-size: max(11px, var(--fs-min, 0px));color:var(--c-a09b94);">
+        <span>${elapsed} / ${sla} biz hrs</span>
+        <div style="flex:1;height:6px;background:var(--c-2a2825);border-radius:3px;overflow:hidden;">
+          <div style="width:${pctWidth}%;height:100%;background:${urgColor};border-radius:3px;transition:width 0.5s;"></div>
+        </div>
+        <span style="font-weight:600;color:${urgColor};">${urgency}</span>
+      </div>
+      <div style="font-size: max(9px, var(--fs-min, 0px));color:var(--t3);margin-top:3px;">Aging: business hours only (${esc(bizHoursText())})</div>
+    </div>
+
+    ${triageBodyBlock(item, tid, 60)}
+
+    <div class="triage-field">
+      <div class="triage-field-label">Link to ${esc(ent('project'))}</div>
+      <select class="triage-select" id="triage-proj-${tid}" data-on-change="${EH(null, EK('onTriageProjectChange', String(tid), $V))}">
+        ${buildTriageProjectOptions(matchedProj, { showNew: true })}
+      </select>
+    </div>
+    ${triageNewProjectFields(item, tid, tvBase(matchedProj) === '__new__', false)}
+
+    <div class="triage-buttons">
+      <button class="triage-btn triage-btn-approve" data-on-click="${EH(null, EK('approveTriage', String(tid)))}" style="background:${urgColor};">ACKNOWLEDGED</button>
+      <button class="triage-btn triage-btn-dismiss" data-on-click="${EH(null, EK('dismissTriage', String(tid)))}">Not now</button>
+    </div>
+  </div>`;
+}
+
+
+function renderSubtaskProposalCard(item, projects) {
+  const tid = item.triage_id;
+  const editedClass = item.edited ? 'triage-edited' : '';
+  const projId = item.project_id || '';
+  const projName = projId ? (projects.find(p => p.id === projId)?.name || projId) : '';
+  const subtaskText = item.proposed_subtask || '';
+  const reason = item.reason || '';
+  const source = item.source || 'assistant';
+
+  return `<div class="triage-card triage-subtask-proposal ${editedClass}" id="triage-${tid}">
+    <div class="triage-card-header">
+      <span class="triage-subtask-badge">SUBTASK</span>
+      <span class="triage-subject">${esc(projName || '(no project)')}</span>
+    </div>
+
+    <div class="subtask-source">Source: ${esc(source)}</div>
+
+    ${reason ? `<div class="subtask-reason">${esc(reason)}</div>` : ''}
+
+    <div class="triage-field">
+      <div class="triage-field-label">${esc(ent('project'))}</div>
+      <select class="triage-select" id="triage-proj-${tid}"
+        data-on-change="${EH(null, EK('onSubtaskProjectChange', String(tid), $V))}">
+        ${buildTriageProjectOptions(projId, { showUnmatched: true, emptyLabel: '- select ' + ent('project').toLowerCase() + ' -' })}
+      </select>
+    </div>
+
+    <div class="triage-field">
+      <div class="triage-field-label">Subtask</div>
+      <textarea class="triage-action-input" id="triage-subtask-${tid}" rows="3"
+        data-on-change="${EH(null, EK('updateTriageField', String(tid), 'proposed_subtask', $V))}">${esc(subtaskText)}</textarea>
+    </div>
+
+    <div class="triage-buttons">
+      <button class="triage-btn triage-btn-approve" data-on-click="${EH(null, EK('approveTriage', String(tid)))}">Add task</button>
+      <button class="triage-btn triage-btn-dismiss" data-on-click="${EH(null, EK('dismissTriage', String(tid)))}">Not now</button>
+    </div>
+  </div>`;
+}
+
+
+function renderReassignSubtaskCard(item, projects) {
+  const tid = item.triage_id;
+  const editedClass = item.edited ? 'triage-edited' : '';
+  const projId = item.project_id || '';
+  const subtaskText = item.proposed_subtask || '';
+  const originName = item.origin_project_name || item.origin_project || '';
+
+  return `<div class="triage-card ${editedClass}" id="triage-${tid}">
+    <div class="triage-card-header">
+      <span class="triage-reassign-badge">REASSIGN</span>
+      <span class="triage-subject">${esc(subtaskText).substring(0,60)}</span>
+    </div>
+
+    <div style="font-size: max(11px, var(--fs-min, 0px));color:var(--c-7a7570);margin-bottom:6px">Orphaned from: <span style="color:var(--c-c0a030)">${esc(originName)}</span></div>
+
+    <div class="triage-field">
+      <div class="triage-field-label">Assign to ${esc(ent('project').toLowerCase())}</div>
+      <select class="triage-select" id="triage-proj-${tid}"
+        data-on-change="${EH(null, EK('onReassignProjectChange', String(tid), $V))}">
+        ${buildTriageProjectOptions(projId, { showNew: true, showUnmatched: true, emptyLabel: '- select ' + ent('project').toLowerCase() + ' -' })}
+      </select>
+    </div>
+    ${triageNewProjectFields(item, tid, tvBase(projId) === '__new__', false)}
+
+    <div class="triage-field">
+      <div class="triage-field-label">Subtask</div>
+      <textarea class="triage-action-input" id="triage-subtask-${tid}" rows="2"
+        data-on-change="${EH(null, EK('updateTriageField', String(tid), 'proposed_subtask', $V))}">${esc(subtaskText)}</textarea>
+    </div>
+
+    <div class="triage-buttons">
+      <button class="triage-btn triage-btn-approve" data-on-click="${EH(null, EK('approveTriage', String(tid)))}">Move task</button>
+      <button class="triage-btn triage-btn-dismiss" data-on-click="${EH(null, EK('dismissTriage', String(tid)))}">Not now</button>
+    </div>
+  </div>`;
+}
+
+// The "+ New" fields shared by every card that can create a project:
+// location (optional) + name, and the quote-request toggle when money is on.
+function triageNewProjectFields(item, tid, visible, withQuoteToggle) {
+  const loc = item.new_project_location || item.new_project_site || '';
+  return `<div class="triage-new-fields" id="triage-new-${tid}" style="display:${visible ? 'block' : 'none'}">
+      <div class="triage-field">
+        <div class="triage-field-label">${esc(ent('location'))}</div>
+        <input type="text" autocomplete="off" class="triage-action-input" id="triage-site-${tid}"
+          placeholder="${escA(ent('location'))} (optional)"
+          value="${escA(loc)}"
+          data-on-change="${EH(null, EK('updateTriageField', String(tid), 'new_project_location', $V))}">
+      </div>
+      <div class="triage-field">
+        <div class="triage-field-label">${esc(ent('project'))} name</div>
+        <input type="text" autocomplete="off" class="triage-action-input" id="triage-name-${tid}"
+          placeholder="${escA(ent('project'))} name"
+          value="${escA(item.new_project_name || '')}"
+          data-on-change="${EH(null, EK('updateTriageField', String(tid), 'new_project_name', $V))}">
+      </div>
+      ${withQuoteToggle && showMoney() ? `<div class="triage-field" style="margin-top:6px">
+        <label class="quote-request-toggle" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size: max(13px, var(--fs-base, 0px))">
+          <input type="checkbox" id="triage-quotereq-${tid}"
+            ${item.is_quote_request ? 'checked' : ''}
+            data-on-change="${EH(null, EK('triageQuoteFlag', tid, $C))}">
+          <span style="color:var(--accent-blue,var(--c-4a90d9))">⚡ ${esc(ent('quote'))} request</span>
+        </label>
+      </div>` : ''}
+    </div>`;
+}
+
+// Link chips on a triage card: icon by hostname, never by a vendor name.
+function linkHost(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch (e) { return String(url || '').slice(0, 40); }
+}
+function linkIcon(url) {
+  const h = linkHost(url).toLowerCase();
+  if (/onedrive|1drv|live\.com|share[p]oint/.test(h)) return '\u2601\ufe0f';
+  if (/dropbox|box\.com|drive\.google|docs\.google|wetransfer/.test(h)) return '\ud83d\udce6';
+  if (/github|gitlab|bitbucket/.test(h)) return '\ud83d\udcbb';
+  if (/zoom|teams\.microsoft|meet\.google|webex/.test(h)) return '\ud83c\udfa5';
+  if (/docusign|hellosign|pandadoc|adobesign/.test(h)) return '\u270d\ufe0f';
+  if (/calendly|calendar/.test(h)) return '\ud83d\udcc5';
+  return '\ud83d\udd17';
+}
+
+function formatTriageTime(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    return d.toLocaleDateString('en-US', {month:'numeric',day:'numeric'})
+      + ' ' + d.toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit'});
+  } catch(e) { return ts; }
+}
+
+// ── Triage panel resize handle ──────────────────────────────────
+(function() {
+  const handle = document.getElementById('triage-resize-handle');
+  const panel = document.getElementById('triage-panel');
+  if (!handle || !panel) return;
+  let dragging = false, startX = 0, startW = 0;
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    dragging = true;
+    startX = e.clientX;
+    startW = panel.offsetWidth;
+    handle.classList.add('active');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = startX - e.clientX; // dragging left = wider
+    const newW = Math.min(900, Math.max(300, startW + dx));
+    panel.style.width = newW + 'px';
+    panel.style.minWidth = newW + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('active');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  });
+})();
+
+// ── Missing inline images banner ─────────────────────────────────────────
+// Some providers report hasAttachments=false when a message's only images are
+// INLINE, so nothing is saved and the images are gone with no error anywhere.
+// The card says so BEFORE approve, while the email is still one click away.
+function buildMissingPhotoWarning(item) {
+  const n = Number(item.missing_inline_images || 0);
+  if (!n) return '';
+  let refs = item.inline_image_refs || [];
+  if (typeof refs === 'string') { try { refs = JSON.parse(refs) || []; } catch (e) { refs = []; } }
+  const sizes = (Array.isArray(refs) ? refs : []).slice(0, 6)
+    .map(r => (r && r.size > 0) ? Math.round(r.size / 1024) + 'KB' : '?')
+    .join(', ');
+  return `<div class="triage-missing-photos" title="The mail provider did not save inline-only images. Open the email in your mail client to see them.">
+      ⚠ ${n} inline image${n > 1 ? 's' : ''} in this email ${n > 1 ? 'were' : 'was'} not captured${sizes ? ` (${esc(sizes)})` : ''}
+      <span class="triage-missing-photos-hint">open the message in your mail client to view</span>
+    </div>`;
+}
+
+// Facts line: what the deterministic pass pulled out of the subject/body -
+// a location, a name, and any id-pattern hits ({key, value}). Renders nothing
+// when there's nothing solid to say; silence beats a guess.
+function buildFactsLine(item) {
+  const s = item.suggestion;
+  if (!s) return '';
+  const ids = Array.isArray(s.ids) ? s.ids : (s.wo_numbers || []).map(v => ({ key: '', value: v }));
+  const loc = s.location || s.site, name = s.name || s.job;
+  if (!loc && !name && !ids.length) return '';
+  const bits = [];
+  if (loc) bits.push(`<span class="triage-facts-site">${esc(loc)}</span>`);
+  if (name) bits.push(`<span class="triage-facts-job">${esc(name)}</span>`);
+  ids.slice(0, 3).forEach(w => {
+    const lbl = w && w.key ? ((PROF.id_patterns || []).find(x => x.key === w.key) || {}).label || w.key : '';
+    bits.push(`<span class="triage-facts-wo">${esc((lbl ? lbl + ' ' : '') + (w && w.value != null ? w.value : w))}</span>`);
+  });
+  if ((s.is_new_location || s.is_new_site) && !item.matched_project)
+    bits.push(`<span class="triage-facts-new">NEW ${esc(ent('location').toUpperCase())}</span>`);
+  if (s.location_source === 'ambiguous' || s.site_source === 'ambiguous')
+    bits.push(`<span class="triage-facts-src">${esc(ent('location').toLowerCase())} ambiguous: several match</span>`);
+  else if (s.location_source || s.site_source)
+    bits.push(`<span class="triage-facts-src">${esc(String(s.location_source || s.site_source).replace(/_/g, ' '))}</span>`);
+  return `<div class="triage-facts">${bits.join('')}</div>`;
+}
+
+function buildSignalTags(item) {
+  const tags = [];
+  const actions = item.triage_actions || [];
+  actions.forEach(a => {
+    if (a === 'approval_signal') tags.push('<span class="triage-tag triage-tag-signal">approval signal</span>');
+    else if (typeof a === 'string' && /_detected$/.test(a)) tags.push(`<span class="triage-tag triage-tag-signal">${esc(a.replace(/_detected$/, '').replace(/_/g, ' '))}</span>`);
+    else if (a === 'increment_emails_sent') tags.push('<span class="triage-tag triage-tag-signal">sent++</span>');
+    else if (a === 'follow_up_sent') tags.push('<span class="triage-tag triage-tag-signal">follow-up</span>');
+    else if (a === 'internal_handoff') tags.push('<span class="triage-tag triage-tag-signal">handoff</span>');
+    else if (typeof a === 'object' && a.action === 'dollar_detected') {
+      // dollar already shown separately
+    }
+  });
+  return tags.join('');
+}
+
+function toggleTriagePreview(tid) {
+  const prev = document.getElementById('triage-prev-' + tid);
+  if (!prev) return;
+  const expanded = prev.classList.toggle('expanded');
+  const btn = prev.nextElementSibling;
+  if (btn) btn.textContent = expanded ? 'show less' : 'show more';
+}
+
+function toggleTriageSummary(tid) {
+  const summary = document.getElementById('triage-summary-' + tid);
+  const original = document.getElementById('triage-prev-' + tid);
+  if (!summary) return;
+  // Button is always the element after original (or after summary if no original)
+  const btn = original ? original.nextElementSibling : summary.nextElementSibling;
+  const showingOriginal = summary.style.display === 'none';
+  if (showingOriginal) {
+    // Switch back to summary view
+    summary.style.display = '';
+    if (original) original.style.display = 'none';
+    if (btn) btn.textContent = 'show original';
+  } else {
+    // Switch to original full body
+    summary.style.display = 'none';
+    if (original) { original.style.display = ''; original.classList.add('expanded'); }
+    if (btn) btn.textContent = 'show summary';
+  }
+}
+
+// Render a triage card's body the SAME way the project-card threads do: the real
+// email body (body_raw) run through the deterministic cleanEmailBody(): no AI.
+// If a (now anti-confabulation-guarded) AI summary exists, show it on top with
+// the real body one click away. A contentless email shows its real body or
+// "(no message body)": never an invented summary. (2026-06-29)
+function triageBodyBlock(item, tid, maxH) {
+  const styleAttr = maxH ? ` style="max-height:${maxH}px;"` : '';
+  const raw = item.body_raw || '';
+  const isHtml = !!raw;
+  let cleaned = '';
+  try { cleaned = cleanEmailBody(raw, isHtml); } catch (e) { cleaned = ''; }
+  const realBody = cleaned || (item.body_preview || '').trim() || '(no message body)';
+  const realHtml = esc(realBody).replace(/\n/g, '<br>');
+  const fullText = (htmlToText(raw, isHtml) || (item.body_preview || '').trim());
+  const summary = (item.ai_summary || '').trim();
+
+  if (summary) {
+    // Trustworthy summary up top; "show original" reveals the real cleaned body
+    // (reuses toggleTriageSummary, which swaps -summary- and -prev-).
+    return `<div class="triage-preview triage-ai-summary" id="triage-summary-${tid}"${styleAttr}>${esc(summary).replace(/\n/g, '<br>')}</div>
+      <div class="triage-preview triage-original" id="triage-prev-${tid}" style="display:none;">${realHtml}</div>
+      <button class="triage-preview-expand" data-on-click="${EH(null, EK('toggleTriageSummary', String(tid)))}">show original</button>`;
+  }
+  // No summary → just the real body, exactly like the project-card threads.
+  let html = `<div class="triage-preview" id="triage-prev-${tid}"${styleAttr}>${realHtml}</div>`;
+  if (fullText && fullText.trim() !== realBody.trim()) {
+    // Cleaner stripped a sig/quote chain: let the user see the untouched original.
+    html += `<div class="triage-preview triage-original" id="triage-orig-${tid}" style="display:none;">${esc(fullText).replace(/\n/g, '<br>')}</div>
+      <button class="triage-preview-expand" data-on-click="${EH(null, EK('toggleTriageOrig', String(tid)))}">show original</button>`;
+  } else {
+    html += `<button class="triage-preview-expand" data-on-click="${EH(null, EK('toggleTriagePreview', String(tid)))}">show more</button>`;
+  }
+  return html;
+}
+
+function toggleTriageOrig(tid) {
+  const main = document.getElementById('triage-prev-' + tid);
+  const orig = document.getElementById('triage-orig-' + tid);
+  if (!main || !orig) return;
+  const btn = orig.nextElementSibling;
+  const showingOrig = main.style.display === 'none';
+  if (showingOrig) {
+    main.style.display = ''; orig.style.display = 'none';
+    if (btn) btn.textContent = 'show original';
+  } else {
+    main.style.display = 'none'; orig.style.display = ''; orig.classList.add('expanded');
+    if (btn) btn.textContent = 'show cleaned';
+  }
+}
+
+function toggleQuoteRequest(tid) {
+  const item = TRIAGE_ITEMS.find(i => i.triage_id === tid);
+  if (!item) return;
+  const wasQR = !!item.is_quote_request || (item.classification === 'quote_request' && item.is_quote_request !== 0);
+  const isNowQR = !wasQR;
+  item.is_quote_request = isNowQR ? 1 : 0;
+  // Update server
+  fetch(`/api/triage/${tid}`, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({is_quote_request: isNowQR ? 1 : 0})
+  }).then(r => {
+    if (!r.ok) console.error('Failed to update quote request flag');
+  });
+  // Re-render the card in place
+  const cardEl = document.getElementById('triage-' + tid);
+  if (cardEl) {
+    const newHtml = renderEmailTriageCard(item, (DATA && DATA.projects) || []);
+    const temp = document.createElement('div');
+    temp.innerHTML = newHtml;
+    cardEl.replaceWith(temp.firstElementChild);
+  }
+}
+
+function onTriageProjectChange(triageId, value) {
+  // Intercept __existing__: open picker instead of setting value
+  if (value === '__existing__') {
+    openTriageProjectPicker(triageId, 'matched_project', 'onTriageProjectChange');
+    // Reset dropdown to previous value so it doesn't stay on "Search existing..."
+    const sel = document.getElementById('triage-proj-' + triageId);
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    if (sel && item) sel.value = item.matched_project || '';
+    return;
+  }
+  // Show/hide new project fields: only for __new__
+  const newFields = document.getElementById('triage-new-' + triageId);
+  if (newFields) newFields.style.display = tvBase(value) === '__new__' ? 'block' : 'none';
+  updateTriageField(triageId, 'matched_project', value);
+  if (tvWorkType(value)) updateTriageField(triageId, 'work_type', tvWorkType(value));
+  // Auto-fill the name from the subject when switching to New
+  if (tvBase(value) === '__new__') autoFillJobName(triageId);
+  // Fetch and render subtask completions for the selected project
+  fetchAndRenderSubtaskCompletions(triageId, value);
+
+  // ── Thread cascade: match siblings to the same project ──
+  // Picking a project for one email card auto-sets the same project on all
+  // other pending email cards with the same conversation_id.
+  if (value && !String(value).startsWith('__')) {
+    const thisItem = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    if (thisItem && thisItem.conversation_id) {
+      const siblings = TRIAGE_ITEMS.filter(i =>
+        i.triage_id !== triageId &&
+        i.status === 'pending' &&
+        i.card_type === 'email' &&
+        i.conversation_id === thisItem.conversation_id
+      );
+      for (const sib of siblings) {
+        const sibSel = document.getElementById('triage-proj-' + sib.triage_id);
+        if (sibSel && sibSel.value !== value) {
+          sibSel.value = value;
+          sib.matched_project = value;
+          updateTriageField(sib.triage_id, 'matched_project', value);
+          // Also hide new fields on siblings
+          const sibNew = document.getElementById('triage-new-' + sib.triage_id);
+          if (sibNew) sibNew.style.display = 'none';
+          fetchAndRenderSubtaskCompletions(sib.triage_id, value);
+        }
+      }
+      if (siblings.length > 0) {
+        toast(`Thread matched: ${siblings.length} sibling email${siblings.length > 1 ? 's' : ''} -> same ${ent('project').toLowerCase()}`);
+      }
+    }
+  }
+}
+
+function onSubtaskProjectChange(triageId, value) {
+  if (value === '__existing__') {
+    openTriageProjectPicker(triageId, 'project_id', 'onSubtaskProjectChange');
+    const sel = document.getElementById('triage-proj-' + triageId);
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    if (sel && item) sel.value = item.project_id || '';
+    return;
+  }
+  updateTriageField(triageId, 'project_id', value);
+}
+
+function onReassignProjectChange(triageId, value) {
+  // Intercept __existing__
+  if (value === '__existing__') {
+    openTriageProjectPicker(triageId, 'project_id', 'onReassignProjectChange');
+    const sel = document.getElementById('triage-proj-' + triageId);
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    if (sel && item) sel.value = item.project_id || '';
+    return;
+  }
+  // Show/hide new project fields for reassign cards
+  const newFields = document.getElementById('triage-new-' + triageId);
+  if (newFields) newFields.style.display = tvBase(value) === '__new__' ? 'block' : 'none';
+  updateTriageField(triageId, 'project_id', value);
+}
+
+async function fetchAndRenderSubtaskCompletions(triageId, projId) {
+  const container = document.getElementById('triage-subtask-completions-' + triageId);
+  if (!container) return;
+
+  // Hide if no real project selected
+  if (!projId || projId === '' || String(projId).startsWith('__')) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  // Get the triage item's completion_signals
+  const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+  const signals = (item && item.completion_signals) || [];
+
+  try {
+    const r = await fetch('/api/projects/' + projId + '/subtasks');
+    if (!r.ok) { container.style.display = 'none'; return; }
+    const data = await r.json();
+    const subtasks = data.subtasks || [];
+
+    if (subtasks.length === 0) {
+      container.style.display = 'none';
+      return;
+    }
+
+    // Fuzzy match: for each subtask, check if any signal keyword appears in the subtask text
+    const matches = subtasks.map(st => {
+      const stLower = (st.text || '').toLowerCase();
+      let matchedSignal = null;
+      let score = 0;
+      for (const sig of signals) {
+        const sigWords = sig.toLowerCase().split(/\s+/);
+        let hits = 0;
+        for (const w of sigWords) {
+          if (w.length > 2 && stLower.includes(w)) hits++;
+        }
+        if (hits > score) {
+          score = hits;
+          matchedSignal = sig;
+        }
+      }
+      return { ...st, matchedSignal, score };
+    });
+
+    // Sort: matched subtasks first (highest score), then unmatched
+    matches.sort((a, b) => b.score - a.score);
+
+    let html = '<div class="stc-header">Complete subtasks with this email?</div>';
+    for (const m of matches) {
+      const checked = m.score >= 2 ? 'checked' : '';
+      html += `<label>
+        <input type="checkbox" class="stc-checkbox" data-stid="${esc(m.id)}" ${checked}>
+        <span>${esc(m.text)}</span>
+      </label>`;
+      if (m.matchedSignal && m.score > 0) {
+        html += `<div class="stc-match">matched: "${esc(m.matchedSignal)}"</div>`;
+      }
+    }
+    container.innerHTML = html;
+    container.style.display = 'block';
+  } catch (e) {
+    container.style.display = 'none';
+  }
+}
+
+function autoFillJobName(triageId) {
+  // Auto-fills or strips site prefix from job name field
+  const nameInput = document.getElementById('triage-name-' + triageId);
+  if (!nameInput) return;
+  const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+  if (!item) return;
+  // Location: the deterministic suggestion fills an empty box.
+  const locInput = document.getElementById('triage-site-' + triageId);
+  if (locInput && !locInput.value.trim()) {
+    const sug = (item.suggestion && (item.suggestion.location || item.suggestion.site)) || '';
+    if (sug) { locInput.value = sug; updateTriageField(triageId, 'new_project_location', sug); }
+  }
+  // Use existing value if present, otherwise pull from email subject
+  let jobHint = nameInput.value.trim()
+    || (item.new_project_name || '').trim()
+    || (item.subject || '').replace(/^(re:|fw:|fwd:)\s*/gi, '').trim();
+  // Strip a location prefix from the name
+  const siteInput = document.getElementById('triage-site-' + triageId);
+  if (siteInput && siteInput.value.trim()) {
+    const site = siteInput.value.trim();
+    const lower = jobHint.toLowerCase();
+    const siteLower = site.toLowerCase();
+    if (lower.startsWith(siteLower)) {
+      jobHint = jobHint.substring(site.length).replace(/^[\s\--:,]+/, '').trim();
+    }
+  }
+  if (jobHint) {
+    nameInput.value = jobHint;
+    updateTriageField(triageId, 'new_project_name', jobHint);
+  }
+}
+
+async function updateTriageField(triageId, field, value) {
+  try {
+    const r = await fetch(`/api/triage/${triageId}`, {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ [field]: value })
+    });
+    if (!r.ok) {
+      const errData = await r.json().catch(() => ({}));
+      throw new Error(errData.error || 'HTTP ' + r.status);
+    }
+    // Only update local state if server confirmed the write
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    if (item) {
+      item[field] = value;
+      item.edited = true;
+    }
+  } catch(e) { toast('Error updating triage: ' + e.message); }
+}
+
+// Animate a triage card out of the panel. Returns a promise that resolves when animation ends.
+function animateCardOut(triageId, animClass = 'triage-exit-approve') {
+  const cardEl = document.getElementById('triage-' + triageId);
+  if (!cardEl) return Promise.resolve();
+  return new Promise(resolve => {
+    cardEl.classList.add(animClass);
+    cardEl.addEventListener('animationend', () => resolve(), { once: true });
+    // Safety timeout in case animationend never fires
+    setTimeout(resolve, 400);
+  });
+}
+
+async function approveTriage(triageId) {
+  try {
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    const cardType = item ? (item.card_type || 'email') : 'email';
+
+    // Collect subtask completions (checked checkboxes in the completion panel)
+    const stcChecked = [];
+    const stcContainer = document.getElementById('triage-subtask-completions-' + triageId);
+    if (stcContainer) {
+      stcContainer.querySelectorAll('.stc-checkbox:checked').forEach(cb => {
+        stcChecked.push(cb.dataset.stid);
+      });
+    }
+
+    // Check for quote request toggle on new project cards
+    const quoteReqEl = document.getElementById('triage-quotereq-' + triageId);
+    const quoteRequest = quoteReqEl ? quoteReqEl.checked : false;
+
+    // Build approve payload: ALL DOM state goes in one shot, no pre-sync PUTs.
+    // Server-side approve handlers apply these as DOM-truth overrides.
+    const approvePayload = { subtask_completions: stcChecked, quote_request: quoteRequest };
+
+    // Read the create-new fields off the DOM: location + name, plus the work
+    // type (and its workflow) the dropdown encodes as `__new__:<work_type>`.
+    const readNewFields = (val) => {
+      if (tvBase(val) !== '__new__') return;
+      const se = document.getElementById('triage-site-' + triageId);
+      const ne = document.getElementById('triage-name-' + triageId);
+      if (se) approvePayload.new_project_location = se.value;
+      if (ne) approvePayload.new_project_name = ne.value;
+      if (tvWorkType(val)) approvePayload.work_type = tvWorkType(val);
+      if (tvWorkflow(val)) approvePayload.workflow_id = tvWorkflow(val);
+    };
+
+    if (cardType === 'email' || cardType === 'acknowledgment') {
+      const ps = document.getElementById('triage-proj-' + triageId);
+      if (ps) {
+        approvePayload.matched_project = tvBase(ps.value);
+        readNewFields(ps.value);
+      }
+      const dollarEl = document.getElementById('triage-dollar-' + triageId);
+      if (dollarEl && dollarEl.value) {
+        approvePayload.dollar_amount = parseFloat(dollarEl.value) || null;
+      }
+    } else if (cardType === 'subtask_proposal') {
+      const ps = document.getElementById('triage-proj-' + triageId);
+      if (ps) {
+        approvePayload.project_id = tvBase(ps.value);
+        if (tvWorkflow(ps.value)) approvePayload.workflow_id = tvWorkflow(ps.value);
+      }
+      const stEl = document.getElementById('triage-subtask-' + triageId);
+      if (stEl) approvePayload.proposed_subtask = stEl.value;
+    } else if (cardType === 'reassign_subtask') {
+      const ps = document.getElementById('triage-proj-' + triageId);
+      if (ps) {
+        approvePayload.project_id = tvBase(ps.value);
+        readNewFields(ps.value);
+      }
+      const stEl = document.getElementById('triage-subtask-' + triageId);
+      if (stEl) approvePayload.proposed_subtask = stEl.value;
+    }
+
+    const r = await fetch(`/api/triage/${triageId}/approve`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(approvePayload)
+    });
+    if (!r.ok) {
+      const errData = await r.json().catch(() => ({}));
+      throw new Error(errData.error || 'HTTP ' + r.status);
+    }
+    const data = await r.json();
+
+    // Animate out the approved card + any thread siblings before re-rendering
+    const animPromises = [animateCardOut(triageId, 'triage-exit-approve')];
+    const sibCount = data.thread_siblings_committed || 0;
+    if (sibCount > 0 && item && item.conversation_id) {
+      TRIAGE_ITEMS.filter(i => i.conversation_id === item.conversation_id && i.triage_id !== triageId)
+        .forEach(sib => animPromises.push(animateCardOut(sib.triage_id, 'triage-exit-approve')));
+    }
+    await Promise.all(animPromises);
+
+    // Remove from local list after animation completes
+    TRIAGE_ITEMS = TRIAGE_ITEMS.filter(i => i.triage_id !== triageId);
+    if (sibCount > 0 && item && item.conversation_id) {
+      TRIAGE_ITEMS = TRIAGE_ITEMS.filter(i => i.conversation_id !== item.conversation_id);
+    }
+    renderTriagePanel();
+
+    // Card-type-specific toast: show instantly
+    const stcCount = stcChecked.length;
+    const sibMsg = sibCount > 0 ? ` + ${sibCount} thread email${sibCount > 1 ? 's' : ''} auto-filed` : '';
+    if (cardType === 'subtask_proposal') {
+      const pName = data.project ? data.project.name : '';
+      toast(`Subtask added → ${pName}`);
+    } else if (cardType === 'reassign_subtask') {
+      const pName = data.project ? data.project.name : '';
+      toast(`Subtask reassigned → ${pName}`);
+    } else {
+      const projName = data.project ? data.project.name : 'skipped';
+      const stcMsg = stcCount > 0 ? ` + ${stcCount} subtask${stcCount > 1 ? 's' : ''} completed` : '';
+      toast(`Approved → ${projName}${stcMsg}${sibMsg}`);
+    }
+
+    // Refresh board + triage data in background: don't block the UI
+    loadData();
+    loadTriageItems();
+  } catch(e) {
+    console.error('Approve error:', e);
+    toast('Approve failed: ' + e.message);
+  }
+}
+
+async function dismissTriage(triageId) {
+  try {
+    await fetch(`/api/triage/${triageId}`, { method: 'DELETE' });
+    await animateCardOut(triageId, 'triage-exit-dismiss');
+    TRIAGE_ITEMS = TRIAGE_ITEMS.filter(i => i.triage_id !== triageId);
+    renderTriagePanel();
+    toast('Dismissed');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function ignoreTriage(triageId) {
+  try {
+    // If matched to a real project, set that project to ignored status
+    const item = TRIAGE_ITEMS.find(i => i.triage_id === triageId);
+    const proj = item?.matched_project;
+    const pr = (proj && !String(proj).startsWith('__')) ? (DATA.projects||[]).find(x => x.id === proj) : null;
+    const ignStage = pr ? stageWithRole('ignored', projectWorkflowId(pr)) : null;
+    // Hiding the mail must not silently hide a live project with it.
+    if (pr && ignStage && pr.status !== ignStage && !isClosedStage(pr.status, projectWorkflowId(pr))) {
+      const ok = confirm(`This mail is matched to "${pr.name}". Hiding it will also hide "${pr.name}" from the board (moved to ${stageLabel(ignStage)}).\n\nOK hides both. Cancel keeps "${pr.name}" and only sets the mail aside.`);
+      if (!ok) { await dismissTriage(triageId); return; }
+    }
+    if (pr && ignStage) await apiPut(proj, { status: ignStage });
+    // Remove from staging
+    await fetch(`/api/triage/${triageId}`, { method: 'DELETE' });
+    await animateCardOut(triageId, 'triage-exit-ignore');
+    TRIAGE_ITEMS = TRIAGE_ITEMS.filter(i => i.triage_id !== triageId);
+    renderTriagePanel();
+    await loadData();
+    toast('Ignored' + (pr && ignStage ? ` -> ${pr.name} set to ${stageLabel(ignStage)}` : ''));
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function approveAllTriage() {
+  const pending = TRIAGE_ITEMS.filter(i => i.status === 'pending');
+  if (!pending.length) return;
+  // Server path: one call, unmatched cards are skipped and left for the user.
+  try {
+    const r = await fetch('/api/triage/approve-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (r.status !== 404 && r.status !== 405) {
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+      const n = v => Array.isArray(v) ? v.length : (parseInt(v, 10) || 0);
+      const a = n(j.approved), sk = n(j.skipped_unmatched), f = n(j.failed);
+      await loadTriageItems(); await loadData();
+      toast(`Added ${a}` + (sk ? `, ${sk} left for you (no match yet)` : '') + (f ? `, ${f} failed` : ''));
+      return;
+    }
+  } catch (e) { toast('Add all failed: ' + e.message); return; }
+  // Older engine: one approve per card. Unmatched cards are left alone and
+  // every failure is counted, never swallowed.
+  let approved = 0, skipped = 0;
+  const failed = [];
+  for (const item of pending) {
+    const mp = item.matched_project;
+    if ((item.card_type || 'email') === 'email' && (!mp || String(mp).startsWith('__'))) { skipped++; continue; }
+    try {
+      const r = await fetch(`/api/triage/${item.triage_id}/approve`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+      if (r.ok) approved++; else failed.push(item.subject || item.triage_id);
+    } catch (e) { failed.push(item.subject || item.triage_id); }
+  }
+  await loadTriageItems();
+  await loadData();
+  toast(`Added ${approved}` + (skipped ? `, ${skipped} left for you (no match yet)` : '') + (failed.length ? `, ${failed.length} failed: ${failed.slice(0, 2).join('; ')}` : ''));
+}
+
+// ── FILTER ──
+function matchesFilter(p) {
+  // Hide ignored unless showIgnored is on, or the active stat/tab filter counted
+  // it as a member: a tab must list exactly what it counted, and the CLOSED tab
+  // counts ignored projects too (isClosedStage covers complete AND ignored).
+  if (roleIs(p, 'ignored') && !showIgnored && statFilter !== 'ignored'
+      && !tabFilterHasMember(p.id)) return false;
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    const blob = [p.name, p.site, p.scope, p.open_question, p.last_activity, p.id,
+      ...(p.contacts||[]).map(c => c.name + ' ' + (c.role||'') + ' ' + (c.email||'')),
+      ...(p.notes||[]).map(n => n.text||''),
+      ...(p.subtasks||[]).map(s => s.text||''),
+      fieldSearchBlob(p)
+    ].join(' ').toLowerCase();
+    if (!blob.includes(q)) return false;
+  }
+  if (activeFilters.size > 0) {
+    // Type pills are PROF.work_types ids plus the two tag filters.
+    let pass = false;
+    if (activeFilters.has('revenue') && (p.tags||[]).includes('revenue')) pass = true;
+    if (activeFilters.has('flagged') && (p.tags||[]).includes('flagged')) pass = true;
+    if (activeFilters.has(p.work_type || '')) pass = true;
+    if (!pass) return false;
+  }
+  return true;
+}
+
+// ── CARD RENDERING ──
+function buildTags(p) {
+  let h = '';
+  if ((p.tags||[]).includes('flagged')) h += '<span class="tag tag-flagged">flagged</span>';
+  if ((p.tags||[]).includes('revenue')) h += '<span class="tag tag-revenue">$$</span>';
+  if (p.work_type) h += workTypePill(p.work_type);
+  if (p.follow_up_date) {
+    const d = daysUntil(p.follow_up_date);
+    if (d !== null && d === 0) h += '<span class="tag tag-followup">due today</span>';
+    else if (d !== null && d < 0) h += '<span class="tag tag-followup">overdue ' + Math.abs(d) + 'd</span>';
+    else if (d !== null && d <= 2) h += '<span class="tag tag-followup">' + d + 'd left</span>';
+  }
+  return h ? '<div class="tags">' + h + '</div>' : '';
+}
+
+// Contact line under a name: name + company, or name + role. A contact whose
+// role names the user's own company is a colleague; the role is noise there.
+function contactLine(cs) {
+  if (!cs || !cs.length) return '';
+  const own = ((PROF.user && PROF.user.company) || '').toLowerCase();
+  return cs.slice(0,3).map(c => {
+    let s = c.name || c.email || '';
+    if (c.company) s += ' \u00b7 ' + c.company;
+    else if (c.role && !(own && c.role.toLowerCase().includes(own))) s += ' \u00b7 ' + c.role;
+    return s;
+  }).join(' \u00b7 ') + (cs.length > 3 ? ` +${cs.length-3}` : '');
+}
+
+function buildCard(p) {
+  let detail = p.open_question || p.scope || '';
+  if (p.last_activity && p.last_activity.includes('\u2014')) {
+    detail = p.last_activity.split('\u2014').slice(1).join('\u2014').trim();
+  }
+  const isFlagged = (p.tags||[]).includes('flagged');
+  const isPinned = (p.tags||[]).includes('pinned');
+  const cardOverdue = isOverdue(p);
+  const uScore = getUrgencyMax(p);  // card display uses max (hottest subtask)
+  const uLevel = isPinned ? 'pinned' : getUrgencyLevel(uScore);
+  const uc = isPinned ? null : urgencyColors(uScore);
+
+  const sparkle = hasSLA(p);
+  return `<div class="card ${cardOverdue?'card-overdue':''}${_changedIds[p.id]>0?' urgency-up':''}${_changedIds[p.id]<0?' urgency-down':''}" draggable="true" data-id="${p.id}"${sparkle?' data-sparkle="true"':''}
+    style="position:relative"
+    data-on-dragstart='{"f":"onDragStart","a":[{"$":"event"}]}' data-on-dragend='{"f":"onDragEnd","a":[{"$":"event"}]}'
+    data-on-click="${EH(null, EK('openPanel', String(p.id)))}">
+    <span class="card-urgency${_changedIds[p.id]?' badge-changed':''}" title="Urgency score ${Math.round(uScore)}" style="background:${uc?uc.bg:'var(--c-0c1a2a)'};color:${uc?uc.text:'var(--c-4fc3f7)'}">${isPinned ? '📌' : esc(dueWord(nearestDue(p)))}</span>${p.snoozed_until && daysUntil(p.snoozed_until) > 0 ? `<span class="card-snooze-badge">⏸ ${p.snoozed_until.slice(5)}</span>` : ''}
+    <div class="card-actions">
+      <button class="card-btn ${isFlagged?'flagged':''}" data-on-click="${EH({sp:1}, EK('toggleFlag', String(p.id)))}" title="${isFlagged?'Unflag':'Flag'}">&#9873;</button>
+    </div>
+    ${buildTags(p)}
+    <div class="name">${qFlagHtml(p)}${esc(p.name)}</div>
+    <div class="site">${esc(p.site || '')}${p.site && (p.contacts||[]).length ? ' \u00b7 ' : ''}${esc(contactLine(p.contacts))}</div>
+    ${(() => { const f = renderFields(p, 'card'); return f ? `<div class="pf-chips">${f}</div>` : ''; })()}
+        ${(() => { const ps = sortedPendingSubtasks(p); return ps.length > 0 ? `<div class="detail" style="color:var(--t1)"><span style="color:var(--c-fac775);font-family:'JetBrains Mono',monospace;font-size: max(9px, var(--fs-min, 0px));font-weight:600;margin-right:4px">TODO</span>${esc(ps[0].text)}</div>` : `<div class="detail">${esc(detail)}</div>`; })()}
+    ${(p.subtasks&&p.subtasks.length) ? (() => { const done = p.subtasks.filter(s=>s.status==='complete').length; const pct = Math.round((done/p.subtasks.length)*100); return `<div class="card-subtask-bar"><div class="mini-bar"><div class="mini-fill" style="width:${pct}%"></div></div><span class="mini-label">${done}/${p.subtasks.length}</span></div>`; })() : ''}
+  </div>`;
+}
+
+// ── URGENCY SCORING: SUBTASK-DRIVEN ──
+// ── URGENCY SCORING v2 ──
+// Primary driver: TIME: how overdue is the subtask's follow-up, or how close is a deadline.
+// Exponential ramp: the longer you're late, the exponentially worse it gets.
+// Modifiers (deal stage, dollar value, customer loyalty) each capped at 5% of base.
+// Project urgency = max of all pending subtask scores.
+
+// Loyalty cache: computed once per data load from active + archived projects per location
+let _loyaltyCache = {};
+function rebuildLoyaltyCache() {
+  const counts = {};
+  (DATA.projects || []).forEach(p => {
+    const site = (p.site || '').toLowerCase().trim();
+    if (site && site !== 'not set') counts[site] = (counts[site] || 0) + 1;
+  });
+  (DATA.archived || []).forEach(p => {
+    const site = (p.site || p.location || '').toLowerCase().trim();
+    if (site && site !== 'not set') counts[site] = (counts[site] || 0) + 1;
+  });
+  _loyaltyCache = counts;
+}
+
+// Exponential urgency from days past due (positive = overdue)
+function urgencyFromOverdue(daysPast) {
+  if (daysPast <= 0) return 0;
+  // NOT CALLED anywhere: the live overdue curve is inline in getSubtaskScore.
+  // Kept in sync with it so a future caller inherits the slowed rate.
+  const d = daysPast / AGING_SLOWDOWN;
+  return d * d * 3;  // 4d=3, 8d=12, 12d=27, 20d=75, 28d=147
+}
+
+// ── AGING SLOWDOWN: ONE KNOB. Every curve below reaches a given score
+// AGING_SLOWDOWN times later than the raw formula. Set it to 1 for the raw
+// curves; raise it to age slower still. The deadline curve is deliberately NOT
+// slowed: a deadline is a fixed date.
+let AGING_SLOWDOWN = 4;   // `let`, not `const`: _oldToNewScale() flips it to 1
+                          // for one synchronous pass to measure the old scale.
+
+// CLOCK-DRIVEN task (a date type the profession marks `clock: true`, or the
+// legacy clock type id): ages LINEARLY over BUSINESS HOURS from when it was armed
+// (sla_created): floor CLOCK_FLOOR -> 999 at CLOCK_BASE_HOURS * AGING_SLOWDOWN
+// biz hours. A follow-up date in the FUTURE defers the start to that morning.
+const CLOCK_BASE_HOURS = 8;
+const CLOCK_FLOOR = 50;
+function isClockDateType(dt) {
+  if (!dt) return false;
+  if (dt === 'clock') return true;
+  const d = dateTypes().find(x => x.id === dt);
+  return !!(d && d.clock);
+}
+function clockSubtaskScore(st) {
+  const bh = bizHours();
+  const open = 'T' + String(bh.start).padStart(2, '0') + ':00:00';
+  const fu = st.follow_up_date ? String(st.follow_up_date).slice(0, 10) : null;
+  let basis = null;
+  if (fu && fu > localISODate(0)) basis = fu + open;   // deferred
+  else basis = st.sla_created;
+  if (!basis) {
+    const d = fu || st.created;
+    basis = d ? String(d).slice(0, 10) + open : null;
+  }
+  if (!basis) return CLOCK_FLOOR;
+  const elapsed = calcBizHoursElapsed(basis);
+  return Math.min(999, Math.max(CLOCK_FLOOR, Math.round(elapsed / (CLOCK_BASE_HOURS * AGING_SLOWDOWN) * 999)));
+}
+
+// For deadlines: urgency ramps to 999 (the ceiling) ON deadline day, starting 7
+// BUSINESS days out. Deadline day or past = 999, pinned. One scale for every
+// subtask type; everything ages on business days, not the wall clock.
+// Curve: cubic ramp 0->999 over 7 biz days.  7d=2, 5d=20, 3d=130, 1d=500, 0d=999
+const URGENCY_MAX = 999;
+const DEADLINE_RAMP_DAYS = 7;   // biz days, never divided by AGING_SLOWDOWN
+function urgencyFromDeadline(daysRemaining) {
+  if (daysRemaining === null) return 0;
+  // Deadline day or past: pinned at the ceiling (a DATE, never slowed)
+  if (daysRemaining <= 0) return URGENCY_MAX;
+  if (daysRemaining > DEADLINE_RAMP_DAYS) return 0;
+  // Cubic ramp: (1 - remaining/DEADLINE_RAMP_DAYS)^3 * 999
+  const t = 1 - daysRemaining / DEADLINE_RAMP_DAYS;
+  return Math.round(t * t * t * URGENCY_MAX);
+}
+
+// Deal stage modifier: 0 to 0.05, by the stage's ROLE.
+function dealStageMod(p) {
+  const role = projRole(p);
+  const hasApproval = (showMoney() && p.approved_amount > 0)
+    || /\bsigned\b|\bapprov/i.test((p.scope||'') + ' ' + (p.open_question||''))
+    || /\bgo.?ahead\b|\bmove.?forward\b/i.test((p.scope||'') + ' ' + (p.open_question||''));
+  const hasPendingSubs = (p.subtasks||[]).some(s => s.status !== 'complete');
+  if ((hasApproval || role === 'won' || role === 'in_progress') && hasPendingSubs) return 0.05;
+  if (role === 'out') return 0.03;
+  if (role === 'todo') return 0.02;
+  return 0;
+}
+
+// Value modifier: 0 to 0.05 (zero when money is off)
+function dollarMod(p) {
+  if (!showMoney()) return 0;
+  const dollars = p.approved_amount || p.quote_amount || 0;
+  if (dollars >= 100000) return 0.05;
+  if (dollars >= 50000) return 0.04;
+  if (dollars >= 20000) return 0.03;
+  if (dollars >= 5000) return 0.02;
+  if (dollars >= 1000) return 0.01;
+  return 0;
+}
+
+// Client loyalty modifier: 0 to 0.05 based on total projects for this location
+function loyaltyMod(p) {
+  const site = (p.site || '').toLowerCase().trim();
+  const count = _loyaltyCache[site] || 0;
+  if (count >= 5) return 0.05;
+  if (count >= 4) return 0.04;
+  if (count >= 3) return 0.03;
+  if (count >= 2) return 0.02;
+  return 0;  // first project with this customer, no loyalty bump
+}
+
+// Score a single subtask from its own follow-up date + project modifiers.
+// ONE SCALE: every path caps at URGENCY_MAX (999). Three paths:
+//   1. SLA response: 85 + 914*ratio^2 (biz hours), hits 999 at 4x the SLA boundary
+//   2. Deadline: cubic ramp over 7 biz days, 999 ON the deadline day (and past it); NOT slowed
+//   3. Normal follow-up: ramp 0->30 over the last 0.25 biz day, 30 + (days/4)^2*3 overdue (999 cap)
+//   Rates 1, 3 and the clock curve are divided by AGING_SLOWDOWN; the deadline
+//   curve is deliberately left alone.
+// ── Business-hours elapsed calculator (PROF.business_hours: start/end/days) ──
+// Server timestamps are local-naive in the profession's tz; the browser clock
+// is assumed to be in that tz too (single-user desktop app).
+function _clampToBiz(dt) {
+  const bh = bizHours();
+  const d = new Date(dt);
+  let guard = 0;
+  while (!isBizDay(d) && guard++ < 14) {
+    d.setDate(d.getDate() + 1);
+    d.setHours(bh.start, 0, 0, 0);
+  }
+  if (d.getHours() < bh.start) d.setHours(bh.start, 0, 0, 0);
+  if (d.getHours() >= bh.end) {
+    d.setDate(d.getDate() + 1);
+    d.setHours(bh.start, 0, 0, 0);
+    guard = 0;
+    while (!isBizDay(d) && guard++ < 14) d.setDate(d.getDate() + 1);
+  }
+  return d;
+}
+
+function calcBizHoursElapsed(createdStr) {
+  if (!createdStr) return 0;
+  const bh = bizHours();
+  let start = _clampToBiz(new Date(createdStr));
+  let end = _clampToBiz(new Date());
+  if (end <= start) return 0;
+  let total = 0;
+  let cursor = new Date(start);
+  let guard = 0;
+  while (cursor < end && guard++ < 5000) {
+    const eod = new Date(cursor);
+    eod.setHours(bh.end, 0, 0, 0);
+    if (end <= eod) {
+      total += (end - cursor) / 3600000;
+      break;
+    } else {
+      total += (eod - cursor) / 3600000;
+      cursor.setDate(cursor.getDate() + 1);
+      cursor.setHours(bh.start, 0, 0, 0);
+      let g2 = 0;
+      while (!isBizDay(cursor) && g2++ < 14) cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+  return total;
+}
+
+function getSubtaskScore(subtask, p) {
+  // ── RESPONSE SLA: fast-aging subtask for client emails ──
+  const isSla = (subtask.sla_type === 'response' || subtask.date_type === 'sla') && subtask.status !== 'complete';
+  if (isSla) {
+    const elapsed = calcBizHoursElapsed(subtask.sla_created || subtask.created);
+    const slaHrs = subtask.sla_hours || PROF.sla_hours || 4;
+    const ratio = elapsed / (slaHrs * AGING_SLOWDOWN);
+    // 85 at creation -> 999 at 4x the SLA boundary, pinned past it.
+    return Math.min(URGENCY_MAX, Math.round(85 + 914 * ratio * ratio));
+  }
+
+  // ── CLOCK-DRIVEN task: linear ramp over business hours from when it was armed.
+  if (isClockDateType(subtask.date_type) && subtask.status !== 'complete') {
+    return clockSubtaskScore(subtask);
+  }
+
+  const fuDate = subtask.follow_up_date;
+  if (!fuDate) return 0;
+
+  let base;
+  const dateType = subtask.date_type || 'follow_up';
+
+  if (dateType === 'deadline') {
+    // ── DEADLINE: cubic ramp over 7 BIZ days, 999 ON the due day ──
+    const remaining = bizFractionalDaysUntil(fuDate);
+    base = urgencyFromDeadline(remaining);
+  } else {
+    // ── NORMAL: continuous ramp from due date, on BUSINESS days ──
+    // T-0.25d: 0 → T-0: 30 (linear approach) → overdue: 30 + quadratic on days/4
+    const du = bizFractionalDaysUntil(fuDate);
+    if (du === null) { base = 0; }
+    else {
+      const daysPast = -du;
+      const APPROACH = 1 / AGING_SLOWDOWN;   // 0.25 biz days of pre-due ramp (was 1)
+      const dp = daysPast / AGING_SLOWDOWN;  // overdue clock, quartered
+      if (daysPast < -APPROACH) base = 0;
+      else if (daysPast < 0) base = (1 + daysPast / APPROACH) * 30;
+      else base = 30 + dp * dp * 3;
+    }
+  }
+
+  // Apply modifiers (each max 5% of base)
+  const modTotal = dealStageMod(p) + dollarMod(p) + loyaltyMod(p);
+  const score = Math.round(base * (1 + modTotal));
+  // Single ceiling for every subtask type
+  return Math.min(URGENCY_MAX, score);
+}
+
+// Check if project has any pending SLA subtask (for sparkle effect)
+function hasSLA(p) {
+  return (p.subtasks||[]).some(s => s.status !== 'complete' && (s.sla_type === 'response' || s.date_type === 'sla'));
+}
+
+// Project urgency = sum of all pending subtask scores (every completion moves the needle)
+// The hottest subtask still dominates via its raw score, but clearing smaller tasks
+// visibly reduces total urgency: no more "nothing happened" when you check things off.
+// PARKED = scores nothing until the project is picked back up: a stage whose
+// ROLE is closed or cold is muted. 'ignored' is muted too but returns -1 so it
+// sorts below zero.
+function getUrgencyScore(p) {
+  const role = projRole(p);
+  if (role === 'ignored') return -1;
+  if (role === 'closed' || role === 'cold') return 0;
+  if (p.snoozed_until) {
+    const snoozeD = daysUntil(p.snoozed_until);
+    if (snoozeD !== null && snoozeD > 0) return -0.5;
+  }
+  const pendingSubs = (p.subtasks||[]).filter(s => s.status !== 'complete');
+  if (pendingSubs.length === 0) return 0;
+  return Math.round(pendingSubs.reduce((sum, s) => sum + getSubtaskScore(s, p), 0));
+}
+
+// Helper: get just the max subtask score (used for card color/row display)
+function getUrgencyMax(p) {
+  if (isMutedStatus(p.status, p.workflow_id)) return 0;
+  if (p.snoozed_until) {
+    const snoozeD = daysUntil(p.snoozed_until);
+    if (snoozeD !== null && snoozeD > 0) return 0;
+  }
+  const pendingSubs = (p.subtasks||[]).filter(s => s.status !== 'complete');
+  if (pendingSubs.length === 0) return 0;
+  return Math.max(...pendingSubs.map(s => getSubtaskScore(s, p)));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SUBTASK-DRIVEN BOARD SORT 
+// "i want the project board to sort by subtask only. highest urgency subtask's
+//  project will be at the top of the list. sorted by urgency score > subtask
+//  type > date ... I want quote request to be my highest priority flow, specifically the
+//  quote requests that come in through the intake form. second I want SLA
+//  tasks. then the rest. if they're all 999 urgency then i want the oldest
+//  highest priority subtask to push its project to the top of the list."
+//
+// A project's place in the list IS its hottest pending subtask's place. Three
+// keys, in this order:
+//   1. the subtask's urgency score, DESC: the existing curve, reused verbatim
+//      (getSubtaskScore: clock / SLA / deadline / follow-up). Never
+//      re-derived here: two implementations of that curve would drift, and a
+//      row ordered by a different number than the badge on it prints is worse
+//      than no ordering at all.
+//   2. the priority RANK of its type, ASC: index in workflows.json sort.priority
+//   3. its AGE, ASC: oldest first
+// SCORE FIRST is deliberate and is the answer to "does a 600 quote request beat a 999
+// follow-up?": no. Type only separates a tie, which is exactly the wall of
+// 999s the user described.
+//
+// Ordering is IDENTICAL in the list view, inside every kanban column, and for
+// the subtasks shown on a card, so the task at the top of a card is the one
+// that put the card where it is.
+// ══════════════════════════════════════════════════════════════════════════
+
+// One rule's match against one subtask. Every key present must match (AND).
+function _sortRuleMatches(rule, st, p) {
+  const m = (rule && rule.match) || {};
+  const keys = Object.keys(m);
+  if (!keys.length) return true;            // the catch-all
+  if (m.date_type) {
+    const dt = st.date_type || 'follow_up';
+    // A response SLA is an SLA task whatever its date_type says: the scorer
+    // keys off sla_type === 'response' while the workflow document says
+    // date_type 'sla'. Both spellings land on the sla rule.
+    const isSla = dt === 'sla' || st.sla_type === 'response';
+    if (m.date_type === 'sla') { if (!isSla) return false; }
+    else if (dt !== m.date_type || isSla) return false;
+  }
+  if (m.source) {
+    const src = String(st.source || '').toLowerCase();
+    if (src !== String(m.source).toLowerCase()) return false;
+  }
+  if (m.workflow && projectWorkflowId(p) !== m.workflow) return false;
+  if (m.work_type && (p.work_type || '') !== m.work_type) return false;
+  if (m.text_prefix) {
+    if (!String(st.text || '').toLowerCase().startsWith(String(m.text_prefix).toLowerCase()))
+      return false;
+  }
+  return true;
+}
+
+// Rank = index of the first matching rule. The catch-all guarantees a hit, so
+// the fallback below only fires on a hand-broken config.
+function subtaskPriorityRank(st, p, rules) {
+  for (let i = 0; i < rules.length; i++) {
+    if (_sortRuleMatches(rules[i], st, p)) return i;
+  }
+  return rules.length;
+}
+
+// AGE: "oldest first" among equally-hot, equally-ranked tasks. Which field IS
+// the age depends on what the task's clock runs off, so it mirrors the scorer:
+//   SLA / quote request (ramp off a stamped start): sla_created → created → follow_up_date
+//   everything else (dated commitment):   follow_up_date → due → created → created_at
+// Returned as a comparable string; a task with no date at all yields '' and
+// therefore sorts OLDEST: the same convention the existing last_activity tie
+// break uses, and the safe direction (an undated task surfaces instead of
+// hiding at the bottom forever).
+function subtaskAgeKey(st) {
+  const dt = st.date_type || 'follow_up';
+  const clockDriven = (dt === 'sla' || isClockDateType(dt) || st.sla_type === 'response');
+  const order = clockDriven
+    ? [st.sla_created, st.created, st.created_at, st.follow_up_date, st.due]
+    : [st.follow_up_date, st.due, st.created, st.created_at, st.sla_created];
+  for (const v of order) { if (v) return String(v); }
+  return '';
+}
+
+// Pending subtasks of one project, hottest-first by the same three keys.
+// Returns [] for a project with nothing pending.
+function sortedPendingSubtasks(p) {
+  const pend = (p.subtasks || []).filter(s => s.status !== 'complete');
+  if (pend.length < 2) return pend;
+  const s = wfSort();
+  const scored = pend.map((st, i) => ({
+    st, i,
+    score: getSubtaskScore(st, p),
+    rank: s ? subtaskPriorityRank(st, p, s.priority) : 0,
+    age: subtaskAgeKey(st)
+  }));
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;   // 1. score DESC
+    if (a.rank !== b.rank)   return a.rank - b.rank;     // 2. priority ASC
+    const d = a.age.localeCompare(b.age);                // 3. oldest first
+    if (d) return d;
+    return a.i - b.i;                                    // stable
+  });
+  return scored.map(x => x.st);
+}
+
+// The project's own sort key: its best pending subtask.
+// A MUTED project (closed/cold/ignored/snoozed) has no key even when its
+// subtasks compute hot: getSubtaskScore deliberately ignores project status,
+// so without this a parked project's 999 task would top the board. Same rule
+// getUrgencyScore already enforces; `fallback` carries its value so the
+// keyless bucket keeps ignored below zero and snoozed below active.
+function projectSortKey(p) {
+  const proj = getUrgencyScore(p);
+  const muted = isMutedStatus(p.status, p.workflow_id)
+                || (p.snoozed_until && daysUntil(p.snoozed_until) > 0);
+  if (muted) return { has: false, score: 0, rank: 0, age: '', fallback: proj };
+  const best = sortedPendingSubtasks(p)[0];
+  if (!best) return { has: false, score: 0, rank: 0, age: '', fallback: proj };
+  const s = wfSort();
+  return {
+    has: true,
+    score: getSubtaskScore(best, p),
+    rank: s ? subtaskPriorityRank(best, p, s.priority) : 0,
+    age: subtaskAgeKey(best),
+    fallback: proj
+  };
+}
+
+// One key per project per sort, not one per comparison: a 260-project sort is
+// ~4k comparisons and each key walks that project's subtasks. Cleared by
+// projectComparator() at the start of every render, so it can never serve a
+// stale key across a data load.
+let _sortKeyCache = {};
+function projectSortKeyCached(p) {
+  const k = _sortKeyCache[p.id];
+  return k !== undefined ? k : (_sortKeyCache[p.id] = projectSortKey(p));
+}
+
+// The comparator. Projects with no pending subtask fall BELOW every project
+// that has one, ordered among themselves by project urgency (which is what
+// keeps `ignored` at -1 last).
+function compareProjectsBySubtask(a, b) {
+  const ka = projectSortKeyCached(a), kb = projectSortKeyCached(b);
+  if (ka.has !== kb.has) return ka.has ? -1 : 1;
+  if (!ka.has) {
+    if (kb.fallback !== ka.fallback) return kb.fallback - ka.fallback;
+    return (a.last_activity || '').localeCompare(b.last_activity || '');
+  }
+  if (kb.score !== ka.score) return kb.score - ka.score;   // 1. score DESC
+  if (ka.rank !== kb.rank)   return ka.rank - kb.rank;     // 2. priority ASC
+  const d = ka.age.localeCompare(kb.age);                  // 3. oldest first
+  if (d) return d;
+  return (a.last_activity || '').localeCompare(b.last_activity || '');
+}
+
+// The OLD order, unchanged: total project urgency DESC, oldest activity on a
+// tie . This is what `sort.mode: "project"` selects and what
+// an absent sort block falls back to.
+function compareProjectsByUrgency(a, b) {
+  const d = getUrgencyScore(b) - getUrgencyScore(a);
+  if (d) return d;
+  return (a.last_activity || '').localeCompare(b.last_activity || '');
+}
+
+// The one entry point every list/column render uses. Calling it starts a fresh
+// sort, so the key cache is dropped here and nowhere else.
+function projectComparator() {
+  _sortKeyCache = {};
+  return sortModeIsSubtask() ? compareProjectsBySubtask : compareProjectsByUrgency;
+}
+
+function getUrgencyLevel(score) {
+  // Still used for animation class targeting and kanban column borders.
+  // Visual colors now come from urgencyColors() continuous gradient.
+  if (score >= 75) return 'critical';
+  if (score >= 27) return 'high';
+  if (score >= 5) return 'medium';
+  return 'low';
+}
+
+// 7-band cool→hot ramp: thresholds + anchor colors identical to the Farsight
+// board so the same score shows the same color on both. Replaces the old neon
+// green→yellow→red→pink gradient, whose log scale pushed most real scores into
+// the red/pink zone and turned the whole board into one red-and-hot-pink wall.
+// (the user, 2026-07-16.) Band roles (border/text/bg/name/sub) are still derived per
+// band so each keeps the neon glow + dark tint. Manual pins stay cyan elsewhere.
+// Ramp: blue → cyan → gold → amber → orange → red-orange → crimson(999 ceiling).
+function urgencyColors(score) {
+  const gray = { border:'var(--line3)', text:'var(--t4)', bg:'var(--bg2)', name:'var(--t3)', sub:'var(--t3)' };
+  if (score <= 0) return gray;
+  const light = document.body.classList.contains('light');
+
+  const [r, g, b] =
+    score >= 999 ? [0xff, 0x2e, 0x63] :  // MAX      crimson  (999 ceiling)
+    score >= 300 ? [0xff, 0x52, 0x36] :  // CRITICAL red-orange
+    score >= 150 ? [0xff, 0x7a, 0x2e] :  // HOT      orange
+    score >= 75  ? [0xff, 0xab, 0x33] :  // HIGH     amber
+    score >= 50  ? [0xff, 0xd2, 0x4a] :  // ELEVATED gold
+    score >= 27  ? [0x46, 0xc9, 0xe0] :  // WARM     cyan
+                   [0x5a, 0xa9, 0xff];   // COOL     blue
+
+  // t (0-1) scales how dark the card fill sits: hotter = deeper tint.
+  const t = Math.min(1, Math.log(score + 1) / Math.log(URGENCY_MAX));
+  const [h, s, l] = rgbToHsl(r, g, b);
+
+  if (light) {
+    // Light palette: pale tinted fill, deep text. Same hue bands.
+    return {
+      border: `rgb(${r},${g},${b})`,
+      text:   `hsl(${h},${Math.round(s)}%,${Math.round(30 - t * 6)}%)`,
+      bg:     `hsl(${h},${Math.round(s * 0.7)}%,${Math.round(94 - t * 6)}%)`,
+      name:   `hsl(${h},${Math.round(s * 0.7)}%,${Math.round(26 - t * 6)}%)`,
+      sub:    `hsl(${h},${Math.round(s * 0.6)}%,${Math.round(32 - t * 6)}%)`
+    };
+  }
+  return {
+    border: `rgb(${r},${g},${b})`,
+    text:   `hsl(${h},${Math.round(s)}%,${Math.round(Math.min(82, l + 12))}%)`,
+    bg:     `hsl(${h},${Math.round(s * 0.45)}%,${Math.round(7 + t * 6)}%)`,
+    name:   `hsl(${h},${Math.round(s * 0.7)}%,${Math.round(62 + t * 18)}%)`,
+    sub:    `hsl(${h},${Math.round(s * 0.8)}%,${Math.round(58 + t * 14)}%)`
+  };
+}
+
+// HSL derivation for urgencyColors' band roles (h 0-360, s/l 0-100).
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  const l = (max + min) / 2;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  return [Math.round(h), s * 100, l * 100];
+}
+
+function isOverdue(p) {
+  if (isClosedStage(p.status, p.workflow_id)) return false;
+  if ((p.tags||[]).includes('archived')) return false;
+  // Check subtask-level dates first, then fall back to project-level
+  const pendingSubs = (p.subtasks||[]).filter(s => s.status !== 'complete');
+  for (const st of pendingSubs) {
+    const fu = st.follow_up_date;
+    if (fu && daysUntil(fu) !== null && daysUntil(fu) <= 0) return true;
+  }
+  return p.follow_up_date && daysUntil(p.follow_up_date) !== null && daysUntil(p.follow_up_date) <= 0;
+}
+
+// Is this project a member of the tab that is currently the active filter?
+// (Membership was computed by computeTabs earlier in this same render pass.)
+function tabFilterHasMember(id) {
+  const f = String(statFilter || '');
+  if (!f.startsWith('tab:')) return false;
+  const ids = _tabMembers[f.slice(4)];
+  return !!(ids && ids.has(id));
+}
+
+function matchesStatFilter(p) {
+  if (!statFilter) return true;
+  // Workflow tabs (2026-09-02): membership was computed by computeTabs() at
+  // the top of this same renderBoard pass, so it is always in step with what
+  // the strip is showing. An unknown tab id filters nothing rather than
+  // blanking the board.
+  if (String(statFilter).startsWith('tab:')) {
+    const ids = _tabMembers[String(statFilter).slice(4)];
+    return ids ? ids.has(p.id) : true;
+  }
+  if (statFilter === 'active') return !isClosedStage(p.status, p.workflow_id);
+  if (statFilter === 'todo') return isTodo(p);
+  if (statFilter === 'closed') return isClosedStage(p.status, p.workflow_id);
+  if (statFilter === 'ignored') return roleIs(p, 'ignored');
+  return true;
+}
+
+// ── BUDGETS ARE NOT QUOTES ──────────────────────────────────────────────
+// A project tagged `budget` (or whose work type is flagged `budgetary`) carries
+// a planning figure, not a bid that can be won. It never feeds pipeline,
+// quoted/won totals, close rate or the HUD bars.
+function isBudgetProject(p) {
+  if (!p) return false;
+  try {
+    const t = typeof p.tags === 'string' ? JSON.parse(p.tags) : (p.tags || []);
+    if (Array.isArray(t) && t.includes('budget')) return true;
+  } catch (e) {}
+  const wt = workTypeDef(p.work_type);
+  return !!(wt && wt.budgetary);
+}
+// Every quote-stat aggregation funnels through this: one place to fix if the
+// definition of "not a real quote" ever changes.
+function countsAsQuote(p) { return showMoney() && !!(p && p.quote_amount) && !isBudgetProject(p); }
+
+function isTodo(p) {
+  // "To Do" = anything needing the user's hands AND having urgency > 0
+  if (isClosedStage(p.status, p.workflow_id)) return false;
+  if (getUrgencyScore(p) <= 0) return false;
+  if (roleIs(p, 'todo')) return true;
+  if (isOverdue(p)) return true;
+  return false;
+}
+
+function setStatFilter(filter) {
+  if (statFilter === filter) { statFilter = null; }
+  else { statFilter = filter; }
+  renderBoard();
+}
+
+function setView(view) {
+  currentView = view;
+  renderBoard();
+}
+
+function buildListRow(p) {
+  const score = getUrgencyMax(p);  // row display uses max (hottest subtask)
+  const isPinnedRow = (p.tags||[]).includes('pinned');
+  const level = isPinnedRow ? 'pinned' : getUrgencyLevel(score);
+  const overdue = isOverdue(p);
+
+  let detail = p.open_question || p.scope || '';
+  if (p.last_activity && p.last_activity.includes('\u2014')) {
+    detail = p.last_activity.split('\u2014').slice(1).join('\u2014').trim();
+  }
+
+  // Find the most overdue date (subtask or project level) for the badge
+  let maxOverdueDays = 0;
+  if (overdue) {
+    const pendingSubs = (p.subtasks||[]).filter(s => s.status !== 'complete');
+    for (const st of pendingSubs) {
+      const fu = st.follow_up_date;
+      if (fu) { const d = daysUntil(fu); if (d !== null && d < 0) maxOverdueDays = Math.max(maxOverdueDays, Math.abs(d)); }
+    }
+    if (p.follow_up_date) { const d = daysUntil(p.follow_up_date); if (d !== null && d < 0) maxOverdueDays = Math.max(maxOverdueDays, Math.abs(d)); }
+  }
+  // Due today (no date strictly in the past) is a deadline, not a miss: amber
+  // DUE TODAY instead of a red "0d OVERDUE".
+  const overdueHtml = !overdue ? ''
+    : (maxOverdueDays > 0 ? `<span class="overdue-badge">${maxOverdueDays}d OVERDUE</span>`
+                          : `<span class="overdue-badge due-today">DUE TODAY</span>`);
+  const statusLabel = stageLabel(p.status);
+  // No currency anywhere when features.money is off.
+  const money = (showMoney() && p.quote_amount) ? fmtMoney(p.quote_amount) : '';
+  const actDays = daysSince(p.last_activity);
+  const ageText = actDays !== null ? (actDays === 0 ? 'today' : actDays + 'd ago') : '';
+
+  // Show highest-scoring pending subtask: subtask drives the project urgency
+  const allSubs = p.subtasks || [];
+  const pendingSubs = allSubs.filter(s => s.status !== 'complete');
+  const doneSubs = allSubs.filter(s => s.status === 'complete');
+
+  const rc = isPinnedRow ? null : urgencyColors(score);
+  const rcBorder = isPinnedRow ? '#4fc3f7' : rc.border;
+  const rcName = isPinnedRow ? '#f5f3ed' : rc.name;
+
+  let subsHtml = '';
+  if (pendingSubs.length > 0) {
+    // Show the DRIVER: the subtask that put this row where it is. Same three
+    // keys the row order uses (score > priority > age), so the task you read is
+    // the reason for the position you read it at.
+    const top = sortedPendingSubtasks(p)[0];
+    const topScore = getSubtaskScore(top, p);   // local: never stamped onto
+                                                // the shared DATA subtask
+    // Colour the subtask line by the PROJECT's score, not the subtask's raw one,
+    // whenever the project is muted (parked/snoozed → score 0). getSubtaskScore
+    // deliberately ignores project status, so a cold project's quote request task still
+    // computes 999: without this the row read "0" in grey while the task under
+    // it screamed hot pink. Half-muted is worse than not muted. 
+    const tc = urgencyColors(score === 0 ? 0 : topScore);
+    const doneCount = doneSubs.length;
+    const totalCount = allSubs.length;
+    const topFu = top.follow_up_date || p.follow_up_date;
+    const topFuShort = topFu ? formatShortDate(topFu) : '';
+    const topDateType = top.date_type || 'follow_up';
+    const topFuOverdue = topFu && daysUntil(topFu) !== null && daysUntil(topFu) < 0;
+    const topDateLabel = topFu ? dateTypeShort(topDateType) : '';
+    const isTopResponse = top.sla_type === 'response';
+    const topSlaElapsed = isTopResponse ? calcBizHoursElapsed(top.sla_created || top.created) : 0;
+    const topSlaHrs = top.sla_hours || PROF.sla_hours || 4;
+    const topSlaLabel = isTopResponse ? `${topSlaElapsed.toFixed(1)}/${topSlaHrs}h` : '';
+    subsHtml = `<div class="list-row-subtasks">
+      <div class="list-subtask-item" style="color:${tc.sub}">
+        <input type="checkbox" class="task-check" style="border-color:${tc.border}"
+          data-on-click="${EH({sp:1}, EK('toggleSubtask', String(p.id), String(top.id), true))}"
+          >
+        <span>${esc(top.text)}</span>
+        ${isTopResponse ? `<span style="font-size: max(10px, var(--fs-min, 0px));color:${tc.text};margin-left:6px;white-space:nowrap;background:${tc.bg};padding:1px 4px;border-radius:2px;border:1px solid ${tc.border}">${topSlaLabel}</span>` : ''}
+        ${!isTopResponse && topFu ? `<span style="font-size: max(10px, var(--fs-min, 0px));color:${topFuOverdue?tc.text:'var(--t3)'};margin-left:6px;white-space:nowrap">${topDateLabel} ${topFuShort}</span>` : ''}
+        ${totalCount > 1 ? `<span class="subtask-count-badge">${doneCount}/${totalCount}</span>` : ''}
+      </div>
+    </div>`;
+  } else if (doneSubs.length > 0) {
+    subsHtml = `<div class="list-row-subtasks">
+      <div class="list-subtask-item done">
+        <span>All ${doneSubs.length} tasks complete</span>
+      </div>
+    </div>`;
+  }
+
+  const sparkleRow = hasSLA(p);
+  return `<div class="list-row${_changedIds[p.id]>0?' urgency-up':''}${_changedIds[p.id]<0?' urgency-down':''}" style="border-left:3px solid ${rcBorder}" data-id="${p.id}"${sparkleRow?' data-sparkle="true"':''} data-on-click="${EH(null, EK('openPanel', String(p.id)))}">
+    <div class="list-row-main">
+      <div class="list-row-name" style="color:${rcName}">${isPinnedRow ? '<span class="urg-word" title="Pinned">📌</span>' : urgencyWordHtml(p, score, rc)}${p.work_type ? workTypePill(p.work_type, 'tag-row') : ''}${qFlagHtml(p)}${esc(p.name)}</div>
+      <div class="list-row-site">${esc(p.site || '')}${p.site && (p.contacts||[]).length ? ' \u00b7 ' : ''}${esc(contactLine(p.contacts))}</div>
+      ${(() => { const f = renderFields(p, 'list'); return f ? '<div class="pf-chips">' + f + '</div>' : ''; })()}
+    </div>
+    <div class="list-row-detail">${esc(detail)}</div>
+    <div class="list-row-status status-${escA(p.status)}">${teamDot(p.team)}${esc(statusLabel)}</div>
+    <div class="list-row-money">${money}</div>
+    <div class="list-row-age">${ageText}</div>
+    ${subsHtml}
+  </div>`;
+}
+
+
+// ── FLIP ANIMATION ENGINE ──
+// Captures bounding rects before re-render, then animates elements to new positions.
+let _flipRects = {};  // { projId: DOMRect }
+let _flipSource = null;  // 'subtask' | 'refresh' | null: controls animation intensity
+let _panelEditLock = false;  // true while user is actively editing a date/input in the panel
+let _pendingPanelRender = null;  // queued panel re-render ID while locked
+
+function flipSnapshot() {
+  _flipRects = {};
+  const selector = currentView === 'list' ? '.list-row[data-id]' : '.card[data-id]';
+  document.querySelectorAll(selector).forEach(el => {
+    if (el.dataset.id) _flipRects[el.dataset.id] = el.getBoundingClientRect();
+  });
+}
+
+function flipAnimate() {
+  if (Object.keys(_flipRects).length === 0) return;
+  if (typeof UI !== 'undefined' && !UI.flip) { _flipRects = {}; _flipSource = null; return; }
+  const selector = currentView === 'list' ? '.list-row[data-id]' : '.card[data-id]';
+  const isSubtaskAction = _flipSource === 'subtask';
+
+  document.querySelectorAll(selector).forEach(el => {
+    const id = el.dataset.id;
+    if (!id || !_flipRects[id]) return;
+
+    const oldRect = _flipRects[id];
+    const newRect = el.getBoundingClientRect();
+    const deltaX = oldRect.left - newRect.left;
+    const deltaY = oldRect.top - newRect.top;
+
+    // Only animate if position actually changed
+    if (Math.abs(deltaX) < 2 && Math.abs(deltaY) < 2) return;
+
+    // Determine direction for dramatic class
+    const movingDown = deltaY < 0;  // old was above new → tile moved down
+    const movingUp = deltaY > 0;
+
+    // Apply inverse transform (snap to old position)
+    el.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+    el.style.transition = 'none';
+
+    // Force reflow
+    el.offsetHeight;
+
+    // Pick animation class based on direction and trigger
+    if (isSubtaskAction && Math.abs(deltaY) > 20) {
+      el.classList.add(movingDown ? 'flip-demote' : 'flip-promote');
+    } else {
+      el.classList.add('flip-animate');
+    }
+
+    // Animate to final position
+    el.style.transform = '';
+
+    // Cleanup after animation
+    const cleanup = () => {
+      el.classList.remove('flip-animate', 'flip-demote', 'flip-promote');
+      el.style.transition = '';
+      el.removeEventListener('transitionend', cleanup);
+    };
+    el.addEventListener('transitionend', cleanup);
+    // Safety cleanup
+    setTimeout(cleanup, 1000);
+  });
+
+  _flipRects = {};
+  _flipSource = null;
+}
+
+// ── SCROLL ANCHORING (2026-08-12) ──────────────────────────────────────
+// Every render replaces innerHTML wholesale. When a scroller's content is
+// swapped, the browser clamps its scrollTop (content height momentarily 0),
+// so the board, the triage panel and the detail panel all snapped back to the
+// top on every 30s refresh and on every subtask click. Snapshot the scroll
+// offsets before the swap and put them back after: twice, since layout of the
+// new content (and any async fill like correspondence) settles a frame later.
+const _SCROLL_SELECTORS = ['.board-wrap', '.main-left', '.triage-panel', '#detail-panel'];
+function snapshotScroll(selectors) {
+  const out = [];
+  (selectors || _SCROLL_SELECTORS).forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => {
+      if (el.scrollTop || el.scrollLeft) out.push([el, el.scrollTop, el.scrollLeft]);
+    });
+  });
+  return out;
+}
+function restoreScroll(snap) {
+  if (!snap || !snap.length) return;
+  const apply = () => snap.forEach(([el, top, left]) => {
+    if (!el || !el.isConnected) return;
+    if (top && el.scrollTop !== top) el.scrollTop = top;
+    if (left && el.scrollLeft !== left) el.scrollLeft = left;
+  });
+  apply();
+  requestAnimationFrame(apply);
+}
+
+// Per-project correspondence scroll memory + last-seen message count.
+// The thread auto-jumps to newest ONLY on first open or when a new message
+// actually landed; a plain re-render keeps the user where he was reading.
+const _corrScroll = {};   // projId -> {container, thread, lanes:[]}
+const _corrSeen = {};     // projId -> message count at last render
+// Last rendered correspondence / dump-zone HTML per project. Both panes fill
+// ASYNC after renderPanel, so a re-render used to leave them EMPTY for ~500ms -
+// panel-body measured 2718px → 2166px → 2715px on a single subtask click, which
+// slid everything below the correspondence box up 550px and then dropped it back
+// (the "twitch"). Seeding the cached markup keeps the height constant, and an
+// identical payload skips the swap entirely (2026-08-12).
+const _corrHtml = {};     // projId -> inner HTML
+const _corrCountTxt = {}; // projId -> the "12 emails · 3 files" label
+const _dumpHtml = {};     // projId -> inner HTML
+const _dumpCountTxt = {};
+let _panelSig = null;        // signature of the project the panel currently shows
+let _panelRenderedId = null; // which project's markup is actually in the DOM
+
+// Source tag for the floating combat numbers. 'dot' = the 60s aging tick, whose
+// changes are dozens of 1-3 point drips across the whole board: those get
+// consolidated into ONE number instead of spamming the screen (2026-08-12).
+let _fctSource = null;
+let _fctAggLabel = null;
+
+// Signature of everything the detail panel renders. Refresh cycles that change
+// nothing skip the panel re-render entirely: no DOM churn, no correspondence
+// re-fetch, no jump. Urgency score is included so the badges still tick.
+function panelSignature(p) {
+  if (!p) return '';
+  try {
+    return JSON.stringify([
+      p.status, p.name, p.site, p.location, p.work_type, p.workflow_id, p.quote_amount, p.approved_amount,
+      p.quote_sent_date, p.follow_up_date, p.last_activity, p.open_question, p.sold_date, p.won_date, p.closed_date,
+      p.tags, p.subtasks, p.notes, p.key_details, p.contacts, p.scope,
+      p.team,
+      getUrgencyScore(p)
+    ]);
+  } catch(e) { return String(Math.random()); }
+}
+
+// ── BOARD ──
+function isUserEditing() {
+  const ae = document.activeElement;
+  if (!ae) return false;
+  // Search box should never block re-render: that's how filtering works
+  if (ae.id === 'search') return false;
+  // Checkboxes aren't "editing": clicking one should trigger immediate re-render + FLIP
+  if (ae.type === 'checkbox') return false;
+  return ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable;
+}
+
+function renderBoard() {
+  if (!DATA) return;
+  // Skip render if user is typing in an input: prevents nuking mid-edit text
+  if (isUserEditing()) return;
+  // Hold every scroller's position across the innerHTML swaps below
+  const _scrollSnap = snapshotScroll();
+  // FLIP step 1: snapshot current tile positions before re-render
+  flipSnapshot();
+  const projects = DATA.projects || [];
+  // Stats (always from full list, not filtered)
+  // Merge active + archived for KPI calculations (win rate, Won YTD)
+  const all = projects;
+  const archived = DATA.archived || [];
+  const allForStats = [...all, ...archived];
+
+  // ★ TABS FIRST. Both matchesFilter (the ignored-visibility rule) and
+  // matchesStatFilter read _tabMembers, so membership must be computed for THIS
+  // pass before anything filters: computing it inside the metrics strip left
+  // both readers a render behind (2026-09-03).
+  _tabsComputed = computeTabs(all, allForStats);
+
+  const filtered = projects.filter(matchesFilter);
+  const now = new Date();
+  // Win rate is AMOUNT-based: won = has approved_amount, quotable = anything
+  // that got a quote. Budgets are excluded from BOTH sides.
+  const wonCount = allForStats.filter(p => p.approved_amount && !isBudgetProject(p)).length;
+  const quotable = allForStats.filter(p => (p.quote_amount || p.approved_amount) && !isBudgetProject(p)).length;
+  const winRate = quotable > 0 ? Math.round((wonCount / quotable) * 100) : 0;
+
+  // Pipeline = total quoted amount on projects whose stage ROLE is `out`
+  // (proposal sent, waiting on the client), active only, not yet approved.
+  const pipeline = all.filter(p => roleIs(p, 'out') && countsAsQuote(p) && !p.approved_amount)
+    .reduce((s,p) => s + p.quote_amount, 0);
+  // Won YTD = approved amounts this year (active + archived), by won_date,
+  // falling back to closed_date, then created.
+  const yearStart = new Date(now.getFullYear(), 0, 1);
+  const wonYTD = allForStats.filter(p => {
+    if (!p.approved_amount || isBudgetProject(p)) return false;
+    const dateStr = p.sold_date || p.won_date || p.closed_date || p.created;
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    return d >= yearStart;
+  }).reduce((s,p) => s + p.approved_amount, 0);
+
+  const fmtM = n => n >= 1000 ? currencySymbol() + (n/1000).toFixed(1) + 'k' : fmtMoney(n);
+
+  // Build unified metrics strip
+  let mHtml = '';
+  // ── HEADER TABS (row 1) ──
+  // Dynamic from the workflow settings (GET /api/board-tabs → /api/workflows →
+  // today's hardcoded strip), then GROUPED by lifecycle cluster: see
+  // TAB_GROUPS. Membership lands in _tabMembers for matchesStatFilter.
+  mHtml += `<div class="m-row m-row-tabs">${renderTabStrip(all, allForStats)}</div>`;
+
+  // ── TOOLS (row 2): KPIs, then filters, then actions hard right ──
+  // Filters and actions are different animals: `+ TASK` / `+ PROJECT` CREATE,
+  // they don't narrow, so they sit with the view toggle across the gap.
+  mHtml += '<div class="m-row m-row-tools">';
+
+  // KPIs: pipeline / won YTD / win rate are money figures; not rendered at
+  // all when features.money is off.
+  if (showMoney()) {
+    mHtml += `<div class="m-kpi m-kpi-pipeline"><span class="num">${fmtM(pipeline)}</span><span class="lbl">pipeline</span></div>`;
+    mHtml += `<div class="m-kpi m-kpi-won"><span class="num">${fmtM(wonYTD)}</span><span class="lbl">won ytd</span></div>`;
+    mHtml += `<div class="m-kpi m-kpi-rate"><span class="num">${winRate}%</span><span class="lbl">win rate</span></div>`;
+    mHtml += '<div class="m-sep"></div>';
+  }
+
+  // Type filter pills: one per PROF.work_types entry (only when there are 2+).
+  const _wts = workTypes();
+  if (_wts.length > 1) {
+    _wts.forEach(wt => {
+      const col = wt.color || '';
+      mHtml += `<button class="type-pill${activeFilters.has(wt.id)?' active':''}" data-filter="${escA(wt.id)}" data-on-click="${EH(null, EK('toggleTypePill', $T, String(wt.id)))}" title="${escA(wt.label || wt.id)}"${col ? ` style="--wt:${escA(col)}"` : ''}>${esc(wt.short || (wt.label || wt.id).toUpperCase())}</button>`;
+    });
+  }
+  mHtml += `<button class="archive-toggle${showArchive?' active':''}" id="archive-toggle-btn" data-on-click='{"f":"toggleArchive"}'>ARCHIVE</button>`;
+
+  mHtml += '<div class="m-spacer"></div>';
+
+  // Quick Task + View toggle
+  mHtml += `<button class="type-pill quick-task-btn" data-on-click='{"f":"showQuickTaskForm"}' title="Add a standalone task">+ TASK</button>`;
+  mHtml += `<button class="type-pill quick-project-btn" data-on-click='{"f":"showNewProjectForm"}' title="Create a new ${escA(ent('project').toLowerCase())}">+ ${esc(ent('project').toUpperCase())}</button>`;
+  mHtml += '<div class="m-sep"></div>';
+  mHtml += `<div class="view-toggle">
+    <button class="view-btn ${currentView==='today'?'active':''}" data-on-click='{"f":"setView","a":["today"]}'>TODAY</button>
+    <button class="view-btn ${currentView==='list'?'active':''}" data-on-click='{"f":"setView","a":["list"]}'>LIST</button>
+    <button class="view-btn ${currentView==='kanban'?'active':''}" data-on-click='{"f":"setView","a":["kanban"]}'>KANBAN</button>
+    ${feat('analytics') ? `<button class="view-btn ${currentView==='analytics'?'active':''}" data-on-click='{"f":"setView","a":["analytics"]}'>ANALYTICS</button>` : ''}
+    ${mailClientOn() ? `<button class="view-btn ${currentView==='mail'?'active':''}" data-on-click='{"f":"setView","a":["mail"]}'>MAIL</button>` : ''}
+    <button class="view-btn ${currentView==='drafts'?'active':''}" data-on-click='{"f":"setView","a":["drafts"]}'>DRAFTS</button>
+  </div>`;
+  mHtml += '</div>';
+
+  // Render gate: an unchanged strip is not re-written. The tab pills, the KPIs
+  // and the pills all live in this one string, so string-equality is the whole
+  // test: and skipping the write keeps a 30s cycle from churning the header.
+  // (Compared against the last string we WROTE, not against innerHTML: the DOM
+  //  serializes attributes back differently and would never compare equal.)
+  const _stripEl = document.getElementById('metrics-strip');
+  if (mHtml !== _metricsHtml || !_stripEl.firstChild) {
+    _stripEl.innerHTML = mHtml;
+    _metricsHtml = mHtml;
+  }
+
+  // Apply stat filter on top of other filters
+  const statFiltered = filtered.filter(matchesStatFilter);
+
+  // VIEW ROUTING
+  const listEl = document.getElementById('list-view');
+  const boardEl = document.getElementById('board');
+  const analyticsEl = document.getElementById('analytics-view');
+
+  listEl.style.display = 'none';
+  boardEl.style.display = 'none';
+  analyticsEl.style.display = 'none';
+  const todayEl = document.getElementById('today-view'), draftsEl = document.getElementById('drafts-view');
+  todayEl.style.display = 'none';
+  draftsEl.style.display = 'none';
+  if (window.PBMail) PBMail.hide();
+
+  if (currentView === 'analytics' && !feat('analytics')) currentView = 'list';
+  if (currentView === 'mail' && !mailClientOn()) currentView = 'list';
+  if (currentView === 'today') {
+    todayEl.style.display = 'flex';
+    renderToday();
+  } else if (currentView === 'drafts') {
+    draftsEl.style.display = 'flex';
+    renderDrafts();
+  } else if (currentView === 'mail') {
+    // The mail client owns its pane; show() is idempotent across the 30 s cycle.
+    if (window.PBMail) PBMail.show();
+  } else if (currentView === 'analytics') {
+    analyticsEl.style.display = 'block';
+    // Analytics is EMAIL-ONLY: volume, response time, SLA, follow-ups, read
+    // from /api/email-analytics. No money, no stage/cycle metrics.
+    renderEmailAnalytics();
+  } else if (currentView === 'list') {
+    listEl.style.display = 'flex';
+
+    const projectItems = statFiltered.map(p => ({ _project: p }));
+
+    // Deadlines tab: nearest deadline first. Everything else in the board's
+    // configured order: the hottest pending SUBTASK (score > priority > age)
+    // under sort.mode 'subtask', total project urgency under 'project' or with
+    // no sort block at all.
+    const _dlOrder = activeDeadlineOrder();
+    const _cmp = projectComparator();
+    const combined = [...projectItems]
+      .sort((a, b) => {
+        if (_dlOrder) {
+          const da = _dlOrder[a._project.id], db2 = _dlOrder[b._project.id];
+          const ha = da !== undefined, hb = db2 !== undefined;
+          if (ha !== hb) return ha ? -1 : 1;
+          if (ha && hb && da !== db2) return da - db2;
+        }
+        return _cmp(a._project, b._project);
+      });
+
+    let listHtml = `<div class="list-header">
+      <div>${esc(ent('project').toUpperCase())}</div><div>DETAIL</div><div>STATUS</div><div>${showMoney() ? 'VALUE' : ''}</div><div>ACTIVITY</div>
+    </div>`;
+    if (combined.length === 0) {
+      listHtml += '<div class="empty-state">No items</div>';
+    } else {
+      combined.forEach(item => {
+        listHtml += buildListRow(item._project);
+      });
+    }
+    listEl.innerHTML = listHtml;
+  } else {
+    boardEl.style.display = 'grid';
+
+    // Kanban columns: one per `column: true` workflow stage, in workflow order.
+    let boardHtml = '';
+    const _cols = boardColumns();
+    if (!_cols.length && !statFiltered.length) {
+      boardHtml = `<div class="empty-state" style="grid-column:1/-1">No workflow stages are defined. Open Settings &rsaquo; Workflows to add some.</div>`;
+    }
+    const _mapped = new Set();
+    _cols.forEach(c => c.statuses.forEach(s => _mapped.add(s)));
+    // Nothing may disappear because a stage lost its column: anything the
+    // roster doesn't place gets a trailing column, rendered only when used.
+    const _orphans = statFiltered.filter(p => !_mapped.has(p.status));
+    const cols = _orphans.length
+      ? _cols.concat([{ key:'__other__', label:'Other', css:'col-green',
+                        statuses:[...new Set(_orphans.map(p => p.status))] }])
+      : _cols;
+    const _cmpCol = projectComparator();
+    cols.forEach(col => {
+      let matching = statFiltered.filter(p => col.statuses.includes(p.status));
+      // Same order as the list view: one comparator, so a card never sits in a
+      // different place depending on which view you're in.
+      matching.sort(_cmpCol);
+
+      const colStatuses = col.statuses.join(',');
+      boardHtml += `<div class="column ${col.css}">
+        <div class="col-header">
+          <div class="dot"></div>
+          <span class="label">${col.label}</span>
+          <span class="count">${matching.length}</span>
+        </div>
+        <div class="drop-zone" data-statuses="${colStatuses}"
+          data-on-dragover='{"f":"onDragOver","a":[{"$":"event"}]}' data-on-dragleave='{"f":"onDragLeave","a":[{"$":"event"}]}' data-on-drop='{"f":"onDrop","a":[{"$":"event"}]}'>
+          ${matching.length === 0 ? `<div class="empty-state">No ${esc(ent('projects').toLowerCase())}</div>` : matching.map(buildCard).join('')}
+        </div>
+      </div>`;
+    });
+    boardEl.innerHTML = boardHtml;
+  }
+
+  // Update health bar (game layer only)
+  if (feat('game_layer')) renderHealthBar();
+  else { const hb = document.getElementById('health-bar-wrap'); if (hb) hb.style.display = 'none'; }
+
+  // FLIP step 2: animate tiles from old positions to new positions
+  requestAnimationFrame(() => {
+    flipAnimate();
+    // Spawn floating combat text after tiles are in final positions
+    if (feat('game_layer')) spawnCombatText();
+  });
+
+  // Alerts: interactive
+  let alertsHtml = '';
+  document.getElementById('alerts').innerHTML = alertsHtml;
+  // Timestamp removed from new header: push status badge covers last triage time
+
+  // Push status indicator
+  const lastTriage = DATA.meta?.last_triage;
+  if (lastTriage) {
+    const triageDate = new Date(lastTriage);
+    const hoursAgo = Math.floor((now - triageDate) / (1000*60*60));
+    const minsAgo = Math.floor((now - triageDate) / (1000*60));
+    document.getElementById('push-time').textContent = fmtTs(lastTriage);
+    const ageEl = document.getElementById('push-age');
+    if (minsAgo < 60) {
+      ageEl.textContent = minsAgo + 'm ago';
+      ageEl.className = 'push-age push-fresh';
+    } else if (hoursAgo < 4) {
+      ageEl.textContent = hoursAgo + 'h ago';
+      ageEl.className = 'push-age push-stale';
+    } else {
+      ageEl.textContent = hoursAgo + 'h ago';
+      ageEl.className = 'push-age push-old';
+    }
+  }
+
+  // Render triage panel
+  renderTriagePanel();
+
+  // Re-render panel if open (skip if user is editing a field: queue it for
+  // after blur). Also skip when nothing the panel shows actually changed.
+  if (openProjectId) {
+    if (_panelEditLock) {
+      _pendingPanelRender = openProjectId;
+    } else {
+      const _op = (DATA.projects||[]).find(x => x.id === openProjectId);
+      if (_op && panelSignature(_op) !== _panelSig) renderPanel(openProjectId);
+    }
+  }
+
+  restoreScroll(_scrollSnap);
+
+  // Auto-clear urgency change indicators after animation
+  if (Object.keys(_changedIds).length > 0) {
+    setTimeout(() => {
+      _changedIds = {};
+      // Fade out delta arrows
+      document.querySelectorAll('.urgency-delta').forEach(el => { el.style.opacity = '0'; });
+      // Remove change animation classes
+      document.querySelectorAll('.urgency-up,.urgency-down').forEach(el => { el.classList.remove('urgency-up','urgency-down'); });
+      document.querySelectorAll('.badge-changed').forEach(el => { el.classList.remove('badge-changed'); });
+    }, 4000);
+  }
+}
+
+// ANALYTICS VIEW
+// ═══════════════════════════════════════════════════════════════════════
+let _analyticsSortCol = 'won';
+let _analyticsSortDir = 'desc';
+
+// ══════════════════════════════════════════════════════════════════════════
+// EMAIL-ONLY ANALYTICS  (review #18: the user's HARD RULE, 2026-09-02)
+// ══════════════════════════════════════════════════════════════════════════
+// "Analytics = STRICTLY email-based: volume in/out, response time, SLA
+//  hits/breaches, follow-ups open/overdue, oldest waiting, per-contact/per-
+//  thread: nothing else. No dollars, no stage/cycle-time metrics, no job or
+//  tech data of any kind; the analytics tab in the coworker build has no code
+//  path to those tables."
+//
+// This renderer touches NO project money field and calls NOTHING inside
+// any money renderer. Its only data source is GET /api/email-analytics, which
+// reads project_correspondence and subtasks and nothing else. Project NAMES
+// come from DATA (already loaded) purely as labels: never a $ column.
+//
+// If you are tempted to add a stage/cycle/close-rate number here: that is the
+// exact line the user drew. Don't.
+let _emailAnalytics = null;
+let _emailAnalyticsDays = 28;
+let _emailAnalyticsLoading = false;
+
+function setEmailAnalyticsWindow(days) {
+  _emailAnalyticsDays = parseInt(days, 10) || 28;
+  _emailAnalytics = null;
+  renderEmailAnalytics();
+}
+
+async function renderEmailAnalytics() {
+  const el = document.getElementById('analytics-view');
+  if (!el) return;
+  if (!_emailAnalytics && !_emailAnalyticsLoading) {
+    _emailAnalyticsLoading = true;
+    if (!el.innerHTML) el.innerHTML = '<div class="a-card"><div class="a-card-title">Email analytics</div><div class="a-sub">Loading…</div></div>';
+    try {
+      const r = await fetch('/api/email-analytics?days=' + _emailAnalyticsDays);
+      _emailAnalytics = r.ok ? await r.json() : null;
+      if (!r.ok) {
+        el.innerHTML = '<div class="a-card"><div class="a-card-title">Email analytics</div>'
+          + '<div class="a-sub">Unavailable: the server has not been restarted since this was added.</div></div>';
+        return;
+      }
+    } catch (e) {
+      el.innerHTML = '<div class="a-card"><div class="a-card-title">Email analytics</div>'
+        + '<div class="a-sub">Unavailable: ' + String(e).slice(0, 120) + '</div></div>';
+      return;
+    } finally { _emailAnalyticsLoading = false; }
+  }
+  const d = _emailAnalytics;
+  if (!d) return;
+
+  const nameOf = pid => {
+    const p = (DATA.projects || []).concat(DATA.archived || []).find(x => x.id === pid);
+    return p ? (p.name || p.site || pid) : pid;
+  };
+  const hrs = v => (v === null || v === undefined) ? '-' : (v < 1 ? (v * 60).toFixed(0) + 'm' : v.toFixed(1) + 'h');
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+  const v = d.volume || {}, rt = d.response_time || {}, sla = d.sla || {}, fu = d.follow_ups || {};
+
+  // Volume sparkline: inline SVG, no chart library, no money.
+  const days = (v.by_day || []);
+  const maxDay = Math.max(1, ...days.map(x => Math.max(x.inbound, x.outbound)));
+  const W = 520, H = 90, step = days.length > 1 ? W / (days.length - 1) : W;
+  const line = (key, color) => {
+    if (!days.length) return '';
+    const pts = days.map((x, i) => `${(i * step).toFixed(1)},${(H - (x[key] / maxDay) * (H - 8)).toFixed(1)}`).join(' ');
+    return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" />`;
+  };
+
+  const winBtn = n => `<button class="a-subtab ${_emailAnalyticsDays === n ? 'active' : ''}" data-on-click="${EH(null, EK('setEmailAnalyticsWindow', n))}">${n}D</button>`;
+
+  let h = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+      <h2 style="margin:0;font-size:17px;letter-spacing:.5px">EMAIL ANALYTICS</h2>
+      <div style="flex:1"></div>${winBtn(7)}${winBtn(28)}${winBtn(90)}
+    </div>`;
+
+  h += `<div class="a-grid">
+    <div class="a-card"><div class="a-card-title">Volume: last ${d.window_days} days</div>
+      <div class="a-big-num">${v.total || 0}</div>
+      <div class="a-sub">${v.inbound || 0} in &nbsp;·&nbsp; ${v.outbound || 0} out</div>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:70px;margin-top:8px">
+        ${line('inbound', '#4fc3f7')}${line('outbound', '#97dda5')}
+      </svg>
+      <div class="a-sub"><span style="color:var(--c-4fc3f7)">■</span> inbound &nbsp; <span style="color:var(--c-97dda5)">■</span> outbound</div>
+    </div>
+    <div class="a-card"><div class="a-card-title">Response time (business hours)</div>
+      <div class="a-big-num">${hrs(rt.median_biz_hours)}</div>
+      <div class="a-sub">median over ${rt.samples || 0} replies</div>
+      <div class="a-row"><span class="a-sub">p90 ${hrs(rt.p90_biz_hours)}</span>
+        <span class="a-sub">${rt.awaiting_reply || 0} threads awaiting your reply</span></div>
+    </div>
+    <div class="a-card"><div class="a-card-title">Response SLA</div>
+      <div class="a-big-num" style="color:${(sla.hit_pct === null || sla.hit_pct >= 80) ? 'var(--c-97dda5)' : 'var(--c-e8a33d)'}">${sla.hit_pct === null ? '-' : sla.hit_pct + '%'}</div>
+      <div class="a-sub">${sla.hit || 0} hit &nbsp;·&nbsp; ${sla.breached || 0} breached &nbsp;·&nbsp; ${sla.open || 0} still in the clock</div>
+    </div>
+  </div>`;
+
+  h += `<div class="a-grid-2">
+    <div class="a-card"><div class="a-card-title">Follow-ups</div>
+      <div class="a-big-num" style="color:${(fu.overdue || 0) ? 'var(--c-e06c6c)' : 'var(--c-97dda5)'}">${fu.overdue || 0}</div>
+      <div class="a-sub">overdue of ${fu.open || 0} open${(fu.oldest_days ? ' · oldest ' + fu.oldest_days + 'd past due' : '')}</div>
+    </div>
+    <div class="a-card"><div class="a-card-title">Oldest waiting</div>
+      ${(d.oldest_waiting || []).length ? `<table style="width:100%;font-size: max(11px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace">
+        ${(d.oldest_waiting || []).slice(0, 8).map(x => `<tr>
+          <td style="color:var(--c-e06c6c);width:44px">${x.days_overdue}d</td>
+          <td style="color:var(--t2)">${esc(nameOf(x.project_id))}</td>
+          <td style="color:var(--t3)">${esc(x.text).slice(0, 44)}</td></tr>`).join('')}
+      </table>` : '<div class="a-sub">Nothing overdue.</div>'}
+    </div>
+  </div>`;
+
+  h += `<div class="a-grid-2">
+    <div class="a-card"><div class="a-card-title">Per contact</div>
+      <table style="width:100%;font-size: max(11px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace">
+        <tr style="color:var(--t3)"><td>CONTACT</td><td style="width:50px">IN</td><td style="width:60px">REPLIED</td><td style="width:70px">MEDIAN</td></tr>
+        ${(d.top_contacts || []).slice(0, 12).map(c => `<tr>
+          <td style="color:var(--t2)">${esc(c.name || c.contact).slice(0, 40)}</td>
+          <td>${c.inbound}</td><td>${c.replied}</td><td>${hrs(c.median_response_hours)}</td></tr>`).join('')}
+      </table>
+    </div>
+    <div class="a-card"><div class="a-card-title">Busiest threads</div>
+      <table style="width:100%;font-size: max(11px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace">
+        <tr style="color:var(--t3)"><td>SUBJECT</td><td style="width:50px">MSGS</td><td style="width:70px">IN / OUT</td></tr>
+        ${(d.top_threads || []).slice(0, 12).map(t => `<tr>
+          <td style="color:var(--t2)">${esc(t.subject).slice(0, 46) || '(no subject)'}</td>
+          <td>${t.messages}</td><td>${t.inbound} / ${t.outbound}</td></tr>`).join('')}
+      </table>
+    </div>
+  </div>`;
+
+  h += `<div class="a-sub" style="margin-top:10px">Email-only analytics: volume, response time, SLA, follow-ups.
+        No financial, job or technician data is read or shown.</div>`;
+  el.innerHTML = h;
+}
+
+
+// ── DETAIL PANEL ──
+function openPanel(id) {
+  openProjectId = id;
+  // Fresh open = start at the newest message, not wherever we left off days ago
+  delete _corrScroll[id];
+  delete _corrSeen[id];
+  _panelSig = null;
+  document.getElementById('panel-overlay').classList.add('open');
+  document.getElementById('detail-panel').classList.add('open');
+  renderPanel(id);
+}
+function closePanel() {
+  openProjectId = null;
+  document.getElementById('panel-overlay').classList.remove('open');
+  document.getElementById('detail-panel').classList.remove('open');
+}
+document.getElementById('panel-overlay').onclick = closePanel;
+document.getElementById('panel-close').onclick = closePanel;
+
+function renderPanel(id, opts) {
+  opts = opts || {};
+  // Idempotent (2026-08-12): a subtask click used to render the panel TWICE -
+  // once from renderBoard's open-panel branch, once from the handler's own
+  // `if (openProjectId === projId) renderPanel(projId)`: which meant two
+  // correspondence fetches and two dump-zone fetches per click. If the DOM
+  // already shows this project at this signature, there is nothing to do.
+  if (!opts.force && _panelSig !== null && _panelRenderedId === id) {
+    const cur = (DATA.projects||[]).find(x => x.id === id);
+    if (cur && panelSignature(cur) === _panelSig) return;
+  }
+  // If user is focused on any input inside the panel, defer the re-render
+  const panel = document.getElementById('detail-panel');
+  if (panel) {
+    const focused = panel.querySelector('input:focus:not([type="checkbox"]), select:focus, textarea:focus');
+    if (focused) {
+      _panelEditLock = true;
+      _pendingPanelRender = id;
+      focused.addEventListener('blur', function handler() {
+        focused.removeEventListener('blur', handler);
+        _panelEditLock = false;
+        if (_pendingPanelRender) {
+          const qid = _pendingPanelRender;
+          _pendingPanelRender = null;
+          renderPanel(qid);
+        }
+      });
+      return;
+    }
+  }
+  const p = (DATA.projects||[]).find(x => x.id === id);
+  if (!p) { closePanel(); return; }
+  const titleEl = document.getElementById('panel-title');
+  // Split name into locked site prefix + editable job portion
+  const site = p.site || '';
+  const sitePrefix = site ? site + ' ' : '';
+  const jobPart = site && p.name.startsWith(site) ? p.name.slice(site.length).trim() : p.name;
+  titleEl.textContent = p.name;
+  titleEl.title = 'Double-click to rename';
+  titleEl.style.cursor = 'pointer';
+  titleEl.ondblclick = () => {
+    titleEl.innerHTML = '';
+    if (sitePrefix) {
+      const lock = document.createElement('span');
+      lock.textContent = sitePrefix;
+      lock.style.cssText = 'color:var(--t3);font-size:inherit;font-weight:inherit;font-family:inherit;user-select:none;';
+      titleEl.appendChild(lock);
+    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = jobPart;
+    input.className = 'panel-title-edit';
+    input.style.cssText = 'font-size:inherit;font-weight:inherit;font-family:inherit;color:var(--t0);background:var(--bg3b);border:1px solid var(--line3);border-radius:4px;padding:2px 6px;flex:1;outline:none;';
+    titleEl.style.display = 'flex';
+    titleEl.style.alignItems = 'center';
+    titleEl.appendChild(input);
+    input.focus();
+    input.select();
+    const save = () => {
+      const newJob = input.value.trim();
+      const newName = (sitePrefix + newJob).trim();
+      titleEl.style.display = '';
+      if (newName && newName !== p.name) {
+        fetch('/api/projects/' + p.id, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: newName})
+        }).then(r => r.json()).then(d => {
+          if (d.ok) { p.name = newName; loadData(); }
+        });
+      } else {
+        titleEl.textContent = p.name;
+      }
+    };
+    input.onblur = save;
+    input.onkeydown = (e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') { titleEl.style.display = ''; titleEl.textContent = p.name; } };
+  };
+
+  const isFlagged = (p.tags||[]).includes('flagged');
+  const notes = p.notes || [];
+  const kd = p.key_details || {};
+
+  let html = '';
+
+  // Quick actions: AI helpers + Mark won / lost
+  html += drawerActionsHtml(p);
+
+  // Status + work type + team
+  html += `<div class="panel-section">
+    <div class="panel-label">Status</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <select class="status-select" data-on-change="${EH(null, EK('changeStatus', String(p.id), $V))}">
+        ${stageRoster(p).map(([k,v]) => `<option value="${escA(k)}" ${p.status===k?'selected':''}>${esc(v)}</option>`).join('')}
+      </select>
+      ${workTypes().length ? `<select class="status-select" style="width:auto" title="Type"
+              data-on-change="${EH(null, EK('setWorkType', String(p.id), $V))}">
+        <option value="">- type -</option>
+        ${workTypes().map(wt => `<option value="${escA(wt.id)}" ${p.work_type===wt.id?'selected':''}>${esc(wt.label || wt.id)}</option>`).join('')}
+      </select>` : (p.work_type ? workTypePill(p.work_type) : '')}
+      ${teams().length ? `<select class="status-select" style="width:auto" title="Team"
+              data-on-change="${EH(null, EK('setTeam', String(p.id), $V))}">
+        <option value="">- team -</option>
+        ${teams().map(t => { const tid = t.id || t; return `<option value="${escA(tid)}" ${p.team===tid?'selected':''}>${esc(t.label || tid)}</option>`; }).join('')}
+      </select>${teamDot(p.team)}` : ''}
+    </div>
+  </div>`;
+
+  // Location (editable)
+  html += `<div class="panel-section">
+    <div class="panel-label">${esc(ent('location'))}</div>
+    <input class="pf-input pf-wide" type="text" value="${escA(p.site || '')}" placeholder="Not set"
+      data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'
+      data-on-change="${EH(null, EK('saveLocation', String(p.id), $V))}">
+  </div>`;
+
+  // Profession fields (editable; grouped)
+  html += renderFields(p, 'drawer');
+
+  // Contacts
+  html += `<div class="panel-section"><div class="panel-label">${esc(ent('contact'))}s</div><div class="panel-value">`;
+  (p.contacts||[]).forEach(c => {
+    html += `<div class="contact-row">
+      <span class="contact-name">${esc(c.name || c.email || '')}</span>
+      <span class="contact-role"> ${esc(c.role||'')}${c.company ? ' · ' + esc(c.company) : ''}</span>
+      ${c.email ? `<div class="contact-email">${esc(c.email)}</div>` : ''}
+      ${c.phone || c.mobile || c.cell ? `<div class="contact-email">${esc(c.phone || c.mobile || c.cell)}</div>` : ''}
+    </div>`;
+  });
+  if (!p.contacts?.length) html += '<span style="color:var(--t4)">None</span>';
+  html += `</div>
+    <div class="contact-add-wrap">
+      <input class="subtask-add-input" id="contact-name-${p.id}" placeholder="Name" data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'>
+      <input class="subtask-add-input" id="contact-email-${p.id}" placeholder="Email" data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'>
+      <button class="subtask-add-btn" data-on-click="${EH(null, EK('addContact', String(p.id)))}">ADD</button>
+    </div></div>`;
+
+  // Scope (editable)
+  html += `<div class="panel-section">
+    <div class="panel-label">Scope</div>
+    <textarea class="note-input pf-wide" rows="2" placeholder="Not set"
+      data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'
+      data-on-change="${EH(null, EK('saveScope', String(p.id), $V))}">${esc(p.scope || '')}</textarea>
+  </div>`;
+
+  // Money (only when the profession has money on and the template did not
+  // already place these as fields)
+  if (showMoney()) {
+    const placed = new Set(profFields().map(f => f.key));
+    const needQ = !placed.has('quote_amount'), needA = !placed.has('approved_amount');
+    if (needQ || needA) {
+      html += `<div class="panel-section">
+        <div class="panel-label">${esc(ent('quote'))}</div>
+        <div class="money-row">
+          ${needQ ? `<div class="money-field">
+            <label class="money-lbl">Quoted</label>
+            <div class="money-input-wrap">
+              <span class="money-prefix">${esc(currencySymbol().trim())}</span>
+              <input class="money-input" id="quote-amt-${p.id}" type="number" step="0.01" min="0"
+                value="${p.quote_amount||''}" placeholder="0.00"
+                data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'
+                data-on-change="${EH(null, EK('saveMoney', String(p.id), 'quote_amount', $V))}">
+            </div>
+          </div>` : ''}
+          ${needA ? `<div class="money-field">
+            <label class="money-lbl">Approved</label>
+            <div class="money-input-wrap">
+              <span class="money-prefix">${esc(currencySymbol().trim())}</span>
+              <input class="money-input" id="approved-amt-${p.id}" type="number" step="0.01" min="0"
+                value="${p.approved_amount||''}" placeholder="0.00"
+                data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'
+                data-on-change="${EH(null, EK('saveMoney', String(p.id), 'approved_amount', $V))}">
+            </div>
+          </div>` : ''}
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:8px;font-family:'JetBrains Mono',monospace;font-size: max(11px, var(--fs-min, 0px));flex-wrap:wrap">
+          ${p.quote_sent_date ? `<span style="color:var(--t3)">Sent: ${esc(p.quote_sent_date)}</span>` : ''}
+          ${p.sold_date ? `<span style="color:var(--c-c0dd97)">Won: ${esc(p.sold_date)}</span>` : ''}
+          <span style="color:var(--t3)">Emails sent: <span style="color:var(--c-85b7eb)">${p.emails_sent||0}</span></span>
+        </div>
+      </div>`;
+    }
+  }
+
+
+  // ── CORRESPONDENCE (chat-style thread) ──
+  html += `<div class="panel-section" id="corr-section-${p.id}">
+    <div class="panel-label" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer"
+         data-on-click="${EH(null, EK('toggleCorrespondence', String(p.id)))}">
+      <span>Correspondence</span>
+      <span id="corr-count-${p.id}" style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3)">${_corrCountTxt[p.id] || ''}</span>
+    </div>
+    <div id="corr-items-${p.id}" class="corr-thread" style="display:block">${_corrHtml[p.id] || ''}</div>
+  </div>`;
+  setTimeout(() => loadCorrespondence(p.id), 0);
+
+  html += `<div class="panel-section">
+    <div class="panel-label">Last Activity</div>
+    <div class="panel-value">${esc(p.last_activity || 'None')}</div>
+  </div>`;
+  // ── OPEN QUESTIONS (the assistant's decision queue) ──
+  html += `<div class="panel-section" id="q-section-${p.id}">
+    <div class="panel-label" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Open Question</span>
+      <span id="q-count-${p.id}" style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3)">${_qCountTxt[p.id] || ''}</span>
+    </div>
+    <div id="q-items-${p.id}">${_qHtml[p.id] || '<div class="panel-value" style="color:var(--t3)">None</div>'}</div>
+    ${p.open_question ? `<div class="panel-value" style="margin-top:6px;color:var(--t3);font-size: max(10px, var(--fs-min, 0px))">note: ${esc(p.open_question)}</div>` : ''}
+  </div>`;
+  setTimeout(() => loadQuestions(p.id), 0);
+
+  // Dump zone: paste text or drop files onto the project
+  html += `<div class="panel-section" id="dump-section-${p.id}">
+    <div class="panel-label" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Dump zone</span>
+      <span id="dump-count-${p.id}" style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3)">${_dumpCountTxt[p.id] || ''}</span>
+    </div>
+    <textarea class="note-input pf-wide" id="dump-text-${p.id}" rows="2" placeholder="Paste notes, a forwarded message, anything about this ${escA(ent('project').toLowerCase())}..."
+      data-on-focus='{"f":"editLock","a":[true]}' data-on-blur='{"f":"editLock","a":[false]}'></textarea>
+    <div style="display:flex;gap:6px;align-items:center;margin:6px 0">
+      <button class="est-add-btn" data-on-click="${EH(null, EK('submitDumpText', String(p.id)))}">DUMP TEXT</button>
+      <div class="est-drop-zone" style="flex:1;padding:6px;font-size: max(10px, var(--fs-min, 0px));cursor:pointer"
+        data-on-dragover="${EH(null, EK('dumpDragOver', $E, String(p.id)))}" data-on-dragleave="${EH(null, EK('dumpDragLeave', $E, String(p.id)))}"
+        data-on-drop="${EH(null, EK('dumpDrop', $E, String(p.id)))}" data-on-click="${EH(null, EK('dumpClickUpload', String(p.id)))}">drop files here or click</div>
+      <input type="file" id="dump-file-input-${p.id}" multiple style="display:none" data-on-change="${EH(null, EK('dumpFileSelected', $E, String(p.id)))}">
+    </div>
+    <div class="dump-status" id="dump-status-${p.id}">
+      <span class="dump-step" id="dump-step-save-${p.id}">save</span>
+      <span class="dump-step" id="dump-step-ai-${p.id}">extract</span>
+      <span class="dump-step" id="dump-step-db-${p.id}">file</span>
+      <span class="dump-step" id="dump-step-apply-${p.id}">done</span>
+      <span id="dump-status-detail-${p.id}" style="font-size: max(10px, var(--fs-min, 0px));color:var(--t3)"></span>
+      <span id="dump-status-result-${p.id}" style="font-size: max(10px, var(--fs-min, 0px))"></span>
+    </div>
+    <div id="dump-items-${p.id}">${_dumpHtml[p.id] || ''}</div>
+  </div>`;
+  setTimeout(() => loadDumpZone(p.id), 0);
+
+  // Subtasks
+  const subtasks = p.subtasks || [];
+  if (subtasks.length > 0 || true) {  // Always show section so user can add
+    const doneCount = subtasks.filter(s => s.status === 'complete').length;
+    const pct = subtasks.length > 0 ? Math.round((doneCount / subtasks.length) * 100) : 0;
+    // Select-all: completes every pending, non-blocked subtask in ONE PUT
+    // (2026-08-12). Blocked tasks are never touched: they're gated on
+    // something outside the user's hands.
+    const _togglable = subtasks.filter(s => s.status !== 'blocked');
+    const _allDone = _togglable.length > 0 && _togglable.every(s => s.status === 'complete');
+    html += `<div class="panel-section">
+      <div class="panel-label" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <span>Subtasks</span>
+        ${_togglable.length > 1 ? `<label style="display:inline-flex;align-items:center;gap:4px;font-size: max(9px, var(--fs-min, 0px));color:var(--t2);cursor:pointer;text-transform:none;letter-spacing:0"
+          title="Check every subtask on this project (blocked ones are skipped)">
+          <input type="checkbox" class="subtask-check" ${_allDone ? 'checked' : ''}
+            data-on-change="${EH(null, EK('toggleAllSubtasks', String(p.id), $C))}">
+          ${_allDone ? 'all done' : 'check all'}
+        </label>` : ''}
+      </div>`;
+    if (subtasks.length > 0) {
+      html += `<div class="subtask-progress">
+        <div class="subtask-progress-bar"><div class="subtask-progress-fill" style="width:${pct}%"></div></div>
+        <span class="subtask-progress-label">${doneCount}/${subtasks.length} done</span>
+      </div>`;
+    }
+    subtasks.forEach(st => {
+      const isDone = st.status === 'complete';
+      const isBlocked = st.status === 'blocked';
+      const stScore = isDone ? 0 : getSubtaskScore(st, p);
+      const stc = urgencyColors(stScore);
+      const isResponse = st.sla_type === 'response' && !isDone;
+      const stFu = st.follow_up_date || '';
+      const stType = st.date_type || 'follow_up';
+      const fuOverdue = stFu && daysUntil(stFu) !== null && daysUntil(stFu) < 0;
+      const fuLabel = stFu ? dateTypeShort(stType) : '';
+      const fuDisplay = stFu ? formatShortDate(stFu) : '';
+      const slaElapsed = isResponse ? calcBizHoursElapsed(st.sla_created || st.created) : 0;
+      const slaHrs = st.sla_hours || PROF.sla_hours || 4;
+      const slaLabel = isResponse ? `${slaElapsed.toFixed(1)}/${slaHrs}h` : '';
+      // SLA toggle shows on any pending subtask: arm/disarm the response clock
+      const slaEligible = !isDone;
+      html += `<div class="subtask-item" style="flex-wrap:wrap;gap:4px">
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
+          <input type="checkbox" class="subtask-check" ${isDone ? 'checked' : ''}
+            data-on-change="${EH(null, EK('toggleSubtask', String(p.id), String(st.id), $C))}"
+            ${isBlocked ? 'disabled' : ''}>
+          ${!isDone ? `<span class="card-urgency" style="position:static;display:inline-block;font-size: max(9px, var(--fs-min, 0px));min-width:20px;text-align:center;background:${stc.bg};color:${stc.text}">${stScore}</span>` : ''}
+          ${isResponse ? `<span style="font-size: max(8px, var(--fs-min, 0px));padding:1px 4px;border-radius:2px;background:${stc.bg};color:${stc.text};border:1px solid ${stc.border};white-space:nowrap">${slaLabel}</span>` : ''}
+          ${slaEligible ? `<label title="On = ${PROF.sla_hours || 4} biz-hr SLA clock. Off = normal follow-up." style="display:inline-flex;align-items:center;gap:2px;font-size: max(8px, var(--fs-min, 0px));color:var(--t2);white-space:nowrap;cursor:pointer">
+            <input type="checkbox" ${isResponse ? 'checked' : ''} style="margin:0;width:11px;height:11px"
+              data-on-change="${EH({sp:1}, EK('toggleSLASubtask', String(p.id), String(st.id), $C))}">SLA</label>` : ''}
+          <span class="subtask-text ${isDone ? 'done' : ''}" style="flex:1;min-width:0">${esc(st.text)}${isBlocked ? '<span class="subtask-blocked">BLOCKED</span>' : ''}</span>
+          ${!isDone ? `<button class="orphan-btn" data-on-click="${EH({sp:1}, EK('orphanSubtask', String(p.id), String(st.id)))}" title="Orphan this subtask and reassign via triage">&#x21A9;</button>` : ''}
+        </div>
+        ${!isDone ? `<div style="display:flex;align-items:center;gap:4px;margin-left:22px">
+          <select style="background:var(--bg0);color:var(--t1);border:1px solid var(--line2b);border-radius:3px;font-size: max(10px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace;padding:2px 4px"
+            data-on-change="${EH(null, EK('updateSubtaskDate', String(p.id), String(st.id), null, $V))}">
+            ${dateTypes().filter(d => d.id !== 'sla' || stType === 'sla').map(d => `<option value="${escA(d.id)}" ${stType===d.id?'selected':''}>${esc(d.label)}</option>`).join('')}
+            ${(stType && !dateTypes().some(d => d.id === stType)) ? `<option value="${escA(stType)}" selected>${esc(stType)}</option>` : ''}
+          </select>
+          <input type="date" style="background:var(--bg0);color:${fuOverdue?'var(--c-e24b4a)':'var(--t1)'};border:1px solid ${fuOverdue?'var(--c-e24b4a)':'var(--line2b)'};border-radius:3px;font-size: max(10px, var(--fs-min, 0px));font-family:'JetBrains Mono',monospace;padding:2px 4px;width:120px"
+            value="${stFu}"
+            data-on-focus='{"f":"editLock","a":[true]}'
+            data-on-blur="${EH(null, EK('commitDateEdit', $T, String(p.id), String(st.id)))}"
+            data-on-keydown='{"f":"blurEl","a":[{"$":"this"}],"g":"enter"}'
+            data-orig="${stFu}">
+        </div>` : ''}
+      </div>`;
+    });
+    html += `<div class="subtask-add-wrap">
+      <input class="subtask-add-input" id="subtask-input-${p.id}" placeholder="Add subtask..."
+        data-on-keydown="${EH({g:'enter'}, EK('addSubtask', p.id))}">
+      <button class="subtask-add-btn" data-on-click="${EH(null, EK('addSubtask', String(p.id)))}">ADD</button>
+    </div></div>`;
+  }
+
+  // Notes
+  html += `<div class="panel-section">
+    <div class="panel-label">Notes</div>`;
+  if (notes.length) {
+    notes.slice().reverse().forEach(n => {
+      html += `<div class="note-item">
+        <span class="note-time">${esc(n.time||'')}</span>
+        <span class="note-text">${esc(n.text||'')}</span>
+      </div>`;
+    });
+  } else {
+    html += '<div style="font-size: max(12px, var(--fs-base, 0px));color:var(--t4);margin-bottom:6px">No notes yet</div>';
+  }
+  html += `<div class="note-input-wrap">
+    <textarea class="note-input" id="note-input" rows="2" placeholder="Add a note..."></textarea>
+    <button class="note-add-btn" data-on-click="${EH(null, EK('addNote', String(p.id)))}">ADD</button>
+  </div></div>`;
+
+  // Action buttons
+  html += `<div class="panel-section">
+    <div class="panel-label">Actions</div>
+    <div class="panel-btn-row">
+      <button class="panel-btn panel-btn-flag ${isFlagged?'is-flagged':''}" data-on-click="${EH(null, EK('toggleFlag', String(p.id)))}">
+        ${isFlagged ? 'UNFLAG' : 'FLAG'}
+      </button>
+    </div>
+
+    <div class="panel-btn-row" style="margin-top:6px">
+      ${(() => {
+        // Done / Cold / Ignore map to stages with those ROLES in the project's
+        // workflow; a workflow without such a stage simply has no button.
+        const wid = projectWorkflowId(p);
+        const doneSt = stageWithRole('closed', wid, true), coldSt = stageWithRole('cold', wid, true), ignSt = stageWithRole('ignored', wid, true);
+        let b = '';
+        if (doneSt && p.status !== doneSt) b += `<button class="panel-btn panel-btn-complete" data-on-click="${EH(null, EK('changeStatus', String(p.id), String(doneSt)))}">${esc(stageLabel(doneSt).toUpperCase())}</button>`;
+        if (coldSt && p.status !== coldSt) b += `<button class="panel-btn panel-btn-cold" data-on-click="${EH(null, EK('changeStatus', String(p.id), String(coldSt)))}">${esc(stageLabel(coldSt).toUpperCase())}</button>`;
+        if (ignSt) b += roleIs(p, 'ignored')
+          ? `<button class="panel-btn panel-btn-unignore" data-on-click="${EH(null, EK('unignoreProject', String(p.id)))}">UNIGNORE</button>`
+          : `<button class="panel-btn panel-btn-ignore" data-on-click="${EH(null, EK('ignoreProject', String(p.id)))}">IGNORE</button>`;
+        return b;
+      })()}
+      <button class="panel-btn panel-btn-archive" data-on-click="${EH(null, EK('archiveProject', String(p.id)))}">ARCHIVE</button>
+      <button class="panel-btn panel-btn-delete" data-on-click="${EH(null, EK('deleteProject', String(p.id)))}">DELETE</button>
+      <button class="panel-btn panel-btn-merge" data-on-click="${EH(null, EK('openMergePicker', String(p.id)))}">MERGE</button>
+    </div>
+  </div>`;
+
+  // Created / Follow-up
+  html += `<div class="panel-section" style="border-bottom:none">
+    <div style="font-size: max(10px, var(--fs-min, 0px));color:var(--t4);font-family:'JetBrains Mono',monospace">
+      Created: ${esc(p.created||'?')} &nbsp;&middot;&nbsp; ID: ${esc(p.id)}
+      ${p.workflow_id ? ` &nbsp;&middot;&nbsp; Workflow: ${esc((wfById(p.workflow_id) || {}).label || p.workflow_id)}` : ''}
+      ${p.follow_up_date ? ` &nbsp;&middot;&nbsp; Follow-up: ${esc(p.follow_up_date)}` : ''}
+    </div>
+  </div>`;
+
+  // ── Hold position across the swap (2026-08-12) ──
+  // The panel is one tall scroller; the correspondence thread and dump list are
+  // their own. Capture all three, swap, then put them back. The correspondence
+  // offsets are handed to loadCorrespondence, which fills in async.
+  const _pnl = document.getElementById('detail-panel');
+  const _pnlTop = _pnl ? _pnl.scrollTop : 0;
+  const _corrEl = document.getElementById('corr-items-' + id);
+  if (_corrEl) {
+    _corrScroll[id] = {
+      container: _corrEl.scrollTop,
+      thread: (_corrEl.querySelector('.corr-thread') || {}).scrollTop || 0,
+      lanes: [..._corrEl.querySelectorAll('.corr-lane-body')].map(el => el.scrollTop)
+    };
+  }
+  const _dumpEl = document.getElementById('dump-items-' + id);
+  const _dumpTop = _dumpEl ? _dumpEl.scrollTop : 0;
+
+  document.getElementById('panel-body').innerHTML = html;
+  _panelSig = panelSignature(p);
+  _panelRenderedId = id;
+
+  if (_pnl && _pnlTop) {
+    _pnl.scrollTop = _pnlTop;
+    requestAnimationFrame(() => { if (_pnl.isConnected) _pnl.scrollTop = _pnlTop; });
+  }
+  if (_dumpTop) {
+    setTimeout(() => {
+      const e2 = document.getElementById('dump-items-' + id);
+      if (e2) e2.scrollTop = _dumpTop;
+    }, 80);
+  }
+}
+
+// ── ACTIONS ──
+async function changeStatus(id, newStatus) {
+  try {
+    const updates = { status: newStatus };
+    const role = stageRole(newStatus);
+    if (role === 'closed') updates.closed_date = ymd(new Date());
+    if (role === 'cold') {
+      updates.follow_up_date = null;
+      // Also wipe follow-up dates on pending subtasks
+      const p = (DATA.projects||[]).find(x => x.id === id);
+      if (p && p.subtasks) {
+        updates.subtasks = p.subtasks.map(st =>
+          st.status !== 'complete' ? {...st, follow_up_date: null} : st
+        );
+      }
+    }
+    await apiPut(id, updates);
+    await loadData();
+    toast(`Status -> ${stageLabel(newStatus)}`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function setWorkType(id, wt) {
+  try {
+    const body = { work_type: wt || '' };
+    const def = workTypeDef(wt);
+    if (def && def.workflow_id && wfById(def.workflow_id)) body.workflow_id = def.workflow_id;
+    await apiPut(id, body);
+    await loadData();
+    toast(def ? `Type -> ${def.label || def.id}` : 'Type cleared');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// Team is a free pick from PROF.teams; never re-derived.
+async function setTeam(id, team) {
+  try {
+    // `team` lives in key_details (no column); the server spread-merges it.
+    await apiPut(id, { key_details: { team: team || '' } });
+    await loadData();
+    const t = teamDef(team);
+    toast(team ? `Team -> ${(t && t.label) || team}` : 'Team cleared');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function saveLocation(id, val) {
+  try {
+    await apiPut(id, { location: (val || '').trim() });
+    await loadData();
+    toast(`${ent('location')} saved`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function saveScope(id, val) {
+  try {
+    await apiPut(id, { scope: (val || '').trim() });
+    await loadData();
+    toast('Scope saved');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function saveMoney(projId, field, val) {
+  const num = val ? parseFloat(val) : null;
+  try {
+    const body = { [field]: num };
+    if (field === 'approved_amount') body.won_date = num ? ymd(new Date()) : null;
+    await apiPut(projId, body);
+    await loadData();
+    toast(`${field === 'quote_amount' ? 'Quoted' : 'Approved'}: ${num ? fmtMoney(num, { min: 2 }) : 'cleared'}`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// contacts is a FULL REPLACE on PUT, so spread the existing list.
+async function addContact(id) {
+  const p = (DATA.projects||[]).find(x => x.id === id);
+  if (!p) return;
+  const name = (document.getElementById('contact-name-' + id) || {}).value || '';
+  const email = (document.getElementById('contact-email-' + id) || {}).value || '';
+  if (!name.trim() && !email.trim()) { toast('Name or email required'); return; }
+  try {
+    await apiPut(id, { contacts: [...(p.contacts || []), { name: name.trim(), email: email.trim().toLowerCase(), role: '' }] });
+    await loadData();
+    toast(`${ent('contact')} added`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function toggleFlag(id) {
+  const p = (DATA.projects||[]).find(x => x.id === id);
+  if (!p) return;
+  const tags = [...(p.tags||[])];
+  const idx = tags.indexOf('flagged');
+  if (idx >= 0) tags.splice(idx, 1);
+  else tags.push('flagged');
+  try {
+    await apiPut(id, { tags });
+    await loadData();
+    toast(idx >= 0 ? 'Unflagged' : 'Flagged');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ── SUBTASKS ──
+function smartFollowUpDays(subtaskText) {
+  if (!subtaskText) return 5;
+  const t = subtaskText.toLowerCase();
+  if (/\bschedule\b.*\btoday\b|\border\b|\bpurchase\b|\burgent\b/.test(t)) return 1;
+  if (/\bquote\b|\bprice\b|\bproposal\b|\bestimate\b|\bbuild\b|\bscope\b/.test(t)) return 2;
+  if (/\bsend\b|\bemail\b|\breply\b|\brespond\b|\backnowledg/.test(t)) return 2;
+  if (/\bschedule\b|\bcoordinate\b|\bconfirm\b/.test(t)) return 3;
+  if (/\bfollow.?up\b|\bcheck\b/.test(t)) return 5;
+  if (/\bwait\b|\bhold\b|\bpending\b|\bmonitor\b/.test(t)) return 7;
+  return 5;
+}
+
+function localISODate(daysFromNow) {
+  const d = new Date();
+  d.setDate(d.getDate() + daysFromNow);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+async function toggleSubtask(projId, subtaskId, checked) {
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  if (checked) { try { sfx('ding'); } catch(e) {} }
+  // Completing a stage's owning task can make the server advance the stage
+  // (advance_on_task_complete / won_transition). The PUT response says so; a
+  // changed status pulls fresh data so the card moves columns NOW.
+  const _statusBefore = p.status;
+  // completed_by:'manual' = the user's own click.
+  const subtasks = (p.subtasks||[]).map(st => {
+    if (st.id === subtaskId) return {...st, status: checked ? 'complete' : 'pending', completed_by: checked ? 'manual' : null};
+    return st;
+  });
+
+  // Build the update payload
+  const update = { subtasks };
+
+  if (checked) {
+    // The user just touched this project: reset timestamps
+    const now = new Date();
+    const localNow = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-'
+      + String(now.getDate()).padStart(2,'0') + ' \u2014 '
+      + now.toLocaleString('en-US', {hour:'numeric', minute:'2-digit', hour12:true});
+    update.last_activity = localNow;
+
+    // Smart follow-up: set the next pending subtask's follow_up_date if it doesn't have one
+    const remaining = subtasks.filter(s => s.status !== 'complete');
+    if (remaining.length > 0) {
+      const nextTask = remaining[0];
+      if (!nextTask.follow_up_date) {
+        const fuDays = smartFollowUpDays(nextTask.text);
+        const fuDate = localISODate(fuDays);
+        // Update the subtask's own follow_up_date
+        const idx = subtasks.findIndex(s => s.id === nextTask.id);
+        if (idx >= 0) subtasks[idx] = {...subtasks[idx], follow_up_date: fuDate, date_type: 'follow_up'};
+      }
+      // Also keep project-level in sync for backward compat
+      update.follow_up_date = remaining[0].follow_up_date || localISODate(smartFollowUpDays(remaining[0].text));
+    } else {
+      // All manual subtasks done: auto-add a close-out subtask
+      const nextId = genSubtaskId(subtasks);
+      const fuDate = localISODate(3);
+      subtasks.push({
+        id: nextId,
+        text: 'Follow up or mark ' + ent('project').toLowerCase() + ' done',
+        status: 'pending',
+        created: localISODate(0),
+        follow_up_date: fuDate,
+        date_type: 'follow_up'
+      });
+      update.subtasks = subtasks;
+      update.follow_up_date = fuDate;
+    }
+  }
+
+  try {
+    // Snapshot scores BEFORE mutating data (for change detection)
+    snapshotScores();
+    // Urgency before the hit: the drop this action causes IS the damage.
+    const _hpBefore = getTotalHP();
+    // Optimistic local update: apply changes to in-memory DATA immediately
+    const localIdx = (DATA.projects||[]).findIndex(x => x.id === projId);
+    if (localIdx >= 0) {
+      DATA.projects[localIdx] = {...DATA.projects[localIdx], ...update};
+    }
+    _dealDamage(_hpBefore - getTotalHP(), checked ? 'subtask' : 'subtask-reopen');
+    // Flag FLIP engine for dramatic subtask-triggered animation
+    _flipSource = 'subtask';
+    detectChanges();
+    renderBoard();
+    // Sync DoT baseline so the 60s tick doesn't re-fire this same delta
+    if (typeof _dotPrevScores !== 'undefined' && DATA && DATA.projects) {
+      DATA.projects.forEach(p => { _dotPrevScores[p.id] = getUrgencyScore(p); });
+    }
+    // Re-render detail panel immediately so checkbox/subtask state updates
+    if (openProjectId === projId) renderPanel(projId);
+    toast(checked ? 'Subtask done: follow-up updated' : 'Subtask reopened');
+    // Persist to server in background (don't block UI)
+    apiPut(projId, update).then(async resp => {
+      // Stage cascade: the server may have moved the stage. Pull fresh data so
+      // the card moves columns immediately instead of waiting for the refresh.
+      if (resp && resp.project && resp.project.status !== _statusBefore) {
+        const newStatus = resp.project.status;
+        await loadData();
+        if (openProjectId === projId) renderPanel(projId);
+        toast(`Stage -> ${stageLabel(newStatus)}`);
+        if (checked && showMoney() && stageRole(newStatus) === 'out') {
+          const fresh = (DATA.projects||[]).find(x => x.id === projId);
+          if (fresh && !fresh.quote_amount) {
+            // Drop straight into the amount field: an `out` stage without an
+            // amount is invisible to pipeline and close-rate math.
+            if (openProjectId !== projId) openPanel(projId);
+            setTimeout(() => {
+              const amtEl = document.getElementById('quote-amt-' + projId) || document.getElementById('pf-quote_amount-' + projId);
+              if (amtEl) { amtEl.focus(); if (amtEl.select) amtEl.select(); }
+            }, 250);
+          }
+        }
+      }
+    }).catch(e => {
+      toast('Sync error: ' + e.message + ': will retry on refresh');
+    });
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ── SELECT ALL SUBTASKS (2026-08-12) ──
+// One PUT for the whole list instead of N round-trips (each of which re-rendered
+// the board). Mirrors toggleSubtask's semantics: completed_by 'manual' so the
+// server's send-guard accepts proposal tasks, close-out task auto-added when the
+// list empties out, and a data reload when a quote task was in the batch (the
+// server cascades quote_needed -> quote_sent on those).
+async function toggleAllSubtasks(projId, checked) {
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  const all = p.subtasks || [];
+  const targets = all.filter(st => st.status !== 'blocked' &&
+    (checked ? st.status !== 'complete' : st.status === 'complete'));
+  if (!targets.length) { toast(checked ? 'Nothing left to check' : 'Nothing to reopen'); return; }
+  if (!checked && !confirm('Reopen ' + targets.length + ' completed subtask' + (targets.length>1?'s':'') + '?')) {
+    renderPanel(projId);  // put the checkbox back the way it was
+    return;
+  }
+
+  // Rattle off a ding per task (capped): sounds like clearing a checklist
+  if (checked) {
+    const dings = Math.min(targets.length, 6);
+    for (let i = 0; i < dings; i++) setTimeout(() => { try { sfx('ding'); } catch(e) {} }, i * 90);
+  }
+
+  const _statusBefore = p.status;
+  const ids = new Set(targets.map(st => st.id));
+
+  let subtasks = all.map(st => ids.has(st.id)
+    ? {...st, status: checked ? 'complete' : 'pending', completed_by: checked ? 'manual' : null}
+    : st);
+
+  const update = { subtasks };
+
+  if (checked) {
+    const now = new Date();
+    update.last_activity = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-'
+      + String(now.getDate()).padStart(2,'0') + ' \u2014 '
+      + now.toLocaleString('en-US', {hour:'numeric', minute:'2-digit', hour12:true});
+    const remaining = subtasks.filter(s => s.status !== 'complete');
+    if (remaining.length === 0) {
+      // Everything's done: same close-out task the one-at-a-time path adds,
+      // so the project doesn't go dark with no next action.
+      const fuDate = localISODate(3);
+      subtasks = [...subtasks, {
+        id: genSubtaskId(subtasks),
+        text: 'Follow up or mark ' + ent('project').toLowerCase() + ' done',
+        status: 'pending',
+        created: localISODate(0),
+        follow_up_date: fuDate,
+        date_type: 'follow_up'
+      }];
+      update.subtasks = subtasks;
+      update.follow_up_date = fuDate;
+    } else {
+      update.follow_up_date = remaining[0].follow_up_date
+        || localISODate(smartFollowUpDays(remaining[0].text));
+    }
+  }
+
+  try {
+    snapshotScores();
+    const _hpBefore = getTotalHP();
+    const localIdx = (DATA.projects||[]).findIndex(x => x.id === projId);
+    if (localIdx >= 0) DATA.projects[localIdx] = {...DATA.projects[localIdx], ...update};
+    _dealDamage(_hpBefore - getTotalHP(), checked ? 'subtask' : 'subtask-reopen');
+    _flipSource = 'subtask';
+    detectChanges();
+    renderBoard();
+    if (typeof _dotPrevScores !== 'undefined' && DATA && DATA.projects) {
+      DATA.projects.forEach(x => { _dotPrevScores[x.id] = getUrgencyScore(x); });
+    }
+    if (openProjectId === projId) renderPanel(projId);
+    toast((checked ? 'Checked ' : 'Reopened ') + targets.length + ' subtask' + (targets.length>1?'s':''));
+
+    apiPut(projId, update).then(async resp => {
+      if (resp && resp.project && resp.project.status !== _statusBefore) {
+        await loadData();
+        if (openProjectId === projId) renderPanel(projId);
+        toast(`Stage -> ${stageLabel(resp.project.status)}`);
+      }
+    }).catch(e => toast('Sync error: ' + e.message + ' - will retry on refresh'));
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+function formatShortDate(ds) {
+  if (!ds) return '';
+  const d = parseLocalDate(ds);
+  if (!d) return ds;
+  return (d.getMonth()+1) + '/' + d.getDate();
+}
+
+async function updateSubtaskDate(projId, subtaskId, newDate, newType) {
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  const subtasks = (p.subtasks||[]).map(st => {
+    if (st.id === subtaskId) {
+      const updated = {...st};
+      if (newDate !== null) updated.follow_up_date = newDate || null;
+      if (newType !== null) updated.date_type = newType;
+      // Clock reset: editing the date or switching a task to a clock-driven
+      // type restarts its aging clock at this moment. LOCAL-naive timestamp.
+      if (isClockDateType(updated.date_type)) {
+        const d = new Date(), z = n => String(n).padStart(2, '0');
+        updated.sla_created = d.getFullYear() + '-' + z(d.getMonth()+1) + '-' + z(d.getDate())
+          + 'T' + z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds());
+      }
+      return updated;
+    }
+    return st;
+  });
+  try {
+    const updates = { subtasks };
+    // Cascade: if no pending subtask has a follow_up_date, also null the project-level date
+    const pendingWithDates = subtasks.filter(st =>
+      st.status !== 'complete' && st.follow_up_date);
+    if (pendingWithDates.length === 0) {
+      updates.follow_up_date = null;
+    } else {
+      // Set project follow_up_date to the earliest pending subtask date
+      const earliest = pendingWithDates
+        .map(st => st.follow_up_date)
+        .sort()[0];
+      updates.follow_up_date = earliest;
+    }
+    await apiPut(projId, updates);
+    await loadData();
+    if (openProjectId === projId) renderPanel(projId);
+    toast('Subtask date updated');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function toggleSLASubtask(projId, subtaskId, on) {
+  // Toggle a "Respond to X" subtask between the SLA clock and a normal
+  // follow-up. ON  -> arm sla_* so getSubtaskScore uses the fast-aging curve.
+  // OFF -> clear sla_* and drop to a standard follow-up date.
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  let msg = '';
+  const slaH = PROF.sla_hours || 4;
+  const subtasks = (p.subtasks||[]).map(st => {
+    if (st.id !== subtaskId) return st;
+    if (on) {
+      msg = `SLA armed: ${slaH} biz-hr response clock`;
+      const d = new Date(), z = n => String(n).padStart(2, '0');
+      const local = d.getFullYear() + '-' + z(d.getMonth()+1) + '-' + z(d.getDate()) + 'T' + z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds());
+      return {...st, sla_type: 'response', sla_created: local, date_type: 'sla', sla_hours: slaH};
+    } else {
+      // Drop SLA: normal follow-up based on task text
+      const fuDate = st.follow_up_date || localISODate(smartFollowUpDays(st.text));
+      msg = 'SLA dropped: normal follow-up (' + fuDate + ')';
+      return {...st, sla_type: null, sla_created: null, sla_hours: null,
+              follow_up_date: fuDate, date_type: 'follow_up'};
+    }
+  });
+  try {
+    snapshotScores();
+    const idx = (DATA.projects||[]).findIndex(x => x.id === projId);
+    if (idx >= 0) DATA.projects[idx] = {...DATA.projects[idx], subtasks};
+    _flipSource = 'subtask';
+    detectChanges();
+    renderBoard();
+    if (openProjectId === projId) renderPanel(projId);
+    toast(msg);
+    apiPut(projId, { subtasks }).catch(e => {
+      toast('Sync error: ' + e.message + ': will retry on refresh');
+    });
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+function commitDateEdit(el, projId, subtaskId) {
+  _panelEditLock = false;
+  const newVal = el.value;
+  const orig = el.getAttribute('data-orig') || '';
+  // Only fire the update if the value actually changed
+  if (newVal !== orig) {
+    updateSubtaskDate(projId, subtaskId, newVal, null);
+  } else if (_pendingPanelRender) {
+    // No change but a refresh was queued: flush it now
+    const qid = _pendingPanelRender;
+    _pendingPanelRender = null;
+    renderPanel(qid);
+  }
+}
+
+// Collision-safe subtask ID generator. The old scheme ('st_' + (length+1))
+// broke whenever IDs weren't contiguous: e.g. a project with pending ids
+// st_003 + st_442c2943 has length 2, so it regenerated 'st_003', which the
+// server's PUT reconciler saw as an EXISTING id and routed to the update
+// branch instead of add: the new subtask silently vanished on reload.
+// Mirror the server's format (st_ + 8 hex), and verify against current ids.
+function genSubtaskId(subtasks) {
+  const ids = new Set((subtasks || []).map(s => s.id));
+  let id;
+  do {
+    id = 'st_' + Array.from(crypto.getRandomValues(new Uint8Array(4)))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+  } while (ids.has(id));
+  return id;
+}
+
+async function addSubtask(projId) {
+  const input = document.getElementById('subtask-input-' + projId);
+  const text = input.value.trim();
+  if (!text) return;
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  const subtasks = [...(p.subtasks||[])];
+  const nextId = genSubtaskId(subtasks);
+  subtasks.push({
+    id: nextId,
+    text: text,
+    status: 'pending',
+    created: ymd(new Date()),
+    follow_up_date: ymd(new Date()),
+    date_type: 'follow_up'
+  });
+  try {
+    await apiPut(projId, { subtasks });
+    input.value = '';
+    await loadData();
+    toast('Subtask added');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function orphanSubtask(projId, subtaskId) {
+  const p = (DATA.projects||[]).find(x => x.id === projId);
+  if (!p) return;
+  const st = (p.subtasks||[]).find(s => s.id === subtaskId);
+  if (!st) return;
+  if (!confirm(`Move subtask "${st.text.substring(0,60)}" off ${p.name}?\n\nIt will appear in the triage panel for reassignment.`)) return;
+
+  try {
+    // 1. Remove subtask from source project
+    const remaining = (p.subtasks||[]).filter(s => s.id !== subtaskId);
+    const note = `Subtask moved off for reassignment: ${st.text.substring(0,60)}`;
+    const notes = [{ text: note, time: new Date().toLocaleString('en-US', {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) }];
+    await apiPut(projId, { subtasks: remaining, notes });
+
+    // 2. Stage a reassign_subtask triage card
+    const triageItem = {
+      triage_id: `reassign_${Date.now()}`,
+      card_type: 'reassign_subtask',
+      proposed_subtask: st.text,
+      origin_project: projId,
+      origin_project_name: p.name,
+      original_subtask: st,
+      reason: `Orphaned from ${p.name} for reassignment`,
+      status: 'pending'
+    };
+    await fetch('/api/triage', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(triageItem)
+    });
+
+    await loadData();
+    await loadTriageItems();
+    toast('Subtask moved to triage for reassignment');
+  } catch(e) {
+    console.error('Orphan error:', e);
+    toast('Orphan failed: ' + e.message);
+  }
+}
+
+async function addNote(id) {
+  const input = document.getElementById('note-input');
+  const text = input.value.trim();
+  if (!text) return;
+  const p = (DATA.projects||[]).find(x => x.id === id);
+  if (!p) return;
+  const notes = [{ text, time: new Date().toLocaleString('en-US', {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) }];
+  try {
+    await apiPut(id, { notes });
+    await loadData();
+    toast('Note added');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function archiveProject(id) {
+  try {
+    const p = (DATA.projects||[]).find(x => x.id === id);
+    const closed = p ? (stageWithRole('closed', projectWorkflowId(p)) || p.status) : undefined;
+    const tags = [...new Set([...(p && p.tags || []), 'archived'])];
+    await apiPut(id, Object.assign({ tags }, closed ? { status: closed } : {}));
+    await loadData();
+    closePanel();
+    toast('Archived');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function deleteProject(id, name) {
+  if (!name) { const p = (DATA.projects||[]).find(x => x.id === id); name = p ? p.name : id; }
+  // Two-step confirm to prevent accidents
+  if (!confirm(`Delete "${name}" permanently?\n\nThis removes the project and ALL related data (subtasks, notes, correspondence, triage cards).\n\nThis cannot be undone.`)) return;
+  if (!confirm(`FINAL CONFIRM: Permanently delete "${name}"?`)) return;
+  try {
+    const resp = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Delete failed');
+    await loadData();
+    closePanel();
+    toast(`Deleted: ${name}`);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// REUSABLE PROJECT PICKER MODAL
+// ══════════════════════════════════════════════════════════════════════
+let _pickerSelectedId = null;
+let _pickerCallback = null;
+
+/**
+ * Open a searchable project picker modal.
+ * @param {Object} opts: { title, subtitle, confirmLabel, excludeIds[] }
+ * @param {Function} callback: called with chosen project id on confirm
+ */
+function openProjectPicker(opts, callback) {
+  _pickerSelectedId = null;
+  _pickerCallback = callback;
+  const excludeSet = new Set(opts.excludeIds || []);
+
+  // Recency sort: the project you're looking for is almost always one that's
+  // moving. last_activity desc, nulls sink, alpha tiebreak.
+  const targets = (DATA.projects||[]).filter(p =>
+    !excludeSet.has(p.id) &&
+    !roleIs(p, 'ignored') &&
+    !(p.tags||[]).includes('archived')
+  ).sort((a,b) => {
+    const ad = daysSince(a.last_activity), bd = daysSince(b.last_activity);
+    if (ad !== bd) return (ad === null ? 1 : bd === null ? -1 : ad - bd);
+    return (a.site||'').localeCompare(b.site||'') || (a.name||'').localeCompare(b.name||'');
+  });
+
+  let html = `<div class="merge-picker-overlay" id="picker-overlay" data-on-click='{"f":"closeProjectPicker","g":"self"}'>
+    <div class="merge-picker">
+      <h3>${opts.title || 'Select Project'}</h3>
+      ${opts.subtitle ? `<div class="merge-subtitle">${opts.subtitle}</div>` : ''}
+      <input type="text" id="picker-search" placeholder="Search ${escA(ent('projects').toLowerCase())}..." data-on-input='{"f":"filterPickerList"}' autocomplete="off" name="picker-search-nofill" spellcheck="false">
+      <div class="merge-picker-list" id="picker-list">`;
+  targets.forEach(t => {
+    const d = daysSince(t.last_activity);
+    const age = d === null ? '' : d === 0 ? 'today' : d < 14 ? d + 'd' :
+                d < 60 ? Math.round(d/7) + 'w' : Math.round(d/30) + 'mo';
+    html += `<div class="merge-picker-item" data-id="${t.id}" data-search="${escA(((t.site||'')+' '+t.name+' '+t.id).toLowerCase())}" data-on-click="${EH(null, EK('selectPickerItem', String(t.id), $T))}">
+      <span>${esc(t.name)}</span><span class="mp-site">${esc(t.site||'')}${age ? ` <span style="opacity:.55;font-size:.85em">\u00b7 ${age}</span>` : ''}</span>
+    </div>`;
+  });
+  html += `</div>
+      <div class="merge-picker-btns">
+        <button class="mp-cancel" data-on-click='{"f":"closeProjectPicker"}'>Cancel</button>
+        <button class="mp-confirm" id="picker-confirm-btn" disabled data-on-click='{"f":"confirmPickerSelection"}'>${opts.confirmLabel || 'Select'}</button>
+      </div>
+    </div>
+  </div>`;
+
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('picker-search').focus();
+}
+
+function filterPickerList() {
+  const q = (document.getElementById('picker-search')?.value||'').toLowerCase();
+  document.querySelectorAll('#picker-list .merge-picker-item').forEach(el => {
+    el.style.display = el.dataset.search.includes(q) ? '' : 'none';
+  });
+}
+
+function selectPickerItem(id, el) {
+  _pickerSelectedId = id;
+  document.querySelectorAll('#picker-list .merge-picker-item').forEach(
+    e => e.style.background = '');
+  el.style.background = 'var(--c-2a2a40)';
+  const btn = document.getElementById('picker-confirm-btn');
+  if (btn) btn.disabled = false;
+}
+
+function closeProjectPicker() {
+  const ov = document.getElementById('picker-overlay');
+  if (ov) ov.remove();
+  _pickerSelectedId = null;
+  _pickerCallback = null;
+}
+
+function confirmPickerSelection() {
+  if (!_pickerSelectedId || !_pickerCallback) return;
+  const cb = _pickerCallback;
+  const id = _pickerSelectedId;
+  closeProjectPicker();
+  cb(id);
+}
+
+// ── Merge (uses picker) ─────────────────────────────────────────────
+let _mergeSourceId = null;
+
+function openMergePicker(sourceId) {
+  _mergeSourceId = sourceId;
+  const source = (DATA.projects||[]).find(p => p.id === sourceId);
+  if (!source) return;
+
+  openProjectPicker({
+    title: `Merge "${esc(source.name)}" into...`,
+    subtitle: `${esc(source.site||'')} ${source.site ? '\u00b7 ' : ''}${source.subtasks?.length||0} subtasks, ${source.notes?.length||0} notes`,
+    confirmLabel: 'Merge',
+    excludeIds: [sourceId],
+  }, async (targetId) => {
+    const target = (DATA.projects||[]).find(p => p.id === targetId);
+    if (!target) return;
+
+    if (!confirm(`Merge "${source.name}" into "${target.name}"?\n\nAll subtasks, notes, contacts, and emails will move to the target. The source project will be archived.`)) return;
+
+    try {
+      const r = await fetch(`/api/projects/${targetId}/merge`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ source_id: sourceId })
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || 'HTTP ' + r.status);
+      }
+      const data = await r.json();
+      const s = data.stats || {};
+      closePanel();
+      await loadData();
+      toast(`Merged: ${s.subtasks||0} subtasks, ${s.contacts||0} contacts, ${s.notes||0} notes moved`);
+      setTimeout(() => openPanel(targetId), 300);
+    } catch(e) {
+      toast('Merge failed: ' + e.message);
+    }
+  });
+}
+
+// ── Triage project picker (uses picker) ─────────────────────────────
+
+/**
+ * Open project picker for a triage card. Sets the dropdown + fires the
+ * appropriate change handler when a project is selected.
+ * @param {string} triageId: triage card ID
+ * @param {string} fieldName: 'matched_project' or 'project_id'
+ * @param {string} changeHandler: 'onTriageProjectChange' | 'onReassignProjectChange' | 'updateTriageField'
+ */
+function openTriageProjectPicker(triageId, fieldName, changeHandler) {
+  openProjectPicker({
+    title: 'Select Project',
+    confirmLabel: 'Select',
+  }, (projId) => {
+    const sel = document.getElementById('triage-proj-' + triageId);
+    if (sel) {
+      // Ensure the project is available as an option
+      let opt = sel.querySelector(`option[value="${projId}"]`);
+      if (!opt) {
+        const proj = (DATA.projects||[]).find(p => p.id === projId);
+        opt = document.createElement('option');
+        opt.value = projId;
+        opt.textContent = proj ? `${proj.name} (${proj.id})` : projId;
+        // Insert before the __existing__ option (at end of special opts)
+        const existingOpt = sel.querySelector('option[value="__existing__"]');
+        if (existingOpt) {
+          sel.insertBefore(opt, existingOpt);
+        } else {
+          sel.appendChild(opt);
+        }
+      }
+      sel.value = projId;
+    }
+    // Fire the appropriate handler
+    if (changeHandler === 'onTriageProjectChange') {
+      onTriageProjectChange(triageId, projId);
+    } else if (changeHandler === 'onReassignProjectChange') {
+      onReassignProjectChange(triageId, projId);
+    } else if (changeHandler === 'onSubtaskProjectChange') {
+      onSubtaskProjectChange(triageId, projId);
+    } else {
+      updateTriageField(triageId, fieldName, projId);
+    }
+  });
+}
+
+/**
+ * Build triage project dropdown options (short list + search).
+ * If matchedId is a real project, include it so it shows selected.
+ * @param {string} matchedId: current matched project id
+ * @param {Object} opts: { showNew, showUnmatched, emptyLabel }
+ */
+function buildTriageProjectOptions(matchedId, opts = {}) {
+  const showUnmatched = opts.showUnmatched !== false;
+  const emptyLabel = opts.emptyLabel || '- unmatched -';
+  let html = '';
+  if (showUnmatched) {
+    html += `<option value="">${esc(emptyLabel)}</option>`;
+  }
+  // ── ONE "+ New" ENTRY PER WORK TYPE ──────────────────────────────────
+  // The option VALUE is the sentinel plus the work type after a colon
+  // (`__new__:task`); tvBase strips it for the server, tvWorkType /
+  // tvWorkflow ride along as work_type / workflow_id in the approve payload.
+  if (opts.showNew) {
+    const wts = workTypes();
+    if (wts.length) {
+      wts.forEach(wt => {
+        const val = '__new__:' + wt.id;
+        const sel = (matchedId === val || (tvBase(matchedId) === '__new__' && tvWorkType(matchedId) === wt.id)) ? 'selected' : '';
+        html += `<option value="${escA(val)}" ${sel}>+ New ${esc(wt.label || wt.id)}</option>`;
+      });
+    } else {
+      html += `<option value="__new__" ${tvBase(matchedId) === '__new__' ? 'selected' : ''}>+ New ${esc(ent('project'))}</option>`;
+    }
+  }
+  // If a real project is matched, show it as an option so it appears selected
+  const isRealProject = matchedId && !matchedId.startsWith('__') && matchedId !== '';
+  if (isRealProject) {
+    const proj = (DATA.projects||[]).find(p => p.id === matchedId);
+    const label = proj ? `${esc(proj.name)} (${matchedId})` : matchedId;
+    html += `<option value="${matchedId}" selected>${label}</option>`;
+  }
+  html += `<option value="__existing__">\ud83d\udd0d Search existing...</option>`;
+  return html;
+}
+
+async function ignoreProject(id) {
+  const p = (DATA.projects||[]).find(x => x.id === id);
+  if (!p) return;
+  const ign = stageWithRole('ignored', projectWorkflowId(p));
+  if (!ign) { toast('This workflow has no ignored stage'); return; }
+  // Stash the previous status so it can be restored
+  const notes = [{ text: `Ignored (was ${stageLabel(p.status)})`, time: new Date().toLocaleString('en-US', {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) }];
+  try {
+    await apiPut(id, { status: ign, notes });
+    await loadData();
+    closePanel();
+    toast('Ignored: click the ignored pill to find it later');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+async function unignoreProject(id) {
+  try {
+    const p = (DATA.projects||[]).find(x => x.id === id);
+    const w = p ? wfById(projectWorkflowId(p)) : null;
+    const entry = (w && w.entry_stage) || stageWithRole('todo', p && projectWorkflowId(p)) || (w && wfStages(w)[0] && wfStages(w)[0].id);
+    if (!entry) { toast('No entry stage to restore to'); return; }
+    await apiPut(id, { status: entry });
+    await loadData();
+    toast('Back on the board');
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ── DRAG & DROP ──
+function onDragStart(e) {
+  dragProjectId = e.target.closest('.card').dataset.id;
+  e.target.closest('.card').classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+}
+function onDragEnd(e) {
+  dragProjectId = null;
+  e.target.closest('.card')?.classList.remove('dragging');
+  document.querySelectorAll('.drop-zone').forEach(z => z.classList.remove('drag-over'));
+}
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  e.currentTarget.classList.add('drag-over');
+}
+function onDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over');
+}
+async function onDrop(e) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if (!dragProjectId) return;
+  const statuses = e.currentTarget.dataset.statuses.split(',');
+  const newStatus = statuses[0]; // first status in the column
+  try {
+    await apiPut(dragProjectId, { status: newStatus });
+    await loadData();
+    toast(`Moved → ${stageLabel(newStatus)}`);
+  } catch(err) { toast('Error: ' + err.message); }
+  dragProjectId = null;
+}
+
+// ── FILTERS ──
+document.getElementById('search').addEventListener('input', e => {
+  searchQuery = e.target.value;
+  renderBoard();
+});
+
+// Type pill filters (rendered inside metrics strip, so use global functions)
+function toggleTypePill(btn, f) {
+  if (activeFilters.has(f)) { activeFilters.delete(f); }
+  else { activeFilters.add(f); }
+  renderBoard();
+}
+function toggleArchive() {
+  showArchive = !showArchive;
+  renderBoard();
+}
+
+// ── KEYBOARD ──
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePanel();
+  if (e.key === '/' && !e.target.matches('input,textarea')) {
+    e.preventDefault();
+    document.getElementById('search').focus();
+  }
+});
+
+// ── URGENCY CHANGE TRACKING ──
+let _prevScores = {};  // { projId: score }
+let _changedIds = {};  // { projId: delta }: cleared after render applies classes
+
+function snapshotScores() {
+  if (!DATA || !DATA.projects) return;
+  _prevScores = {};
+  DATA.projects.forEach(p => { _prevScores[p.id] = getUrgencyScore(p); });
+}
+
+function detectChanges() {
+  if (!DATA || !DATA.projects || Object.keys(_prevScores).length === 0) return;
+  _changedIds = {};
+  DATA.projects.forEach(p => {
+    const prev = _prevScores[p.id];
+    const curr = getUrgencyScore(p);
+    if (prev !== undefined && prev !== curr) {
+      _changedIds[p.id] = Math.round(curr - prev);
+    }
+  });
+}
+
+// ── DAILY HEALTH BAR ──
+// Tracks total pipeline urgency over the session. "Boss HP" = sum of all urgency scores.
+// Lower urgency is better: you're trying to kill the boss (your backlog).
+// Persisted to server-side hp_history.json (syncs across machines via OneDrive).
+// Hourly snapshots captured every 15 min to ensure we catch the true daily low.
+let _sessionStartHP = null;   // total urgency when page first loaded today
+let _sessionStartTime = null; // timestamp of first load today
+let _sessionPeakHP = null;    // highest urgency seen today (for bar scaling)
+let _dailyLow = null;         // lowest urgency achieved today (your best)
+let _yesterdayLow = null;     // yesterday's lowest urgency (comparison baseline)
+let _hourlySnapshots = [];    // [{time: ISO, value: number}]: today's readings
+
+// ── DAMAGE IS EVENT-SOURCED, NOT INFERRED (2026-07-28) ───────────────
+// Deriving damage from the HP curve cannot attribute anything to the user: the
+// curve moves on its own. Measured live, urgency AGES UPWARD +25..+37 every
+// single minute, and background events (mail landing, triage staging, status
+// cascades) push it down: so every downward blip scored as his damage and the
+// DPM meter climbed while he sat still. Worse, the aging exceeded the
+// force-snapshot threshold, turning a 15-minute cadence into one snapshot a
+// minute.
+// A hit is now recorded ONLY when the user does something that drops urgency.
+let _damageEvents = [];       // [{time: ISO, amt: number, src: string}]
+
+function _dealDamage(amount, source) {
+  if (!feat('game_layer')) return;
+  const amt = Math.round(amount);
+  if (!(amt > 0)) return;     // aging/regen is the boss's business, not a hit
+  _damageEvents.push({ time: new Date().toISOString(), amt, src: source || 'action', sv: AGING_SCALE_V });
+  if (_damageEvents.length > 400) _damageEvents = _damageEvents.slice(-300);
+  _recordSnapshot(getTotalHP(), { force: true });
+  _saveHPState();
+  if (typeof window.dpsmRefresh === 'function') setTimeout(window.dpsmRefresh, 600);
+}
+
+// Wrap any action that mutates DATA: measures the urgency it knocked off.
+function withDamage(source, fn) {
+  const before = getTotalHP();
+  const done = () => { try { _dealDamage(before - getTotalHP(), source); } catch(e){} };
+  try {
+    const r = fn();
+    if (r && typeof r.then === 'function') { r.then(done, done); return r; }
+    done(); return r;
+  } catch(e) { done(); throw e; }
+}
+let _7dayHistory = [];        // [{date: 'YYYY-MM-DD', low: number, start: number, peak: number}]
+let _7dayAvg = null;          // rolling 7-day average of daily lows
+let _hpServerCache = null;    // cached server response to avoid redundant GETs
+
+function _todayStr() { return ymd(new Date()); }
+function _dateStr(daysAgo) {
+  const d = new Date(); d.setDate(d.getDate() - daysAgo);
+  return ymd(d);
+}
+
+async function _fetchHPHistory() {
+  // Fetch all HP history from server (cached in memory to reduce requests)
+  if (!feat('game_layer')) return {};
+  try {
+    const resp = await fetch('/api/hp-history');
+    if (!resp.ok) return {};
+    const data = await resp.json();
+    _hpServerCache = _normalizeHPScale(data.days || {});
+    return _hpServerCache;
+  } catch(e) { return _hpServerCache || {}; }
+}
+
+function _load7DayHistory() {
+  // Load up to 7 days of HP history from server cache
+  _7dayHistory = [];
+  // Belt and braces: the fetch may have landed before DATA did (no backlog to
+  // measure against ⇒ no conversion), and the normalizer is idempotent.
+  const days = _normalizeHPScale(_hpServerCache) || {};
+  for (let i = 7; i >= 1; i--) {
+    const dateStr = _dateStr(i);
+    const state = days[dateStr];
+    if (state) {
+      _7dayHistory.push({
+        date: dateStr,
+        low: state.dailyLow != null ? state.dailyLow : state.startHP,
+        start: state.startHP,
+        peak: state.peakHP || state.startHP,
+        snapshots: state.snapshots || []
+      });
+    }
+  }
+  // Already oldest-first (loop goes 7..1)
+
+  // Compute 7-day average from daily lows
+  if (_7dayHistory.length > 0) {
+    const lows = _7dayHistory.map(d => d.low);
+    _7dayAvg = Math.round(lows.reduce((s, v) => s + v, 0) / lows.length);
+  } else {
+    _7dayAvg = null;
+  }
+}
+
+async function _loadHPState() {
+  try {
+    const days = await _fetchHPHistory();
+    const today = _todayStr();
+    const yesterday = _dateStr(1);
+
+    // Load yesterday's low for day-over-day comparison
+    if (days[yesterday]) {
+      const ydayState = days[yesterday];
+      _yesterdayLow = ydayState.dailyLow != null ? ydayState.dailyLow : ydayState.startHP;
+    }
+
+    // Load 7-day history for trend graph
+    _load7DayHistory();
+
+    if (!days[today]) return false;
+    const state = days[today];
+    _sessionStartHP = state.startHP;
+    _sessionStartTime = new Date(state.startTime);
+    _sessionPeakHP = state.peakHP;
+    _dailyLow = state.dailyLow != null ? state.dailyLow : state.startHP;
+    _hourlySnapshots = state.snapshots || [];
+    _damageEvents = state.damageEvents || [];
+    _hpStateLoaded = true;
+    return true;
+  } catch(e) { return false; }
+}
+
+// SAVE GATE (2026-07-31). First render fires before _loadHPState() resolves and
+// used to PUT the placeholder state: one fresh snapshot, zero damage events -
+// over the top of today's real record. Nothing persists until the server's copy
+// is in hand.
+let _hpStateLoaded = false;
+
+function _saveHPState() {
+  if (!_hpStateLoaded || !feat('game_layer')) return;   // never write over a day we haven't read yet
+  // Fire-and-forget PUT to server: non-blocking
+  try {
+    const payload = {
+      date: _todayStr(),
+      state: {
+        startHP: _sessionStartHP,
+        startTime: _sessionStartTime.toISOString(),
+        peakHP: _sessionPeakHP,
+        dailyLow: _dailyLow,
+        snapshots: _hourlySnapshots,
+        damageEvents: _damageEvents
+      }
+    };
+    fetch('/api/hp-history', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).catch(() => {});
+    // Update local cache so subsequent reads don't need another GET
+    if (_hpServerCache) _hpServerCache[_todayStr()] = payload.state;
+  } catch(e) { /* degrade gracefully */ }
+}
+
+// Today's cumulative won$ / quoted$: same date-bucketing as renderComboTrend's
+// daily loop, but only for today. Stamped onto each snapshot so HP/Mana get the
+// same intraday resolution as the backlog line (accrues going forward).
+function _todayWonQuoted() {
+  if (!DATA || !DATA.projects) return { won: 0, quo: 0 };
+  const all = [...(DATA.projects || []), ...(DATA.archived || [])];
+  const today = _todayStr();
+  let won = 0, quo = 0;
+  all.forEach(p => {
+    const sd = p.sold_date || p.won_date || p.closed_date || null;
+    if (showMoney() && p.approved_amount && !isBudgetProject(p) && sd && String(sd).slice(0,10) === today) won += p.approved_amount;
+    const qd = p.quote_sent_date || p.created;
+    if (countsAsQuote(p) && qd && String(qd).slice(0,10) === today) quo += p.quote_amount;
+  });
+  return { won, quo };
+}
+
+// A real hit lands the moment the user checks a subtask: a 999-urgency task
+// takes 999 off the boss instantly. The old 14-minute gate meant that damage
+// sat unrecorded for up to a quarter hour, so the DPS meter (which reads
+// PERSISTED snapshots) showed nothing. Now a big swing forces a snapshot
+// immediately; the 14-min cadence still governs idle drift.  (2026-07-28)
+const SNAP_FORCE_DELTA = 25;   // urgency points that count as a real hit
+const SNAP_MIN_SECONDS = 20;   // burst guard: don't log every keystroke
+let _lastForcedSnap = 0;
+
+function _recordSnapshot(value, opts) {
+  const now = new Date();
+  const last = _hourlySnapshots.length ? _hourlySnapshots[_hourlySnapshots.length - 1] : null;
+  let forced = false;
+  if (last) {
+    const elapsed = (now - new Date(last.time)) / 60000;
+    if (elapsed < 14) {
+      // Only an explicit hit (_dealDamage) forces a snapshot. Forcing on raw
+      // delta magnitude was a mistake: urgency ages +25..+37/min on its own,
+      // which cleared the threshold every minute and logged pure aging.
+      const sinceForce = (now - _lastForcedSnap) / 1000;
+      forced = !!(opts && opts.force) && sinceForce >= 2;
+      if (!forced) return false;   // genuinely too soon and nothing happened
+      _lastForcedSnap = +now;
+    }
+  }
+  const wq = _todayWonQuoted();
+  // won/quo ride along so HP+Mana render at the same cadence as the backlog line
+  // sv marks the urgency SCALE this sample was taken on: see _normalizeHPScale.
+  _hourlySnapshots.push({ time: now.toISOString(), value, won: wq.won, quo: wq.quo, sv: AGING_SCALE_V });
+  // Cap at ~96 snapshots per day (every 15 min for 24h)
+  if (_hourlySnapshots.length > 100) _hourlySnapshots = _hourlySnapshots.slice(-96);
+  return forced ? 'forced' : true;
+}
+
+function _rawTotalHP() {
+  if (!DATA || !DATA.projects) return 0;
+  return DATA.projects
+    .filter(p => p.status !== 'ignored' && p.status !== 'complete' && p.status !== 'cold')
+    .reduce((sum, p) => sum + getUrgencyScore(p), 0);
+}
+function getTotalHP() { return Math.round(_rawTotalHP()); }
+
+// ── URGENCY SCALE CONVERSION  ──────────────────────────
+// The 4x aging slowdown moved the whole HP scale down at once, and the boss bar
+// is anchored to a 7-DAY AVERAGE OF DAILY LOWS (BOSS_DED = avg*0.5, BOSS_FULL =
+// avg*1.5). Left alone, every stored day would still be on the OLD scale while
+// today reads the new one, so the bar would have shown the backlog near-dead
+// for a week: the user: "i'm still completely underwater and i don't want the
+// board to not show that."
+//
+// The fix is NOT a magic constant. The board holds the same backlog it scores
+// every cycle, so it MEASURES the conversion: total urgency under the shipped
+// curve divided by total urgency under the pre-slowdown curve, using the real
+// getUrgencyScore both times. That ratio converts a pre-cutover reading into
+// what it would have read today. It is exact for the backlog in front of it and
+// stops mattering entirely once seven days of new-scale history exist.
+const AGING_SCALE_V = 2;                                  // 1 = pre-slowdown curves
+const AGING_CUTOVER = new Date('2026-09-09T20:35:00');    // when board.html changed
+let _scaleMemo = { key: null, r: null };
+
+function _oldToNewScale() {
+  if (!DATA || !DATA.projects || !DATA.projects.length) return null;
+  if (_scaleMemo.key === DATA.projects) return _scaleMemo.r;
+  const prev = AGING_SLOWDOWN;
+  let r = null;
+  try {
+    AGING_SLOWDOWN = prev; const sumNew = _rawTotalHP();
+    AGING_SLOWDOWN = 1;    const sumOld = _rawTotalHP();
+    if (sumOld > 0 && sumNew > 0) r = sumNew / sumOld;
+  } catch (e) { r = null; } finally { AGING_SLOWDOWN = prev; }   // restore ALWAYS
+  _scaleMemo = { key: DATA.projects, r };
+  return r;
+}
+
+// Rescales stored HP history onto the current scale, IN PLACE, idempotently.
+// Per-SAMPLE, keyed on the sample's own timestamp: the cutover day is mixed
+// (old-scale snapshots in the morning, new-scale after), so a day-level factor
+// would be wrong for exactly the day the user is looking at. Converted snapshots
+// carry `sv` so a re-save + re-read can never double-scale them; damage events
+// are never re-saved (db.save_hp_snapshot dedups them stored-first), so they
+// are converted fresh on every read instead. Day aggregates are RE-DERIVED from
+// the converted snapshots wherever snapshots exist, so they need no marker.
+function _normalizeHPScale(days) {
+  if (!days) return days;
+  const r = _oldToNewScale();
+  if (!(r > 0) || Math.abs(r - 1) < 0.001) return days;   // nothing to convert
+  const cut = AGING_CUTOVER.getTime();
+  const old = t => { const ms = new Date(t).getTime(); return isFinite(ms) && ms < cut; };
+  Object.keys(days).forEach(k => {
+    const st = days[k];
+    if (!st) return;
+    const snaps = Array.isArray(st.snapshots) ? st.snapshots : [];
+    snaps.forEach(sn => {
+      if (typeof sn.value === 'number' && !sn.sv && old(sn.time)) {
+        sn.value = Math.round(sn.value * r);
+        sn.sv = AGING_SCALE_V;
+      }
+    });
+    (Array.isArray(st.damageEvents) ? st.damageEvents : []).forEach(e => {
+      if (typeof e.amt === 'number' && !e.sv && old(e.time)) {
+        e.amt = Math.round(e.amt * r);
+        e.sv = AGING_SCALE_V;
+      }
+    });
+    if (st.sv) return;                       // already converted this session
+    const scaleAgg = () => ['startHP', 'peakHP', 'dailyLow'].forEach(f => {
+      if (typeof st[f] === 'number') st[f] = Math.round(st[f] * r);
+    });
+    const dayEnd = new Date(k + 'T23:59:59').getTime();
+    if (isFinite(dayEnd) && dayEnd < cut) {
+      // A day entirely before the change: every number on it is old-scale, so
+      // CONVERT the recorded aggregates rather than re-deriving them from the
+      // snapshots. dailyLow moves on every render and is routinely lower than
+      // any 15-minute snapshot: re-deriving would throw that real low away and
+      // RAISE the 7-day anchor, which reads as "you're winning". Wrong way.
+      scaleAgg();
+    } else {
+      // The cutover day is MIXED: old-scale before 20:35, new after: and its
+      // recorded dailyLow could be from either side with nothing to tell them
+      // apart. The timestamped snapshots are the only trustworthy record, so
+      // this one day is re-derived from them.
+      const vals = snaps.map(sn => sn.value).filter(v => typeof v === 'number');
+      if (vals.length) {
+        st.startHP  = vals[0];
+        st.peakHP   = Math.max.apply(null, vals);
+        st.dailyLow = Math.min.apply(null, vals);
+      } else { scaleAgg(); }
+    }
+    st.sv = AGING_SCALE_V;
+  });
+  return days;
+}
+
+// One-time migration: push any existing localStorage HP data to server, then clear it
+let _hpMigrationDone = false;
+async function _migrateLocalStorageHP() {
+  if (_hpMigrationDone) return;
+  _hpMigrationDone = true;
+  try {
+    let found = 0;
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('hp_')) {
+        const dateStr = k.slice(3); // "hp_YYYY-MM-DD" → "YYYY-MM-DD"
+        const state = JSON.parse(localStorage.getItem(k));
+        await fetch('/api/hp-history', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date: dateStr, state })
+        });
+        found++;
+      }
+    }
+    if (found > 0) {
+      // Clear localStorage HP keys after successful migration
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('hp_')) localStorage.removeItem(k);
+      }
+      console.log(`Migrated ${found} HP history entries from localStorage to server.`);
+      // Refresh cache after migration
+      await _fetchHPHistory();
+    }
+  } catch(e) { console.warn('HP localStorage migration failed:', e); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLAYER LEVELING: level 100 = annual sales target, linear per-level cost.
+// Each level costs ~PLAYER_LEVEL_SLOPE more than the previous (level 2 ≈ 1.1×
+// level 1), scaled so cumulative XP to hit level 100 == the annual goal.
+// XP = won YTD ($). Avatar beefs up every 10 levels; level-ups animate.
+// ─────────────────────────────────────────────────────────────────────────
+const PLAYER_MAX_LEVEL = 100;
+const PLAYER_LEVEL_SLOPE = 0.10;   // tune: bigger = steeper grind on later levels
+let _lastPlayerLevel = (() => { const v = parseInt(localStorage.getItem('pb_player_level'), 10); return isNaN(v) ? null : v; })();
+
+// cumulative XP ($) needed to REACH `level` (level 1 → 0, level 100 → annualTarget)
+function xpToReachLevel(level, annualTarget) {
+  const M = PLAYER_MAX_LEVEL, k = PLAYER_LEVEL_SLOPE;
+  const base = annualTarget / ((M - 1) + k * ((M - 2) * (M - 1) / 2)); // size of the level 1→2 gap
+  const n = Math.max(0, level - 1);
+  return base * (n + k * ((n - 1) * n / 2));
+}
+function playerLevelFromXp(xpXp, annualTarget) {
+  // Leveling continues PAST 100 on the same curve: exceed the annual target
+  // and you keep gaining levels (hard sanity cap 400). Used by BOTH the
+  // player (XP = won $ YTD vs ANNUAL_GOAL) and the boss (XP = quote count
+  // YTD vs pb_boss_annual_quotes).
+  if (annualTarget <= 0) return 1;
+  let L = 1;
+  while (L < 400 && xpToReachLevel(L + 1, annualTarget) <= xpXp) L++;
+  return L;
+}
+
+// Procedural knight bust: bulks up, gilds, and grows horns/crown/aura every 10 levels.
+function buildPlayerAvatar(level) {
+  const tier = Math.max(0, Math.min(9, Math.floor((level - 1) / 10)));   // 0..9
+  const PAL = [
+    ['#eef3fa','#9aa6b8','#566173','#2a313d','#8ee6ff'],
+    ['#eef3fa','#9aa6b8','#566173','#2a313d','#8ee6ff'],
+    ['#e7eef8','#8493ac','#46566e','#243043','#9befff'],
+    ['#e7eef8','#8493ac','#46566e','#243043','#bfe9ff'],
+    ['#f5dcad','#b88044','#6e4a1e','#3a2410','#ffd27a'],
+    ['#f7e0b0','#c2883f','#74471a','#3a2410','#ffbf66'],
+    ['#fff0c2','#e3bd52','#8a6a1e','#3e2e0c','#ffd24a'],
+    ['#fff3c8','#ecc44f','#8a6a1e','#3e2e0c','#ff9a3a'],
+    ['#fffbe6','#ffd86b','#b07e1e','#4a3408','#ff7a2a'],
+    ['#fffdf0','#ffe27a','#c08a1e','#4a3408','#ff5a2a'],
+  ];
+  const [m1, m2, m3, trim, eye] = PAL[tier];
+  const sw = 10.5 + tier * 0.95;          // shoulder half-width: beefier each tier
+  const capR = 2.3 + tier * 0.18;         // pauldron cap size
+  const eyeR = (0.9 + tier * 0.11).toFixed(2);
+  const g = 'pfp' + tier;
+  const F = n => (+n).toFixed(2);
+
+  const aura = tier >= 6 ? `<circle cx="20" cy="20" r="20" fill="url(#${g}aura)"/>` : '';
+  let crest = '';
+  if (tier >= 8)        crest = `<path d="M11 8 L12.6 2 L15 6.6 L17.4 1 L20 5.6 L22.6 1 L25 6.6 L27.4 2 L29 8 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="0.6" stroke-linejoin="round"/><circle cx="20" cy="6" r="1.5" fill="${eye}"/>`;
+  else if (tier >= 6)   crest = `<path d="M16.5 7 Q19 -1.5 20 5 Q21 -1.5 23.5 7 Q20 4.5 16.5 7 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="0.5" stroke-linejoin="round"/>`;
+  else if (tier >= 4)   crest = `<path d="M12.5 9 Q5.5 6.5 6 1.5 Q11 5 14 9 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="0.5" stroke-linejoin="round"/><path d="M27.5 9 Q34.5 6.5 34 1.5 Q29 5 26 9 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="0.5" stroke-linejoin="round"/>`;
+  else if (tier >= 2)   crest = `<path d="M18 7 Q20 2 22 7 Z" fill="${m2}" stroke="${trim}" stroke-width="0.5" stroke-linejoin="round"/>`;
+  const spikes = tier >= 5 ? `<path d="M${F(20-sw)} 31 l-2.6 -3.4 l2.8 0.7 Z" fill="${m2}" stroke="${trim}" stroke-width="0.4"/><path d="M${F(20+sw)} 31 l2.6 -3.4 l-2.8 0.7 Z" fill="${m2}" stroke="${trim}" stroke-width="0.4"/>` : '';
+
+  return `<svg viewBox="0 0 40 40" width="38" height="38" style="display:block">`
+    + `<defs><linearGradient id="${g}met" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${m1}"/><stop offset="0.5" stop-color="${m2}"/><stop offset="1" stop-color="${m3}"/></linearGradient>`
+    + `<radialGradient id="${g}aura" cx="0.5" cy="0.52" r="0.5"><stop offset="0.5" stop-color="${eye}" stop-opacity="0"/><stop offset="0.82" stop-color="${eye}" stop-opacity="${tier >= 8 ? 0.5 : 0.28}"/><stop offset="1" stop-color="${eye}" stop-opacity="0"/></radialGradient></defs>`
+    + aura
+    + `<path d="M${F(20-sw)} 40 Q${F(20-sw)} 30 ${F(20-sw*0.5)} 27.5 L${F(20+sw*0.5)} 27.5 Q${F(20+sw)} 30 ${F(20+sw)} 40 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="0.9" stroke-linejoin="round"/>`
+    + spikes
+    + `<ellipse cx="${F(20-sw*0.82)}" cy="30.2" rx="${F(capR)}" ry="${F(capR*0.78)}" fill="${m2}" stroke="${trim}" stroke-width="0.6"/>`
+    + `<ellipse cx="${F(20+sw*0.82)}" cy="30.2" rx="${F(capR)}" ry="${F(capR*0.78)}" fill="${m2}" stroke="${trim}" stroke-width="0.6"/>`
+    + `<path d="M16 24.5 L24 24.5 L23 28.5 L17 28.5 Z" fill="${m3}" stroke="${trim}" stroke-width="0.6"/>`
+    + `<path d="M12 7 Q20 3 28 7 Q29 12 28.5 20 Q28 26 20 29 Q12 26 11.5 20 Q11 12 12 7 Z" fill="url(#${g}met)" stroke="${trim}" stroke-width="1"/>`
+    + `<path d="M20 6 L20 28" stroke="${trim}" stroke-width="1" opacity="0.6"/>`
+    + crest
+    + `<path d="M13.5 14.3 L18.6 13.4 L18.6 17.8 L13.5 18.6 Z" fill="#0e1420"/><path d="M26.5 14.3 L21.4 13.4 L21.4 17.8 L26.5 18.6 Z" fill="#0e1420"/>`
+    + `<circle cx="16" cy="16" r="${eyeR}" fill="${eye}"/><circle cx="24" cy="16" r="${eyeR}" fill="${eye}"/>`
+    + `<path d="M15 22.3 L25 22.3 L24 25.3 L16 25.3 Z" fill="#0e1420" opacity="0.85"/></svg>`;
+}
+
+// Level-up burst over the player frame. Appended to <body> so a data re-render can't wipe it mid-animation.
+function spawnPlayerLevelUp(level, evolved) {
+  try { sfx('levelup'); } catch(e) {}
+  if (typeof UI !== 'undefined' && !UI.levelFx) return;
+  const frame = document.getElementById('player-frame');
+  const r = frame ? frame.getBoundingClientRect() : null;
+  const fx = document.createElement('div');
+  fx.className = 'levelup-fx';
+  if (r) { fx.style.left = r.left + 'px'; fx.style.top = r.top + 'px'; fx.style.width = r.width + 'px'; fx.style.height = r.height + 'px'; }
+  fx.innerHTML = `<div class="levelup-ring"></div><div class="levelup-text">LEVEL UP<span class="levelup-num">${level}</span></div>`
+    + (evolved ? '<div class="levelup-evo">ARMOR EVOLVED</div>' : '');
+  document.body.appendChild(fx);
+  setTimeout(() => fx.remove(), evolved ? 2600 : 2000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// HUD FORMULAS PER PRESET (2026-09-02, review #18)
+// The HUD is LOCKED: same frame, same bars, same combat text, same sounds,
+// same level-ups. Only the two numbers behind HP and MP change, and the
+// workflow file's `hud` block picks them. the user's sales preset
+// ({hp:'won_vs_goal', mp:'quoted_vs_goal'}) is the default and is exactly what
+// the board has always shown, so nothing moves until someone changes the file.
+// XP/level is deliberately NOT switchable: it drives the avatar tier and the
+// stored level, and re-basing it would erase the user's progression.
+//
+// Every formula returns a 0-100+ percentage on the same scale as the money
+// bars, so "overcharged" (≥100) and the low-HP danger flash keep working.
+// ══════════════════════════════════════════════════════════════════════════
+const HUD_METRICS = {
+  // Sales preset: unchanged behaviour.
+  won_vs_goal: ctx => ({
+    pct: ctx.pct(ctx.wonWeek, ctx.MONTHLY_WON_GOAL),
+    title: `Won ${ctx._fk(ctx.wonWeek)} of ${ctx._fk(ctx.MONTHLY_WON_GOAL)} monthly goal (rolling 28 days)`
+  }),
+  quoted_vs_goal: ctx => ({
+    pct: ctx.pct(ctx.quotedWeek, ctx.monthlyEstGoal),
+    title: `Quoted ${ctx._fk(ctx.quotedWeek)} of ${ctx._fk(ctx.monthlyEstGoal)} monthly goal (rolling 28 days)`
+  }),
+
+  // Email-only presets (scheduling / service manager / coworker edition).
+  // HP = responsiveness: share of the last 28 days' response SLAs that were
+  // answered or are still inside the clock. A breach deals damage, a reply heals.
+  responsiveness: ctx => {
+    let hit = 0, total = 0;
+    (DATA.projects || []).forEach(p => (p.subtasks || []).forEach(st => {
+      if (st.sla_type !== 'response' && st.date_type !== 'sla') return;
+      const created = st.sla_created || st.created;
+      if (!created) return;
+      const d = new Date(created);
+      if (isNaN(d) || d < ctx.weekStart) return;
+      total++;
+      if (st.status === 'complete') { hit++; return; }
+      if (calcBizHoursElapsed(created) <= (st.sla_hours || PROF.sla_hours || 4)) hit++;
+    }));
+    return {
+      pct: total ? Math.round(hit / total * 100) : 100,
+      title: `Responsiveness: ${hit}/${total} response SLAs answered or still inside the clock (rolling 28 days)`
+    };
+  },
+  // MP = capacity: full with nothing overdue; each overdue follow-up drains,
+  // and the longer it has been sitting the harder it drains.
+  capacity: () => {
+    let drain = 0, n = 0, oldest = 0;
+    (DATA.projects || []).forEach(p => {
+      if (isClosedStage(p.status, p.workflow_id)) return;
+      (p.subtasks || []).forEach(st => {
+        if (st.status === 'complete') return;
+        if (!st.follow_up_date) return;
+        const d = daysUntil(st.follow_up_date);
+        if (d === null || d > 0) return;
+        const over = -d;
+        n++; if (over > oldest) oldest = over;
+        drain += Math.min(20, 4 + over);
+      });
+    });
+    return {
+      pct: Math.max(0, 100 - Math.round(drain)),
+      title: `Capacity: ${n} overdue follow-up${n === 1 ? '' : 's'}` +
+             (n ? `, oldest ${oldest}d past due` : '') + ' (full at zero overdue)'
+    };
+  },
+  // Throughput: threads closed in the rolling window vs a goal.
+  threads_closed: ctx => {
+    const goal = parseFloat(localStorage.getItem('pb_threads_goal')) || 20;
+    let n = 0;
+    [...(DATA.projects || []), ...(DATA.archived || [])].forEach(p => {
+      if (!isClosedStage(p.status, p.workflow_id) || roleIs(p, 'ignored')) return;
+      const ds = p.closed_date || p.sold_date || p.last_activity;
+      if (!ds) return;
+      const d = new Date(ds);
+      if (isNaN(d) || d < ctx.weekStart || d >= ctx.weekEnd) return;
+      n++;
+    });
+    return { pct: ctx.pct(n, goal), title: `Threads closed: ${n} of ${goal} (rolling 28 days)` };
+  }
+};
+
+// MONEY FORMULAS ARE HARD-GATED. With features.money off the won/quoted bars
+// can't be selected at all; HP/MP fall to the email-only pair.
+const _MONEY_HUD = {won_vs_goal: 1, quoted_vs_goal: 1};
+
+function hudFormulaId(slot) {
+  const h = (WORKFLOWS && WORKFLOWS.hud) || {};
+  let v = h[slot];
+  if (v && _MONEY_HUD[v] && !showMoney()) v = null;
+  if (v && HUD_METRICS[v]) return v;
+  if (!showMoney()) return slot === 'hp' ? 'responsiveness' : 'capacity';
+  return slot === 'hp' ? 'won_vs_goal' : 'quoted_vs_goal';
+}
+
+function renderPlayerFrame() {
+  const el = document.getElementById('player-frame');
+  if (!el) return;
+  if (!DATA || !DATA.projects) { el.innerHTML = ''; return; }
+  const now = new Date();
+  const all = [...(DATA.projects || []), ...(DATA.archived || [])];
+  const ANNUAL_GOAL = annualGoal();
+  const WK = 53;
+  // HP/MP read a ROLLING 28-DAY (4-week) window vs a 4x-weekly goal. Rolling,
+  // not calendar MTD. Keep MONTH_DAYS/GOAL_WEEKS in sync with the same constants
+  // in renderComboTrend or the trend line stops matching the bar.
+  const MONTH_DAYS = 28, GOAL_WEEKS = 4;
+  const MONTHLY_WON_GOAL = (ANNUAL_GOAL / WK) * GOAL_WEEKS;   // monthly won goal
+  const yearStart = new Date(now.getFullYear(), 0, 1);
+  const weekEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  const weekStart = new Date(weekEnd); weekStart.setDate(weekStart.getDate() - MONTH_DAYS);
+  const inRange = (p, f, s, e) => { const d = p[f] ? new Date(p[f]) : null; return d && d >= s && d < e; };
+  const soldField = p => p.sold_date || p.won_date || p.closed_date || null;
+  const wonInWeek = p => { const d = soldField(p) ? new Date(soldField(p)) : null; return d && d >= weekStart && d < weekEnd; };
+  const wonInYTD = p => { const d = soldField(p) ? new Date(soldField(p)) : null; return d && d >= yearStart && d < now; };
+  // Budgets excluded everywhere below: must match the analytics tab (2026-08-10).
+  const wonP = all.filter(p => p.approved_amount && !isBudgetProject(p));
+  const quoP = all.filter(p => (p.quote_amount || p.approved_amount) && !isBudgetProject(p));
+  const wr = quoP.length ? wonP.length / quoP.length : 0.39;
+  const scOv = parseFloat(localStorage.getItem('pb_close_rate_override'));
+  const closeRate = (!isNaN(scOv) && scOv > 0) ? scOv : (wr > 0 ? wr : 0.39);
+  const monthlyEstGoal = (ANNUAL_GOAL / WK) * GOAL_WEEKS / closeRate;   // monthly quote goal
+  const wonWeek = all.filter(p => p.approved_amount && !isBudgetProject(p) && wonInWeek(p)).reduce((s, p) => s + p.approved_amount, 0);
+  const quotedWeek = all.filter(p => countsAsQuote(p) && (inRange(p, 'quote_sent_date', weekStart, weekEnd) || (!p.quote_sent_date && inRange(p, 'created', weekStart, weekEnd)))).reduce((s, p) => s + p.quote_amount, 0);
+  const wonYTD = all.filter(p => p.approved_amount && !isBudgetProject(p) && wonInYTD(p)).reduce((s, p) => s + p.approved_amount, 0);
+  const pct = (a, b) => b > 0 ? Math.round(a / b * 100) : 0;
+  const _fk = n => n >= 1000000 ? currencySymbol() + (n/1000000).toFixed(2) + 'M' : n >= 1000 ? currencySymbol() + Math.round(n/1000) + 'k' : fmtMoney(n);
+  // HP/MP come from the preset's formulas (defaults = won/quoted vs goal).
+  const _hudCtx = { pct, _fk, wonWeek, quotedWeek, MONTHLY_WON_GOAL, monthlyEstGoal, weekStart, weekEnd };
+  let _hp, _mp;
+  try { _hp = HUD_METRICS[hudFormulaId('hp')](_hudCtx); }
+  catch (e) { _hp = HUD_METRICS.won_vs_goal(_hudCtx); }
+  try { _mp = HUD_METRICS[hudFormulaId('mp')](_hudCtx); }
+  catch (e) { _mp = HUD_METRICS.quoted_vs_goal(_hudCtx); }
+  // XP: money on -> won YTD vs the annual goal; money off -> threads closed
+  // this year vs a per-year goal (threads_goal x 12).
+  let xpVal = wonYTD, xpGoal = ANNUAL_GOAL, xpUnit = 'annual target';
+  if (!showMoney()) {
+    xpVal = all.filter(p => isClosedStage(p.status, p.workflow_id) && !roleIs(p, 'ignored')
+      && (p.closed_date || p.last_activity) && new Date(p.closed_date || p.last_activity) >= yearStart).length;
+    xpGoal = (parseFloat(localStorage.getItem('pb_threads_goal')) || 20) * 12;
+    xpUnit = 'threads closed this year';
+  }
+  const hpReal = _hp.pct, mpReal = _mp.pct, xpReal = pct(xpVal, xpGoal);
+  const hpW = Math.min(100, hpReal), mpW = Math.min(100, mpReal);
+  const xpLevel = playerLevelFromXp(xpVal, xpGoal);
+  const _xpBase = xpToReachLevel(xpLevel, xpGoal);
+  const _xpNext = xpToReachLevel(xpLevel + 1, xpGoal);
+  const xpInLvl = Math.max(0, Math.min(100, Math.round((xpVal - _xpBase) / ((_xpNext - _xpBase) || 1) * 100)));
+  const goalTxt = showMoney() ? _fk(xpGoal) + ' ' + xpUnit : xpGoal + ' ' + xpUnit;
+  const uName = (PROF.user && PROF.user.name) || 'You';
+  const uRole = (PROF.user && PROF.user.role) || PROF.label || '';
+  const xpMaxed = xpLevel >= PLAYER_MAX_LEVEL;  // goal hit: golden glow stays, leveling continues past 100
+  const hpLow = hpReal < 25, hpOver = hpReal >= 100, mpOver = mpReal >= 100;
+  const hpTitle = `${_hp.title}: ${hpReal}%${hpOver ? ' · OVERCHARGED' : ''}`;
+  const mpTitle = `${_mp.title}: ${mpReal}%${mpOver ? ' · OVERCHARGED' : ''}`;
+  el.className = 'uframe player' + (hpLow ? ' wow-danger' : '');
+  el.innerHTML = `<div class="uframe-inner">
+    <div class="pcol"><div class="portrait">${buildPlayerAvatar(xpLevel)}</div><div class="ulevel" title="Level ${xpLevel}: ${xpReal}% of your ${escA(goalTxt)}${xpMaxed ? ' (TARGET HIT)' : ''} \u00b7 ${xpInLvl}% to L${xpLevel+1}">${xpLevel}</div></div>
+    <div class="ubars">
+      <div class="uname">${esc(uName)} ${uRole ? `<small>${esc(uRole)}</small>` : ''}</div>
+      <div class="brow"><span class="blbl lbl-hp">HP</span><div class="ubar${hpOver ? ' charged' : ''}"${hpOver ? ' style="--glow:70,230,54"' : ''} title="${hpTitle}"><div class="ubar-fill hp${hpOver ? ' wow-over' : ''}" style="width:${hpW}%"></div><div class="ubar-txt">${hpOver ? 100 : hpReal}%</div></div></div>
+      <div class="brow"><span class="blbl lbl-mp">MP</span><div class="ubar${mpOver ? ' charged' : ''}"${mpOver ? ' style="--glow:84,172,255"' : ''} title="${mpTitle}"><div class="ubar-fill mp${mpOver ? ' wow-over' : ''}" style="width:${mpW}%"></div><div class="ubar-txt">${mpOver ? 100 : mpReal}%</div></div></div>
+      <div class="brow"><span class="blbl lbl-xp">XP</span><div class="ubar${xpMaxed ? ' charged' : ''}"${xpMaxed ? ` style="--glow:187,85,230" title="Level ${xpLevel}: target hit, still climbing: ${xpInLvl}% to L${xpLevel+1}"` : ` title="Level ${xpLevel}: ${xpInLvl}% to level ${xpLevel+1}"`}><div class="ubar-fill xp${xpMaxed ? ' wow-over' : ''}" style="width:${xpInLvl}%"></div><div class="ubar-txt">${xpInLvl}%</div></div></div>
+    </div>
+  </div>`;
+
+  // ── Level-up detection: fire the burst when level rises across renders ──
+  if (_lastPlayerLevel !== null && xpLevel > _lastPlayerLevel) {
+    const _crossedTier = Math.floor((xpLevel - 1) / 10) > Math.floor((_lastPlayerLevel - 1) / 10);
+    try { spawnPlayerLevelUp(xpLevel, _crossedTier); } catch (e) {}
+  }
+  _lastPlayerLevel = xpLevel;
+  try { localStorage.setItem('pb_player_level', String(xpLevel)); } catch (e) {}
+}
+
+function renderComboTrend(currentUrgency, maxHP, ggThreshold) {
+  // 7-day combined trend on a shared 0–100% axis:
+  //  • BACKLOG (boss): high-res intraday line colored by VALUE (red=high → green=low),
+  //    scaled by the boss model (0% = avg*0.5, 100% = avg*1.5).
+  //  • HP: won this day vs daily won-goal (green).  • MANA: quoted this day vs daily quote-goal (blue).
+  const canvas = document.getElementById('health-bar-sparkline');
+  if (!canvas) return;
+  const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const p2 = n => String(n).padStart(2, '0');
+  const dstr = dt => `${dt.getFullYear()}-${p2(dt.getMonth()+1)}-${p2(dt.getDate())}`;
+
+  // Backlog urgency → % of full, using the same anchors as the boss health bar
+  const bossBase = (typeof _7dayAvg !== 'undefined' && _7dayAvg !== null) ? _7dayAvg
+                 : ((typeof _sessionStartHP !== 'undefined' && _sessionStartHP) ? _sessionStartHP : 100);
+  const BOSS_DED = bossBase * 0.5, BOSS_FULL = bossBase * 1.5;
+  const toBossPct = v => Math.max(0, Math.min(100, ((v - BOSS_DED) / ((BOSS_FULL - BOSS_DED) || 1)) * 100));
+
+  // ── High-res backlog points (intraday snapshots), stored as percent ──
+  const points = [];     // [{x: fractional day index, y: bossPct}]
+  const dayLabels = [];  // [{x, date, label, isToday}]
+  (typeof _7dayHistory !== 'undefined' ? _7dayHistory : []).forEach((day, i) => {
+    const d = new Date(day.date + 'T12:00:00');
+    dayLabels.push({ x: i, date: day.date, label: isNaN(d) ? '' : dayNames[d.getDay()], isToday: false });
+    if (day.snapshots && day.snapshots.length > 0) {
+      day.snapshots.forEach((snap, si) => {
+        const frac = si / Math.max(1, day.snapshots.length - 1);
+        points.push({ x: i + frac * 0.9, y: toBossPct(snap.value) });
+      });
+    } else {
+      points.push({ x: i, y: toBossPct(day.start) });
+      points.push({ x: i + 0.5, y: toBossPct(day.low) });
+      points.push({ x: i + 0.9, y: toBossPct(day.low) });
+    }
+  });
+  const todayIdx = (typeof _7dayHistory !== 'undefined' ? _7dayHistory.length : 0);
+  dayLabels.push({ x: todayIdx, date: dstr(new Date()), label: dayNames[new Date().getDay()], isToday: true });
+  if (typeof _hourlySnapshots !== 'undefined' && _hourlySnapshots.length > 0) {
+    _hourlySnapshots.forEach((snap, si) => {
+      const frac = si / Math.max(1, _hourlySnapshots.length - 1);
+      points.push({ x: todayIdx + frac * 0.9, y: toBossPct(snap.value) });
+    });
+  }
+  points.push({ x: todayIdx + 0.95, y: toBossPct(currentUrgency) });
+
+  // ── HP (won) + MANA (quoted) % series: ROLLING 28-DAY, matches the HP/MP bars ──
+  // The player-frame bars read "trailing-28-day won/quoted vs MONTHLY goal". Plot the
+  // SAME metric at each day node so the trend's right edge equals the bar exactly.
+  // (Was: per-day dollars vs a 1/7 DAILY goal: which read ~0% on any day without a
+  // quote landing on that exact date, making the line look broken next to a 46% bar.
+  // quote_sent_date/sold_date are day-granular, so the rolling window is where the
+  // real resolution lives: the line now moves as quotes enter/leave the 7-day window,
+  // instead of collapsing to zero on quiet days.)
+  const hpSeries = [], mpSeries = [];
+  let todayHp = 0, todayMp = 0;
+  if (DATA && DATA.projects) {
+    const all = [...(DATA.projects || []), ...(DATA.archived || [])];
+    const ANNUAL_GOAL = annualGoal();
+    const WK = 53;
+    const wonP = all.filter(p => p.approved_amount && !isBudgetProject(p));
+    const quoP = all.filter(p => (p.quote_amount || p.approved_amount) && !isBudgetProject(p));
+    const wr = quoP.length ? wonP.length / quoP.length : 0.39;
+    const scOv = parseFloat(localStorage.getItem('pb_close_rate_override'));
+    const closeRate = (!isNaN(scOv) && scOv > 0) ? scOv : (wr > 0 ? wr : 0.39);
+    // MUST stay in sync with renderPlayerFrame's MONTH_DAYS / GOAL_WEEKS
+    const MONTH_DAYS = 28, GOAL_WEEKS = 4;
+    const weekWonGoal = (ANNUAL_GOAL / WK) * GOAL_WEEKS;               // renderPlayerFrame MONTHLY_WON_GOAL
+    const weekQuoGoal = (ANNUAL_GOAL / WK) * GOAL_WEEKS / closeRate;   // renderPlayerFrame monthlyEstGoal
+    const soldField = p => p.sold_date || p.closed_date || null;
+    const hpPct = won => Math.min(100, weekWonGoal > 0 ? (won / weekWonGoal) * 100 : 0);
+    const mpPct = quo => Math.min(100, weekQuoGoal > 0 ? (quo / weekQuoGoal) * 100 : 0);
+    // trailing 28-day (inclusive) won + quoted as of end-of-day `date`: mirrors the
+    // bar's weekStart..weekEnd window and its quote_sent_date-else-created fallback.
+    const MS_DAY = 86400000;
+    const rollingAsOf = date => {
+      const end = new Date(date + 'T23:59:59.999');
+      const start = new Date(end.getTime() - MONTH_DAYS * MS_DAY);
+      let won = 0, quo = 0;
+      all.forEach(p => {
+        const sd = soldField(p);
+        if (p.approved_amount && !isBudgetProject(p) && sd) { const d = new Date(sd); if (d > start && d <= end) won += p.approved_amount; }
+        const qd = p.quote_sent_date || p.created;
+        if (countsAsQuote(p) && qd) { const d = new Date(qd); if (d > start && d <= end) quo += p.quote_amount; }
+      });
+      return { won, quo };
+    };
+    dayLabels.forEach(dl => {
+      const t = rollingAsOf(dl.date);
+      const hpP = hpPct(t.won), mpP = mpPct(t.quo);
+      hpSeries.push({ x: dl.x + 0.45, y: hpP });
+      mpSeries.push({ x: dl.x + 0.45, y: mpP });
+      if (dl.isToday) { todayHp = Math.round(hpP); todayMp = Math.round(mpP); }
+    });
+  }
+
+  // ── Canvas sizing (fills the pane) ──
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = rect.width || 480, h = Math.max(64, rect.height || 92);
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  if (points.length < 2) {
+    ctx.fillStyle = '#4a4845'; ctx.font = '8px "JetBrains Mono", monospace'; ctx.textAlign = 'center';
+    ctx.fillText('building trend…', w / 2, h / 2);
+    return;
+  }
+
+  // ── Fixed 0–100% axis (backlog %, HP %, mana % all share it) ──
+  const yMin = 0, yMax = 100;
+  const xMin = points[0].x, xMax = points[points.length - 1].x;
+  const pad = { l: 4, r: 28, t: 6, b: 12 };
+  const toX = v => pad.l + (v - xMin) / (xMax - xMin || 1) * (w - pad.l - pad.r);
+  const toY = v => pad.t + (yMax - v) / (yMax - yMin || 1) * (h - pad.t - pad.b);
+
+  // value→color by screen Y: top = high urgency = red … bottom = low = green
+  const yPosToColor = (cy, a) => {
+    a = (a == null) ? 1 : a;
+    const gh = h - pad.t - pad.b;
+    const t = Math.max(0, Math.min(1, (cy - pad.t) / (gh || 1)));
+    if (t < 0.30)      return `rgba(239,68,68,${a})`;
+    else if (t < 0.55) return `rgba(251,146,60,${a})`;
+    else if (t < 0.75) return `rgba(250,204,21,${a})`;
+    else               return `rgba(74,222,128,${a})`;
+  };
+
+  // ── Horizontal gridlines + right-edge % scale ──
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#4a4845'; ctx.font = '7px "JetBrains Mono", monospace'; ctx.textAlign = 'left';
+  [0,25,50,75,100].forEach(val => {
+    const y = Math.round(toY(val)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    ctx.fillText(val + '%', w - pad.r + 3, y + 3);
+  });
+
+  // ── Day separators ──
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1;
+  dayLabels.forEach(dl => {
+    const x = Math.round(toX(dl.x)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
+  });
+
+  // ── AVG (grey dashed) + GG go-home (cyan dashed), mapped onto the backlog scale ──
+  if (bossBase > 0) {
+    const ay = toY(toBossPct(bossBase));
+    ctx.strokeStyle = 'rgba(107,105,102,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(pad.l, ay); ctx.lineTo(w - pad.r, ay); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#6b6966'; ctx.font = '6px "JetBrains Mono", monospace'; ctx.textAlign = 'left';
+    ctx.fillText('AVG', pad.l + 2, ay - 2);
+  }
+  if (ggThreshold) {
+    const gy = toY(toBossPct(ggThreshold));
+    ctx.strokeStyle = 'rgba(34,211,238,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([2,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l, gy); ctx.lineTo(w - pad.r, gy); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(34,211,238,0.6)'; ctx.font = '6px "JetBrains Mono", monospace'; ctx.textAlign = 'left';
+    ctx.fillText('GG', pad.l + 2, gy + 8);
+  }
+
+  // ── BACKLOG: gradient fill under the value-colored line ──
+  const fillGrad = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
+  fillGrad.addColorStop(0, 'rgba(239,68,68,0.13)');
+  fillGrad.addColorStop(0.35, 'rgba(251,146,60,0.10)');
+  fillGrad.addColorStop(0.6, 'rgba(250,204,21,0.08)');
+  fillGrad.addColorStop(1, 'rgba(74,222,128,0.06)');
+  ctx.beginPath();
+  ctx.moveTo(toX(points[0].x), h - pad.b);
+  points.forEach(p => ctx.lineTo(toX(p.x), toY(p.y)));
+  ctx.lineTo(toX(points[points.length - 1].x), h - pad.b);
+  ctx.closePath(); ctx.fillStyle = fillGrad; ctx.fill();
+
+  // backlog line: segment-by-segment, each colored by its value
+  ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (let i = 1; i < points.length; i++) {
+    const x0 = toX(points[i-1].x), y0 = toY(points[i-1].y);
+    const x1 = toX(points[i].x),   y1 = toY(points[i].y);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1);
+    ctx.strokeStyle = yPosToColor((y0 + y1) / 2);
+    ctx.stroke();
+  }
+  const lastP = points[points.length - 1], lastY = toY(lastP.y);
+  ctx.beginPath(); ctx.arc(toX(lastP.x), lastY, 2.6, 0, Math.PI*2);
+  ctx.fillStyle = yPosToColor(lastY); ctx.fill();
+  ctx.strokeStyle = '#111113'; ctx.lineWidth = 1; ctx.stroke();
+
+  // ── HP (green) + MANA (blue) overlay lines (daily) ──
+  const drawSeries = (series, color) => {
+    if (!series.length) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.globalAlpha = 0.92;
+    ctx.beginPath();
+    series.forEach((pt, i) => { const x = toX(pt.x), y = toY(pt.y); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.stroke(); ctx.globalAlpha = 1;
+    const last = series[series.length - 1];
+    ctx.beginPath(); ctx.arc(toX(last.x), toY(last.y), 2.1, 0, Math.PI*2); ctx.fillStyle = color; ctx.fill();
+  };
+  drawSeries(hpSeries, '#46e636');
+  drawSeries(mpSeries, '#54acff');
+
+  // ── Day labels along the bottom ──
+  ctx.font = '7px "JetBrains Mono", monospace'; ctx.textAlign = 'center';
+  dayLabels.forEach(dl => {
+    ctx.fillStyle = dl.isToday ? '#f5f3ed' : '#4a4845';
+    ctx.fillText(dl.label, toX(dl.x + 0.45), h - 2);
+  });
+
+  // ── Legend current values ──
+  const lb = document.getElementById('leg-boss'), lh = document.getElementById('leg-hp'), lm = document.getElementById('leg-mp');
+  if (lb) lb.textContent = 'Backlog ' + Math.round(toBossPct(currentUrgency)) + '%';
+  if (lh) lh.textContent = 'HP ' + todayHp + '%';
+  if (lm) lm.textContent = 'Mana ' + todayMp + '%';
+}
+
+function renderHealthBar() {
+  const wrap = document.getElementById('health-bar-wrap');
+  if (!DATA || !DATA.projects) { wrap.style.display = 'none'; return; }
+
+  // Trigger one-time migration from localStorage on first render
+  if (!_hpMigrationDone) _migrateLocalStorageHP();
+
+  const currentUrgency = getTotalHP();
+
+  // First render: restore from server (persists through refreshes, syncs across machines)
+  if (_sessionStartHP === null) {
+    // Async init: fetch history from server, then re-render once loaded
+    if (!_hpServerCache) {
+      _loadHPState().then(loaded => {
+        if (!loaded) {
+          // Genuinely no record for today (first load of the day): start one.
+          _sessionStartHP = currentUrgency;
+          _sessionStartTime = new Date();
+          _sessionPeakHP = currentUrgency;
+          _dailyLow = currentUrgency;
+          _damageEvents = [];
+          _hourlySnapshots = [];
+          _hpStateLoaded = true;   // safe to write: there was nothing to lose
+        }
+        renderHealthBar(); // re-render with loaded data
+      });
+      // Show placeholder while loading
+      _sessionStartHP = currentUrgency;
+      _sessionStartTime = new Date();
+      _sessionPeakHP = currentUrgency;
+      _dailyLow = currentUrgency;
+    }
+  }
+  if (currentUrgency > _sessionPeakHP) _sessionPeakHP = currentUrgency;
+  if (_dailyLow === null || currentUrgency < _dailyLow) _dailyLow = currentUrgency;
+
+  // Record hourly snapshot for trend tracking
+  const _snapResult = _recordSnapshot(currentUrgency);
+  // Always save: _saveHPState also persists dailyLow/peak, which move on
+  // ticks that don't produce a snapshot.
+  _saveHPState();
+  // A forced snapshot means real damage just landed: the meter reads the
+  // SERVER's copy, so let the PUT settle before asking it to repaint.
+  if (_snapResult === 'forced' && typeof window.dpsmRefresh === 'function') {
+    setTimeout(() => window.dpsmRefresh(), 600);
+  }
+
+  // ── BOSS HEALTH MODEL (anchored to 7-day average) ──
+  // Boss HP = pipeline urgency, scaled so the bar drains as you clear work:
+  //   0%   health = avg * 0.5  (boss ded: backlog way below normal)
+  //   100% health = avg * 1.5  (boss full: your realistic heavy-day ceiling)
+  //   GG line     = avg * 0.7  (go-home threshold; lands ~20% up the bar)
+  // Above avg*1.5 the boss is "shielded" (Power Word: Shield): the overflow absorb.
+  const bossBase = _7dayAvg !== null ? _7dayAvg : (_sessionStartHP || 100);
+  const BOSS_DED  = bossBase * 0.5;   // 0% health anchor
+  const BOSS_FULL = bossBase * 1.5;   // 100% health anchor
+  const toBossPct = v => ((v - BOSS_DED) / ((BOSS_FULL - BOSS_DED) || 1)) * 100;
+  const maxHP = BOSS_FULL;            // kept for any downstream callers; bar tops out here
+  const bossHP = currentUrgency;
+  const rawPct = toBossPct(bossHP);
+  const fillPct = Math.max(0, Math.min(100, rawPct));
+  const shieldPct = Math.max(0, Math.min(100, rawPct - 100));  // overflow past full → shield (capped +100%)
+
+  // Marker: yesterday's best (daily low urgency) = boss's lowest HP that day: your benchmark to beat
+  const hasYesterday = _yesterdayLow != null;
+  const markerPct = hasYesterday
+    ? Math.max(0, Math.min(100, toBossPct(_yesterdayLow)))
+    : Math.max(0, Math.min(100, toBossPct(_sessionStartHP)));
+
+  // ── "GG GO HOME" THRESHOLD: 30% below 7-day average (avg * 0.7) ──
+  const GG_THRESHOLD_PCT = 0.30;  // how far below avg to trigger
+  const ggBase = bossBase;
+  const ggThreshold = Math.round(ggBase * (1 - GG_THRESHOLD_PCT));  // urgency must drop below this
+  const ggReached = currentUrgency <= ggThreshold && ggBase > 0;
+  const ggMarkerPct = ggBase > 0 ? Math.max(0, Math.min(100, toBossPct(ggThreshold))) : null;
+
+  // PRIMARY DELTA: current urgency vs 7-day rolling average.
+  // Positive = you're gaining on your workload. Negative = drowning.
+  // Falls back to session start if no history yet.
+  let delta;
+  if (_7dayAvg !== null) {
+    delta = _7dayAvg - currentUrgency;  // positive = below avg = winning
+  } else {
+    delta = _sessionStartHP - currentUrgency;  // fallback: session start
+  }
+
+  const isWinning = delta > 0;
+  const isLosing = delta < 0;
+  const compareBase = _7dayAvg !== null ? _7dayAvg : _sessionStartHP;
+  const isCrushing = isWinning && compareBase > 0 && delta > compareBase * 0.3;
+
+  // HP tier: boss's fill percentage (REVERSED: full = bad, empty = good)
+  // Full bar = red (boss strong, you're losing). Empty bar = green (boss ded, you won).
+  let hpTier;
+  if (fillPct >= 70)      hpTier = 'hp-critical';  // red: boss is thriving, you're getting wrecked
+  else if (fillPct >= 45)  hpTier = 'hp-low';      // orange: boss still kicking
+  else if (fillPct >= 25)  hpTier = 'hp-mid';      // yellow: boss weakening
+  else                     hpTier = 'hp-high';      // green: boss almost ded
+
+  const stateClass = isWinning ? 'winning' : isLosing ? 'losing' : 'neutral';
+
+  wrap.style.display = 'block';
+
+  // Player frame (HP=won/28d, MP=quoted/28d) + boss health %
+  renderPlayerFrame();
+  const _bossPctEl = document.getElementById('boss-hp-pct');
+  if (_bossPctEl) _bossPctEl.textContent = Math.round(fillPct) + '%';
+  const _bossLvlEl = document.getElementById('boss-level');
+  if (_bossLvlEl) {
+    // Boss level = quotes REQUESTED this year (monotonic: the boss only ever
+    // levels UP; killing quotes drains its HP, not its level), run through the
+    // SAME exponential curve as the player so the two levels are comparable.
+    // L100 = pb_boss_annual_quotes (localStorage, default 550/yr): measured
+    // Mar–Jun run rate is ~68/mo (~816/yr annualized), but the DB only started
+    // tracking in March and there's a standing quote-request backlog: 550 calibrates the
+    // boss to sit at/just above the player level. Can level past 100 too.
+    // Active + archived, created this calendar year, 'task' projects excluded.
+    const _yStart = new Date(new Date().getFullYear(), 0, 1);
+    const _qCount = [...(DATA.projects || []), ...(DATA.archived || [])]
+      .filter(p => p.work_type !== 'task' && p.created && new Date(p.created) >= _yStart)
+      .length;
+    const _bossTarget = parseFloat(localStorage.getItem('pb_boss_annual_quotes')) || 550;
+    const _bossLvl = playerLevelFromXp(_qCount, _bossTarget);
+    _bossLvlEl.textContent = _bossLvl;
+    _bossLvlEl.title = 'Level ' + _bossLvl + ': ' + _qCount + ' quotes requested YTD (L100 = ' + _bossTarget + '/yr)';
+    // Boss level-up detection: monotonic, so a rise is always a real level
+    // (2026-08-12). Persisted so it fires once, not on every page load.
+    const _prevBossLvl = parseInt(localStorage.getItem('pb_boss_level'), 10);
+    if (!isNaN(_prevBossLvl) && _bossLvl > _prevBossLvl) {
+      try { sfx('bosslevel'); } catch(e) {}
+      _bossLvlEl.animate(
+        [{transform:'translateX(-50%) scale(1)'},{transform:'translateX(-50%) scale(1.7)'},{transform:'translateX(-50%) scale(1)'}],
+        {duration: 900, easing: 'ease-out'});
+      toast('The Backlog leveled up → ' + _bossLvl);
+    }
+    try { localStorage.setItem('pb_boss_level', String(_bossLvl)); } catch(e) {}
+  }
+
+  // Container ambient glow
+  const outer = document.getElementById('health-bar-outer');
+  outer.className = 'health-bar-container' + (isCrushing ? ' hb-crushing' : isWinning ? ' hb-winning' : isLosing ? ' hb-losing' : '');
+
+  // Fill bar: BOSS health. Red when full (boss strong), green when draining (boss dying)
+  const fillEl = document.getElementById('health-bar-fill');
+  fillEl.style.width = fillPct + '%';
+  fillEl.className = 'health-bar-fill ' + hpTier;
+
+  // Power Word: Shield: urgency past the 100% anchor (avg*2) overlays a golden absorb bubble
+  const shieldEl = document.getElementById('boss-shield');
+  if (shieldEl) {
+    if (shieldPct > 0) {
+      shieldEl.style.display = '';
+      shieldEl.style.width = Math.max(8, shieldPct) + '%';
+      shieldEl.title = `Boss shielded: backlog at ${Math.round(rawPct)}% of full (Power Word: Shield)`;
+    } else {
+      shieldEl.style.display = 'none';
+    }
+  }
+
+  // Marker: yesterday's low (or session start if no yesterday)
+  const markerEl = document.getElementById('health-bar-marker');
+  markerEl.style.left = markerPct + '%';
+  markerEl.title = hasYesterday
+    ? `Yesterday's best: ${_yesterdayLow} urgency`
+    : `Session start: ${_sessionStartHP} urgency`;
+  markerEl.setAttribute('data-label', hasYesterday
+    ? `YDAY LOW ${_yesterdayLow.toLocaleString()}`
+    : `START ${_sessionStartHP.toLocaleString()}`);
+
+  // GG marker: "go home" threshold (20% below 7-day avg)
+  const ggMarkerEl = document.getElementById('health-bar-gg-marker');
+  if (ggMarkerPct !== null) {
+    ggMarkerEl.style.display = '';
+    ggMarkerEl.style.left = ggMarkerPct + '%';
+    ggMarkerEl.className = 'health-bar-gg-marker' + (ggReached ? ' gg-reached' : '');
+    ggMarkerEl.title = `GG threshold: ${ggThreshold} urgency (${Math.round(GG_THRESHOLD_PCT * 100)}% below avg)`;
+    ggMarkerEl.setAttribute('data-label', `GG EZ ${ggThreshold.toLocaleString()}`);
+  } else {
+    ggMarkerEl.style.display = 'none';
+  }
+
+  // AVG marker: 7-day rolling average (dashed grey, above bar)
+  const avgMarkerEl = document.getElementById('health-bar-avg-marker');
+  if (_7dayAvg !== null && maxHP > 0) {
+    const avgPct = Math.max(0, Math.min(100, toBossPct(_7dayAvg)));
+    avgMarkerEl.style.display = '';
+    avgMarkerEl.style.left = avgPct + '%';
+    avgMarkerEl.setAttribute('data-label', `AVG ${_7dayAvg.toLocaleString()}`);
+    avgMarkerEl.title = `7-day average: ${_7dayAvg} urgency`;
+  } else {
+    avgMarkerEl.style.display = 'none';
+  }
+
+  // LOW marker: today's best (green, below bar)
+  const lowMarkerEl = document.getElementById('health-bar-low-marker');
+  if (_dailyLow != null && _dailyLow < currentUrgency && maxHP > 0) {
+    const lowPct = Math.max(0, Math.min(100, toBossPct(_dailyLow)));
+    lowMarkerEl.style.display = '';
+    lowMarkerEl.style.left = lowPct + '%';
+    lowMarkerEl.setAttribute('data-label', `LOW ${_dailyLow.toLocaleString()}`);
+    lowMarkerEl.title = `Today's best: ${_dailyLow} urgency`;
+  } else {
+    lowMarkerEl.style.display = 'none';
+  }
+
+  // HP number: show boss HP (= urgency). Lower = closer to killing the boss
+  const hpEl = document.getElementById('health-bar-hp');
+  hpEl.textContent = bossHP.toLocaleString();
+  hpEl.className = 'health-bar-hp ' + hpTier;
+
+  // Delta: damage dealt to boss vs baseline (positive = boss lost HP = you're winning)
+  const deltaEl = document.getElementById('health-bar-delta');
+  if (delta !== 0) {
+    // Positive delta = urgency dropped from baseline = damage dealt to boss = green
+    const sign = delta > 0 ? '−' : '+';  // boss LOST hp (−) when you're winning, GAINED (+) when losing
+    deltaEl.textContent = sign + Math.abs(Math.round(delta));
+    deltaEl.className = 'health-bar-delta ' + stateClass;
+  } else {
+    deltaEl.textContent = '±0';
+    deltaEl.className = 'health-bar-delta neutral';
+  }
+
+  // Context line: show what we're comparing against
+  const timeEl = document.getElementById('health-bar-time');
+  const mins = Math.floor((new Date() - _sessionStartTime) / 60000);
+  const sessionTime = mins < 60 ? `${mins}m` : `${Math.floor(mins/60)}h ${mins%60}m`;
+  if (_7dayAvg !== null) {
+    timeEl.textContent = `Now: ${currentUrgency.toLocaleString()} · 7d Avg: ${_7dayAvg.toLocaleString()} · GG EZ: ${ggThreshold.toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
+  } else {
+    timeEl.textContent = `Now: ${currentUrgency.toLocaleString()} · Start: ${_sessionStartHP.toLocaleString()} · Today Low: ${(_dailyLow || 0).toLocaleString()} · ${sessionTime}`;
+  }
+
+  // Label: boss status (how close to ded)
+  // GG GO HOME takes priority when threshold is crossed: you've done enough today
+  const labelEl = document.getElementById('health-bar-label');
+  const ydayBeat = hasYesterday && _dailyLow < _yesterdayLow;
+  if (shieldPct > 0) {
+    labelEl.textContent = 'PW: SHIELD';
+    labelEl.className = 'health-bar-label shielded';
+  } else if (ggReached) {
+    labelEl.textContent = 'GG EZ';
+    labelEl.className = 'health-bar-label gg-go-home';
+  } else if (isCrushing) {
+    labelEl.textContent = ydayBeat ? 'BOSS DED' : 'EXECUTE PHASE';
+    labelEl.className = 'health-bar-label crushing';
+  } else if (isWinning) {
+    labelEl.textContent = ydayBeat ? 'NEW LOW' : 'DPS PHASE';
+    labelEl.className = 'health-bar-label winning';
+  } else if (isLosing && compareBase > 0 && Math.abs(delta) > compareBase * 0.2) {
+    labelEl.textContent = 'BOSS ENRAGE';
+    labelEl.className = 'health-bar-label losing';
+  } else if (isLosing) {
+    labelEl.textContent = 'ADDS SPAWNING';
+    labelEl.className = 'health-bar-label losing';
+  } else {
+    labelEl.textContent = 'BOSS HP';
+    labelEl.className = 'health-bar-label neutral';
+  }
+
+  // ── 7-DAY COMBINED TREND (boss / player HP / player MP) ──
+  renderComboTrend(currentUrgency, maxHP, ggThreshold);
+}
+
+function renderTrendGraph(currentUrgency, ggThreshold) {
+  const trendWrap = document.getElementById('health-bar-trend');
+  const canvas = document.getElementById('health-bar-sparkline');
+  const statsEl = document.getElementById('health-bar-trend-stats');
+  if (!canvas || !trendWrap) return;
+
+  // Build data points: up to 7 days of history + today
+  // Each day gets multiple points from its snapshots for a smoother line
+  const points = [];  // [{x: fractional day index, y: urgency}]
+  const dayLabels = [];  // [{x: fractional day index, label: 'Mon', isToday: bool}]
+
+  // Historical days
+  _7dayHistory.forEach((day, i) => {
+    const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const d = new Date(day.date + 'T12:00:00');
+    dayLabels.push({ x: i, label: dayNames[d.getDay()], isToday: false });
+
+    if (day.snapshots && day.snapshots.length > 0) {
+      // Use intraday snapshots for smooth curve
+      day.snapshots.forEach((snap, si) => {
+        const fracInDay = si / Math.max(1, day.snapshots.length - 1);
+        points.push({ x: i + fracInDay * 0.9, y: snap.value });
+      });
+    } else {
+      // Fallback: just use the daily summary values
+      points.push({ x: i, y: day.start });
+      points.push({ x: i + 0.5, y: day.low });
+      points.push({ x: i + 0.9, y: day.low });  // assume ended near low
+    }
+  });
+
+  // Today
+  const todayIdx = _7dayHistory.length;
+  const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  dayLabels.push({ x: todayIdx, label: dayNames[new Date().getDay()], isToday: true });
+
+  if (_hourlySnapshots.length > 0) {
+    _hourlySnapshots.forEach((snap, si) => {
+      const fracInDay = si / Math.max(1, _hourlySnapshots.length - 1);
+      points.push({ x: todayIdx + fracInDay * 0.9, y: snap.value });
+    });
+  }
+  // Always end with current value
+  points.push({ x: todayIdx + 0.95, y: currentUrgency });
+
+  if (points.length < 2) {
+    // Not enough data yet: hide the graph
+    trendWrap.style.display = 'none';
+    return;
+  }
+
+  trendWrap.style.display = 'flex';
+
+  // Canvas sizing
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = rect.width || 300;
+  const h = 56;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  // Scale: y-axis = boss HP (urgency). High urgency = top of graph (red/boss strong).
+  // Line going DOWN = urgency dropping = boss dying = GOOD.
+  const yVals = points.map(p => p.y);
+  const yMin = Math.min(...yVals) * 0.9;
+  const yMax = Math.max(...yVals) * 1.05;
+  const xMin = points[0].x;
+  const xMax = points[points.length - 1].x;
+  const pad = { l: 2, r: 2, t: 3, b: 10 };
+
+  const toX = (v) => pad.l + (v - xMin) / (xMax - xMin || 1) * (w - pad.l - pad.r);
+  const toY = (v) => pad.t + (yMax - v) / (yMax - yMin || 1) * (h - pad.t - pad.b);
+  // toY: high urgency (yMax) → top of graph (pad.t) = red/boss strong.
+  // Low urgency (yMin) → bottom of graph = green/boss ded.
+
+  // Day separator lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  dayLabels.forEach(dl => {
+    const x = Math.round(toX(dl.x)) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, h - pad.b);
+    ctx.stroke();
+  });
+
+  // Day labels at bottom
+  ctx.font = '7px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  dayLabels.forEach(dl => {
+    const x = toX(dl.x + 0.45);
+    ctx.fillStyle = dl.isToday ? '#f5f3ed' : '#4a4845';
+    ctx.fillText(dl.label, x, h - 1);
+  });
+
+  // 7-day average line
+  if (_7dayAvg !== null) {
+    const avgY = toY(_7dayAvg);
+    ctx.strokeStyle = 'rgba(107,105,102,0.4)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, avgY);
+    ctx.lineTo(w - pad.r, avgY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Tiny "AVG" label
+    ctx.fillStyle = '#4a4845';
+    ctx.font = '6px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('AVG', w - pad.r, avgY - 2);
+
+    // GG threshold line: 20% below avg. Cyan dashed line = "go home" target
+    if (ggThreshold) {
+      const ggY = toY(ggThreshold);
+      ctx.strokeStyle = 'rgba(34,211,238,0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(pad.l, ggY);
+      ctx.lineTo(w - pad.r, ggY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Tiny "GG" label
+      ctx.fillStyle = 'rgba(34,211,238,0.5)';
+      ctx.font = '6px "JetBrains Mono", monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText('GG', w - pad.r, ggY + 8);
+    }
+  }
+
+  // Boss HP color mapping: graph Y position → color
+  // Top of graph = high urgency = boss strong = RED. Bottom = low urgency = boss ded = GREEN.
+  function yPosToColor(canvasY, alpha) {
+    const a = alpha || 1;
+    const graphH = h - pad.t - pad.b;
+    const t = Math.max(0, Math.min(1, (canvasY - pad.t) / (graphH || 1)));
+    // t=0 → top of graph → high boss HP → red (bad)
+    // t=1 → bottom of graph → low boss HP → green (boss ded)
+    if (t < 0.3)       return `rgba(239,68,68,${a})`;    // red: boss strong
+    else if (t < 0.55) return `rgba(251,146,60,${a})`;   // orange: boss holding
+    else if (t < 0.75) return `rgba(250,204,21,${a})`;   // yellow: boss weakening
+    else               return `rgba(74,222,128,${a})`;   // green: boss almost ded
+  }
+
+  // Gradient fill under the line: top = red (boss strong), bottom = green (boss ded)
+  const fillGrad = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
+  fillGrad.addColorStop(0, 'rgba(239,68,68,0.12)');     // top = red (boss strong)
+  fillGrad.addColorStop(0.35, 'rgba(251,146,60,0.10)');
+  fillGrad.addColorStop(0.6, 'rgba(250,204,21,0.08)');
+  fillGrad.addColorStop(1, 'rgba(74,222,128,0.06)');    // bottom = green (boss ded)
+
+  // Draw fill
+  ctx.beginPath();
+  ctx.moveTo(toX(points[0].x), h - pad.b);
+  points.forEach(p => ctx.lineTo(toX(p.x), toY(p.y)));
+  ctx.lineTo(toX(points[points.length - 1].x), h - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = fillGrad;
+  ctx.fill();
+
+  // Draw line segment-by-segment, colored by Y position (high = red/boss strong, low = green/boss ded)
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (let i = 1; i < points.length; i++) {
+    const p0 = points[i - 1], p1 = points[i];
+    const x0 = toX(p0.x), y0 = toY(p0.y);
+    const x1 = toX(p1.x), y1 = toY(p1.y);
+    // Color by midpoint canvas Y position: high on screen = red (boss strong), low = green (boss ded)
+    const midY = (y0 + y1) / 2;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.strokeStyle = yPosToColor(midY);
+    ctx.stroke();
+  }
+
+  // Current value dot: colored by its Y position
+  const lastP = points[points.length - 1];
+  const lastY = toY(lastP.y);
+  const dotColor = yPosToColor(lastY);
+  ctx.beginPath();
+  ctx.arc(toX(lastP.x), lastY, 2.5, 0, Math.PI * 2);
+  ctx.fillStyle = dotColor;
+  ctx.fill();
+  ctx.strokeStyle = '#111113';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Stats text
+  if (_7dayAvg !== null) {
+    const trend = _7dayHistory.length >= 2
+      ? _7dayHistory[_7dayHistory.length - 1].low - _7dayHistory[0].low
+      : 0;
+    const trendSign = trend > 0 ? '+' : trend < 0 ? '' : '±';
+    statsEl.textContent = `${trendSign}${trend} / 7d`;
+    statsEl.style.color = trend <= 0 ? 'var(--c-4ade80)' : 'var(--c-ef4444)';
+  } else {
+    statsEl.textContent = 'building...';
+    statsEl.style.color = 'var(--t4)';
+  }
+}
+
+// ── FLOATING COMBAT TEXT ──
+function spawnCombatText() {
+  let changes = Object.entries(_changedIds);
+  const src = _fctSource;
+  _fctSource = null;
+  if (changes.length === 0) return;
+
+  // Sound rides the same deltas as the numbers: and still fires when the
+  // numbers themselves are switched off (2026-08-12)
+  try { sfxCombat(changes); } catch(e) {}
+  if (typeof UI !== 'undefined' && !UI.fct) return;
+
+  // ── CONSOLIDATE (2026-08-12) ──
+  // The 60s aging tick drips 1-3 points onto dozens of jobs at once; one number
+  // per project buried the screen in tiny −2s. Roll them into a single net
+  // number. Same treatment for any burst of 5+ simultaneous changes.
+  _fctAggLabel = null;
+  if (src === 'dot' || changes.length > 4) {
+    const net = changes.reduce((s, [, d]) => s + d, 0);
+    const n = changes.length;
+    if (!net) return;
+    _fctAggLabel = (src === 'dot' ? 'backlog aging' : 'board update')
+      + ' · ' + n + ' job' + (n !== 1 ? 's' : '');
+    changes = [['__aggregate__', net]];
+  }
+
+  // Remove any existing FCT container
+  document.querySelectorAll('.fct-container').forEach(el => el.remove());
+
+  const container = document.createElement('div');
+  container.className = 'fct-container';
+  document.body.appendChild(container);
+
+  // Sort by absolute delta descending: biggest change pops first / center
+  changes.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+
+  const cx = window.innerWidth / 2;
+  const cy = window.innerHeight / 2;
+
+  changes.forEach(([projId, delta], i) => {
+    const isHeal = delta < 0;
+    const absDelta = Math.abs(delta);
+    const p = (DATA.projects || []).find(x => x.id === projId);
+    const projName = _fctAggLabel || (p ? p.name : projId);
+
+    // Scale font: base 72px, scales up with delta, caps at 140px
+    const fontSize = Math.min(72 + absDelta * 3, 140);
+
+    // Stagger multiple changes vertically and with slight horizontal jitter
+    const yOffset = i * 70;
+    const xJitter = (Math.random() - 0.5) * 120;
+
+    const fct = document.createElement('div');
+    fct.className = `fct-number ${isHeal ? 'fct-heal' : 'fct-crit'}`;
+    fct.style.fontSize = fontSize + 'px';
+    fct.style.left = (cx + xJitter) + 'px';
+    fct.style.top = (cy - 40 + yOffset) + 'px';
+    fct.style.transform = 'translate(-50%, -50%)';
+    fct.style.animationDelay = (i * 0.12) + 's';
+    fct.textContent = isHeal ? `+${absDelta}` : `−${absDelta}`;
+    container.appendChild(fct);
+
+    // Project name label underneath
+    const label = document.createElement('div');
+    label.className = `fct-label ${isHeal ? 'fct-heal-label' : 'fct-crit-label'}`;
+    label.style.left = (cx + xJitter) + 'px';
+    label.style.top = (cy - 40 + yOffset + fontSize * 0.45) + 'px';
+    label.style.transform = 'translate(-50%, 0)';
+    label.style.animationDelay = (i * 0.12) + 's';
+    label.textContent = projName;
+    container.appendChild(label);
+  });
+
+  // Clean up after longest animation completes
+  const maxDelay = changes.length * 0.12;
+  setTimeout(() => container.remove(), (3200 + maxDelay * 1000));
+}
+
+// ── DATA LOADING ──
+async function loadData() {
+  try {
+    snapshotScores();
+    DATA = await apiGet();
+    await loadOpenQuestions();
+    rebuildLoyaltyCache();
+    detectChanges();
+    renderBoard();
+    // Sync DoT baseline so the 60s tick doesn't re-fire changes already rendered
+    if (typeof _dotPrevScores !== 'undefined' && DATA && DATA.projects) {
+      DATA.projects.forEach(p => { _dotPrevScores[p.id] = getUrgencyScore(p); });
+    }
+    document.getElementById('error-banner').style.display = 'none';
+  } catch(e) {
+    document.getElementById('error-banner').textContent = 'Failed to load: ' + e.message;
+    document.getElementById('error-banner').style.display = 'block';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ALERTS + LIVENESS BADGES (2026-09-02)
+// Everything here reads fields that may be ABSENT on a server that hasn't been
+// restarted yet. A 404 leaves the banner empty; it never throws, never blocks
+// a refresh, and never blanks the board.
+// ══════════════════════════════════════════════════════════════════════════
+let ALERTS = [];
+let HEALTH = null;   // last /api/health payload (Settings tabs read it)
+async function loadAlerts() {
+  const el = document.getElementById('alerts-banner');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/alerts?status=open&' + Date.now());
+    if (!r.ok) { ALERTS = []; el.innerHTML = ''; return; }
+    const j = await r.json();
+    ALERTS = Array.isArray(j) ? j : (Array.isArray(j.alerts) ? j.alerts : []);
+  } catch (e) { ALERTS = []; el.innerHTML = ''; return; }
+
+  const hard = ALERTS.filter(a => a.severity === 'hard');
+  const warn = ALERTS.filter(a => a.severity !== 'hard');
+  let h = '';
+  hard.forEach(a => {
+    h += `<div class="alert-bar">
+      <span class="a-title">⛔ ${esc(a.title || a.key || 'Alert')}</span>
+      ${a.detail ? `<span class="a-detail">${esc(String(a.detail).slice(0, 300))}</span>` : ''}
+      ${a.seen_count > 1 ? `<span class="a-detail">×${a.seen_count}</span>` : ''}
+      ${a.id != null ? `<button class="alert-ack" data-on-click="${EH(null, EK('ackAlert', a.id))}">ACK</button>` : ''}
+    </div>`;
+  });
+  if (warn.length) {
+    h += '<div style="margin-bottom:6px">' + warn.map(a =>
+      `<span class="alert-chip" title="${esc(String(a.detail || ''))}">
+        ⚠ ${esc(a.title || a.key || 'warning')}
+        ${a.id != null ? `<button class="alert-ack" data-on-click="${EH(null, EK('ackAlert', a.id))}">ACK</button>` : ''}
+      </span>`).join('') + '</div>';
+  }
+  el.innerHTML = h;
+}
+
+async function ackAlert(id) {
+  try {
+    const r = await fetch('/api/alerts/' + id + '/ack', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ by: (PROF.user && PROF.user.email) || 'user' })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    toast('Alert acknowledged: it re-opens in 12h if the condition holds');
+    loadAlerts();
+  } catch (e) { toast('Ack failed: ' + e.message); }
+}
+
+// A watcher that isn't running reads as green unless something says so: the
+// 8/31 lesson. These two badges are that something.
+async function loadHealthBadges() {
+  const el = document.getElementById('health-badges');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/health?' + Date.now());
+    if (!r.ok) { el.innerHTML = ''; return; }
+    const j = await r.json();
+    HEALTH = j;
+    renderMailBanner();
+    const down = Array.isArray(j.watchers_down) ? j.watchers_down : [];
+    const restart = Array.isArray(j.restart_needed) ? j.restart_needed : [];
+    let h = '';
+    if (down.length) {
+      h += `<span class="hdr-badge" title="${escA(down.join(', '))}: a watcher with no heartbeat. Absent evidence is DOWN, not fine.">${down.length} WATCHER${down.length > 1 ? 'S' : ''} DOWN</span>`;
+    }
+    if (restart.length) {
+      const mods = restart.map(m => (typeof m === 'string' ? m : (m.module || ''))).filter(Boolean);
+      h += `<span class="hdr-badge warn" title="Edited since the server imported them: ${escA(mods.join(', '))}. Restart to pick the changes up.">RESTART NEEDED (${restart.length})</span>`;
+    }
+    // Mail / AI / License badges (DESIGN.md section 4 health shape). Click opens
+    // the matching Settings tab.
+    const m = j.mail || {}, ai = j.ai || {}, lic = j.license || {};
+    const badge = (cls, txt, tip, tab) => `<span class="hdr-badge ${cls}" title="${escA(tip)}" style="cursor:pointer" data-on-click="${EH(null, EK('openSettings', String(tab)))}">${esc(txt)}</span>`;
+    if (m.provider && m.provider !== 'none') {
+      h += badge(m.ok ? 'ok' : '', 'MAIL ' + (m.ok ? 'OK' : 'DOWN'),
+        `${m.provider}${m.last_fetch ? ' \u00b7 last fetch ' + m.last_fetch : ''}${m.error ? ' \u00b7 ' + m.error : ''}`, 'mail');
+    } else {
+      h += badge('dim', 'NO MAIL', 'No mail provider configured. Open Settings > Mail.', 'mail');
+    }
+    if (ai.provider && ai.provider !== 'none') {
+      const spent = ai.today_cost_usd != null ? `$${Number(ai.today_cost_usd).toFixed(2)}` : '';
+      h += badge(ai.budget_hit ? 'warn' : (ai.ok === false ? '' : 'ok'), 'AI ' + (ai.budget_hit ? 'BUDGET' : (ai.ok === false ? 'DOWN' : 'OK')),
+        `${ai.provider}${spent ? ' \u00b7 today ' + spent : ''}${ai.budget_usd ? ' of $' + ai.budget_usd : ''}${ai.error ? ' \u00b7 ' + ai.error : ''}`, 'ai');
+    }
+    const ls = String(lic.status || '').toLowerCase();
+    if (ls && ls !== 'ok' && ls !== 'valid' && ls !== 'active') {
+      h += badge(ls === 'dev' ? 'dim' : 'warn', 'LICENSE ' + ls.toUpperCase(),
+        `${lic.plan ? lic.plan + ' \u00b7 ' : ''}${lic.expires ? 'expires ' + lic.expires : ''}${lic.grace_days_left != null ? ' \u00b7 ' + lic.grace_days_left + ' grace days left' : ''}`, 'license');
+    }
+    el.innerHTML = h;
+  } catch (e) { el.innerHTML = ''; }
+}
+
+async function fullRefresh() {
+  // Profession + config FIRST of all: entity names, fields and feature flags
+  // decide which columns, tiles, views and HUD formulas even get built. Same
+  // re-attempt rule as the workflow layer: retried while not live, fetched once
+  // per session after that.
+  if (PROF_STATE !== 'live') { await loadProfession(); }
+  if (CFG_STATE !== 'live') { await loadAppConfig(); }
+  // Workflows/tabs next: loadData renders, and a render that ran before the
+  // definitions landed would show the fallback strip and then never correct
+  // itself. Re-attempted while not live so a server restart is picked up
+  // without a page reload; once live it is fetched once per session.
+  if (WF_STATE !== 'live') { await loadWorkflows(); }
+  if (WF_STATE === 'live') { await loadBoardTabs(); }
+  await loadData();
+  await loadTriageItems();
+  loadAlerts();
+  loadHealthBadges();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// (Estimate workbench removed: builds handled by Claude/Cowork)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════
+// DUMP ZONE: project text/file intake
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// ASSISTANT QUESTIONS: the decision queue, on the card
+// ─────────────────────────────────────────────
+// The assistant posts blocking questions to /api/questions instead of asking
+// in chat. They render here, on the project they belong to, which means the
+// pane inherits the board's own ranking for free. Do NOT add a sort of your
+// own: a second score is what made the first swarm run surface a #12 project
+// ahead of #1 (2026-09-22).
+let _qHtml = {};
+let _qCountTxt = {};
+
+function _qRender(pid, qs) {
+  if (!qs.length) return '<div class="panel-value" style="color:var(--t3)">None</div>';
+  return qs.map(q => {
+    const opts = (q.options || []).map((o, i) => {
+      const label  = typeof o === 'string' ? o : (o.label || '');
+      const detail = typeof o === 'string' ? ''  : (o.detail || '');
+      const rec    = q.recommend && label && q.recommend.toLowerCase().startsWith(label.toLowerCase());
+      return `<div class="q-opt" data-on-click="${EH(null, EK('answerQuestion', String(pid), String(q.id), label))}">
+          <span class="q-opt-n">${i + 1}</span>
+          <span class="q-opt-body">
+            <span class="q-opt-label">${esc(label)}${rec ? ' <span class="q-rec">rec</span>' : ''}</span>
+            ${detail ? `<span class="q-opt-detail">${esc(detail)}</span>` : ''}
+          </span>
+        </div>`;
+    }).join('');
+    return `<div class="q-card" id="q-${q.id}">
+      <div class="q-text">${esc(q.question)}</div>
+      ${q.evidence ? `<div class="q-evidence">${esc(q.evidence)}</div>` : ''}
+      ${opts}
+      <div class="q-free">
+        <input id="q-in-${q.id}" class="q-input" placeholder="Something else..."
+               data-on-keydown="${EH({g:'enter'}, EK('answerQuestion', String(pid), String(q.id), $V))}">
+        <button class="est-add-btn q-skip" data-on-click="${EH(null, EK('mootQuestion', String(pid), String(q.id)))}">Not relevant</button>
+      </div>
+      ${q.unblocks ? `<div class="q-unblocks">&#x21B3; ${esc(q.unblocks)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function loadQuestions(projId) {
+  try {
+    const r = await fetch(`/api/questions?status=open&project_id=${encodeURIComponent(projId)}`);
+    const d = await r.json();
+    const qs = d.questions || [];
+    _qHtml[projId] = _qRender(projId, qs);
+    _qCountTxt[projId] = qs.length ? `${qs.length} open` : '';
+  } catch (e) {
+    _qHtml[projId] = '<div class="panel-value" style="color:var(--c-c96f6f)">questions unavailable</div>';
+    _qCountTxt[projId] = '';
+  }
+  const el = document.getElementById(`q-items-${projId}`);
+  if (el) el.innerHTML = _qHtml[projId];
+  const c = document.getElementById(`q-count-${projId}`);
+  if (c) c.textContent = _qCountTxt[projId];
+}
+
+async function answerQuestion(projId, qid, answer) {
+  answer = (answer || '').trim();
+  if (!answer) return;
+  const card = document.getElementById(`q-${qid}`);
+  if (card) card.style.opacity = '0.4';
+  try {
+    let r = await fetch(`/api/questions/${qid}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer })
+    });
+    if (r.status === 404 || r.status === 405) {
+      r = await fetch(`/api/questions/${qid}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'answered', answer })
+      });
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    if (j.drafted && j.draft_id) { _draftsCache = null; toast('Draft ready in the Drafts tab'); }
+    else toast(`Answer saved: ${answer.slice(0, 40)}`);
+  } catch (e) {
+    toast('answer failed');
+    if (card) card.style.opacity = '1';
+    return;
+  }
+  loadQuestions(projId);
+  loadOpenQuestions().then(() => { _tabStripSig = null; renderBoard(); });
+}
+
+async function mootQuestion(projId, qid) {
+  try {
+    await fetch(`/api/questions/${qid}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'moot' })
+    });
+  } catch (e) { toast('skip failed'); return; }
+  loadQuestions(projId);
+  loadOpenQuestions().then(() => { _tabStripSig = null; renderBoard(); });
+}
+
+async function loadDumpZone(projId) {
+  const container = document.getElementById('dump-items-' + projId);
+  const countEl = document.getElementById('dump-count-' + projId);
+  if (!container) return;
+
+  try {
+    const resp = await fetch('/api/projects/' + projId + '/intake');
+    const data = await resp.json();
+    if (!data.ok) { container.innerHTML = ''; return; }
+
+    const items = data.items || [];
+    if (countEl) {
+      countEl.textContent = items.length > 0 ? `${items.length} item${items.length > 1 ? 's' : ''}` : '';
+      _dumpCountTxt[projId] = countEl.textContent;
+    }
+
+    // Show/hide APPLY button based on processed items
+    const applyBtn = document.getElementById('dump-apply-btn-' + projId);
+    const hasProcessed = items.some(i => i.processed);
+    if (applyBtn) applyBtn.style.display = hasProcessed ? '' : 'none';
+
+    if (items.length === 0) {
+      const empty = '<div style="color:var(--t4);font-size: max(10px, var(--fs-min, 0px));padding:4px">No intake yet: paste text or drop files above</div>';
+      if (_dumpHtml[projId] !== empty || !container.innerHTML) container.innerHTML = empty;
+      _dumpHtml[projId] = empty;
+      if (applyBtn) applyBtn.style.display = 'none';
+      return;
+    }
+
+    let html = '';
+    items.forEach(item => {
+      const ts = item.created_at ? new Date(item.created_at).toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
+      const statusIcon = item.needs_review
+        ? '<span style="color:var(--c-f39c12);font-size: max(9px, var(--fs-min, 0px))" title="Needs Claude review">&#x1F441;</span>'
+        : item.claude_reviewed
+        ? '<span style="color:var(--c-4ecdc4);font-size: max(9px, var(--fs-min, 0px))" title="Claude reviewed">&#x2713;&#x2713;</span>'
+        : item.processed
+        ? '<span style="color:var(--c-4ecdc4);font-size: max(9px, var(--fs-min, 0px))" title="Regex extracted">&#x2713;</span>'
+        : '<span style="color:var(--c-f39c12);font-size: max(9px, var(--fs-min, 0px));animation:pulse 1.2s infinite" title="Processing...">&#x25CF;</span>';
+
+      // Build extraction tags for processed items
+      let extTags = '';
+      if (item.processed && item.extraction && typeof item.extraction === 'object') {
+        const ext = item.extraction;
+        const tags = [];
+        if (ext.equipment && ext.equipment.length) tags.push(`${ext.equipment.length} equip`);
+        if (ext.line_items && ext.line_items.length) tags.push(`${ext.line_items.length} items`);
+        if (ext.contacts && ext.contacts.length) tags.push(`${ext.contacts.length} contacts`);
+        if (ext.scope_snippets && ext.scope_snippets.length) tags.push('scope');
+        if (ext.dollar_amounts && ext.dollar_amounts.length) tags.push(`${ext.dollar_amounts.length} $`);
+        if (ext.building_info && Object.values(ext.building_info).some(v=>v)) tags.push('building');
+        if (ext.customer_info && Object.values(ext.customer_info).some(v=>v)) tags.push('customer');
+        if (ext.notes && ext.notes.length) tags.push(`${ext.notes.length} notes`);
+        if (tags.length) {
+          extTags = '<div class="dump-extraction-tags">' +
+            tags.map(t => `<span class="dump-ext-tag">${t}</span>`).join('') + '</div>';
+        }
+      }
+
+      if (item.intake_type === 'text') {
+        const preview = (item.content || '').substring(0, 150);
+        html += `<div style="background:var(--c-0f0f11);border:1px solid ${item.processed ? 'var(--c-1a2a1a)' : 'var(--bg3b)'};border-radius:4px;padding:6px;margin-bottom:4px;font-size: max(11px, var(--fs-min, 0px))">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">
+            <span style="color:var(--t3);font-size: max(9px, var(--fs-min, 0px))">${ts}</span>
+            <span>${statusIcon}
+              <button class="est-row-btn" style="width:auto;padding:0 4px;font-size: max(10px, var(--fs-min, 0px));color:var(--t3);margin-left:4px"
+                data-on-click="${EH(null, EK('deleteDumpItem', String(projId), item.id))}" title="Delete">&times;</button></span>
+          </div>
+          <div style="color:var(--c-c0bdb5);white-space:pre-wrap;word-break:break-word">${esc(preview)}${item.content.length > 150 ? '...' : ''}</div>
+          ${extTags}
+        </div>`;
+      } else {
+        const icon = {'pdf':'&#x1F4C4;','excel':'&#x1F4CA;','image':'&#x1F5BC;','docx':'&#x1F4DD;'}[item.file_type] || '&#x1F4CE;';
+        html += `<div style="background:var(--c-0f0f11);border:1px solid ${item.processed ? 'var(--c-1a2a1a)' : 'var(--bg3b)'};border-radius:4px;padding:6px;margin-bottom:4px;font-size: max(11px, var(--fs-min, 0px))">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span>${icon} <span style="color:var(--c-a89060)">${esc(item.file_name || 'file')}</span>
+              <span style="color:var(--t3);font-size: max(10px, var(--fs-min, 0px))">${item.file_size ? (item.file_size / 1024).toFixed(0) + 'KB' : ''}</span></span>
+            <span>${statusIcon} <span style="color:var(--t3);font-size: max(9px, var(--fs-min, 0px))">${ts}</span>
+              <button class="est-row-btn" style="width:auto;padding:0 4px;font-size: max(10px, var(--fs-min, 0px));color:var(--t3);margin-left:4px"
+                data-on-click="${EH(null, EK('deleteDumpItem', String(projId), item.id))}" title="Delete">&times;</button></span>
+          </div>
+          ${extTags}
+        </div>`;
+      }
+    });
+    // Same no-churn rule as correspondence: identical payload, leave it alone
+    if (html !== _dumpHtml[projId] || !container.innerHTML) container.innerHTML = html;
+    _dumpHtml[projId] = html;
+  } catch(e) {
+    container.innerHTML = '';
+    _dumpHtml[projId] = '';
+  }
+}
+
+// Status bar helpers
+function _dumpSetStep(projId, stepName, detail) {
+  const statusBar = document.getElementById('dump-status-' + projId);
+  if (statusBar) statusBar.classList.add('active');
+
+  const steps = ['save', 'ai', 'db', 'apply'];
+  const activeIdx = steps.indexOf(stepName);
+  steps.forEach((s, i) => {
+    const el = document.getElementById(`dump-step-${s}-${projId}`);
+    if (!el) return;
+    el.className = 'dump-step' + (i < activeIdx ? ' done' : i === activeIdx ? ' current' : '');
+  });
+
+  const detailEl = document.getElementById('dump-status-detail-' + projId);
+  if (detailEl) detailEl.textContent = detail || '';
+}
+
+function _dumpSetResult(projId, text, isError) {
+  const resultEl = document.getElementById('dump-status-result-' + projId);
+  if (resultEl) {
+    resultEl.style.color = isError ? 'var(--c-e24b4a)' : 'var(--c-4ecdc4)';
+    resultEl.textContent = text;
+  }
+  // Mark all steps done if success
+  if (!isError) {
+    ['save', 'ai', 'db', 'apply'].forEach(s => {
+      const el = document.getElementById(`dump-step-${s}-${projId}`);
+      if (el) el.className = 'dump-step done';
+    });
+  }
+}
+
+function _dumpHideStatus(projId, delay) {
+  setTimeout(() => {
+    const bar = document.getElementById('dump-status-' + projId);
+    if (bar) bar.classList.remove('active');
+    const detailEl = document.getElementById('dump-status-detail-' + projId);
+    if (detailEl) detailEl.textContent = '';
+    const resultEl = document.getElementById('dump-status-result-' + projId);
+    if (resultEl) resultEl.textContent = '';
+  }, delay || 5000);
+}
+
+async function submitDumpText(projId) {
+  const textarea = document.getElementById('dump-text-' + projId);
+  if (!textarea) return;
+  const content = textarea.value.trim();
+  if (!content) { toast('Nothing to dump'); return; }
+
+  const dumpBtn = textarea.closest('.panel-section')?.querySelector('.est-add-btn[data-on-click*="submitDumpText"]');
+  if (dumpBtn) { dumpBtn.textContent = 'PROCESSING...'; dumpBtn.disabled = true; }
+
+  try {
+    // Step 1: Save
+    _dumpSetStep(projId, 'save', 'Saving text...');
+    const resp = await fetch('/api/projects/' + projId + '/intake', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({type: 'text', content: content})
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    textarea.value = '';
+    const intakeId = data.intake_id;
+
+    // Step 2: Regex Extract
+    _dumpSetStep(projId, 'ai', 'Extracting structured data...');
+    try {
+      const procResp = await fetch('/api/projects/' + projId + '/intake/' + intakeId + '/process', {method: 'POST'});
+      const procData = await procResp.json();
+
+      if (procData.ok) {
+        const ext = procData.extraction || {};
+        const found = [];
+        if (ext.equipment && ext.equipment.length) found.push(`${ext.equipment.length} equip`);
+        if (ext.line_items && ext.line_items.length) found.push(`${ext.line_items.length} items`);
+        if (ext.contacts && ext.contacts.length) found.push('contacts');
+        if (ext.building_info && Object.values(ext.building_info).some(v=>v)) found.push('building');
+        if (ext.customer_info && Object.values(ext.customer_info).some(v=>v)) found.push('customer');
+        if (ext.scope_snippets && ext.scope_snippets.length) found.push('scope');
+
+        const reviewNote = procData.needs_review ? ' (needs Claude review)' : '';
+
+        // Show extraction results
+        _dumpSetStep(projId, 'ai', 'Saved to Input folder');
+        _dumpSetResult(projId, `Saved: ${found.join(', ') || 'text'}${reviewNote}`);
+      } else {
+        _dumpSetResult(projId, 'Saved (will process on next triage cycle)', true);
+      }
+    } catch(pe) {
+      _dumpSetResult(projId, 'Saved (will process on next triage cycle)', true);
+    }
+
+    await loadDumpZone(projId);
+    _dumpHideStatus(projId, 8000);
+  } catch(e) {
+    _dumpSetResult(projId, 'Error: ' + e.message, true);
+    _dumpHideStatus(projId, 5000);
+  }
+  finally {
+    if (dumpBtn) { dumpBtn.textContent = 'DUMP TEXT'; dumpBtn.disabled = false; }
+  }
+}
+
+function dumpDragOver(e, projId) {
+  e.preventDefault();
+  e.currentTarget.style.borderColor = 'var(--c-a89060)';
+}
+function dumpDragLeave(e, projId) {
+  e.currentTarget.style.borderColor = '';
+}
+function dumpClickUpload(projId) {
+  document.getElementById('dump-file-input-' + projId)?.click();
+}
+
+async function dumpDrop(e, projId) {
+  e.preventDefault();
+  e.currentTarget.style.borderColor = '';
+  const files = e.dataTransfer?.files;
+  if (files && files.length) {
+    for (const file of files) {
+      await uploadDumpFile(projId, file);
+    }
+    await loadDumpZone(projId);
+  }
+}
+
+async function dumpFileSelected(e, projId) {
+  const files = e.target.files;
+  if (!files || !files.length) return;
+  for (const file of files) {
+    await uploadDumpFile(projId, file);
+  }
+  e.target.value = '';
+  await loadDumpZone(projId);
+}
+
+async function uploadDumpFile(projId, file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const resp = await fetch('/api/projects/' + projId + '/intake', {
+      method: 'POST',
+      body: formData
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'Upload failed');
+    toast('File dumped: ' + file.name);
+  } catch(e) { toast('Upload error: ' + e.message); }
+}
+
+// applyIntakeToEstimate removed: estimates handled by Claude/Cowork
+
+async function deleteDumpItem(projId, intakeId) {
+  try {
+    await fetch('/api/projects/' + projId + '/intake/' + intakeId, {method: 'DELETE'});
+    await loadDumpZone(projId);
+  } catch(e) { toast('Delete error: ' + e.message); }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// CORRESPONDENCE: project email history + attachment viewer
+// ══════════════════════════════════════════════════════════════════════
+
+function toggleCorrespondence(projId) {
+  const container = document.getElementById('corr-items-' + projId);
+  if (!container) return;
+  container.style.display = container.style.display === 'none' ? 'block' : 'none';
+}
+
+// Convert raw email HTML to plain text (no cleaning): used for "show original".
+function htmlToText(raw, isHtml) {
+  if (!raw) return '';
+  if (!isHtml) return raw.replace(/\r/g, '');
+  // DOMParser builds an inert document: no img onerror / script ever fires.
+  const tmp = new DOMParser().parseFromString(
+    raw.replace(/<\s*(br|\/p|\/div|\/tr|\/li|\/h[1-6])\s*\/?>/gi, '\n'), 'text/html').body;
+  // drop orphan link labels: textContent strips hrefs, leaving bare CTA words
+  // ("show original", "View Order Details", "unsubscribe") floating as noise
+  tmp.querySelectorAll('a').forEach(a => {
+    if (/^(show original|view (this )?(order ?)?details?|view order|view (this )?(e-?mail )?in browser|unsubscribe|click here|manage (your )?preferences|update preferences|add to address book|view online)\b/i.test((a.textContent || '').trim()))
+      a.remove();
+  });
+  let t = tmp.textContent || tmp.innerText || '';
+  return t.replace(/\r/g, '').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Rip out security banners, quoted reply chains, signatures, and greeting/
+// closing pleasantries so the bubble reads like a text message. Email HTML
+// collapses to one run-on line, so cleaning is done inline on the string.
+function cleanEmailBody(raw, isHtml) {
+  if (!raw) return '';
+  let text = htmlToText(raw, isHtml);
+  // normalise whitespace + decode stray entities
+  text = text.replace(/\r/g, '').replace(/ /g, ' ');
+  // security / external-sender banners
+  text = text.replace(/EMAIL SECURITY WARNING:.*?(?:untrusted sources\.?|@\S+\.\w+)/gis, ' ');
+  text = text.replace(/Caution:\s*This (?:e-?mail|message) comes from outside[^.]*\.(?:\s*Do not click[^.]*\.)?/gi, ' ');
+  text = text.replace(/This (?:e-?mail|message) originated from outside[^.]*\./gi, ' ');
+  // quoted reply chain → cut to end
+  text = text.replace(/From:\s+.*$/s, ' ');
+  text = text.replace(/On .{0,80}?\bwrote:.*$/s, ' ');
+  text = text.replace(/-{2,}\s*Original Message\s*-{2,}.*$/s, ' ');
+  // sign-off + signature block → cut to end
+  text = text.replace(/\b(Thanks|Thank you|Thank you so much|Thanks so much|Regards|Best regards|Kind regards|Warm regards|Best|Sincerely|Cheers|Respectfully|Talk soon|Appreciate it)[,!.]\s+\S.*$/is, ' ');
+  // The user's own signature block (name + role / company line) -> cut to end.
+  try {
+    const u = PROF.user || {};
+    const rx = v => String(v || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (u.name && u.name.trim()) text = text.replace(new RegExp('\\b' + rx(u.name.trim()) + '\\s*[-|,]\\s*' + (u.role ? rx(u.role) : '[A-Z][\\w ]{2,40}') + '.*$', 'is'), ' ');
+    if (u.company && u.company.trim().length > 3) text = text.replace(new RegExp('\\b' + rx(u.company.trim()) + '\\s*\\|.*$', 'is'), ' ');
+  } catch (e) {}
+  text = text.replace(/\b(Cell|Office|Mobile|Direct|Tel|Phone|Fax|Desk)\s*:?\s*[\d(].*$/is, ' ');
+  // strip leading header soup up to the first greeting
+  const greet = text.match(/\b(Hi|Hello|Hey|Dear|Good morning|Good afternoon|Good evening)\b[^,.:!?]{0,40}[,:]/i);
+  if (greet) {
+    text = text.slice(greet.index + greet[0].length);
+  } else {
+    text = text.replace(/^.*?\bSubject:\s*.*?(?=[A-Z][a-z]{2,}\b)/s, ' ');
+  }
+  // misc junk
+  text = text.replace(/\bSent from my [^.\n]*\.?/gi, ' ');
+  text = text.replace(/\bGet Outlook for \w+/gi, ' ');
+  text = text.replace(/\[cid:[^\]]*\]/gi, ' ');
+  // ASCII divider lines (----- _____ ===== ***** ~~~~~ etc.) from plaintext mail
+  text = text.replace(/^[ \t]*[-_=*~·•-]{3,}[ \t]*$/gm, '');
+  // collapse consecutive duplicate lines (e.g. "Order # 255756" echoed twice)
+  text = text.replace(/^(.+)(?:\n\1)+$/gm, '$1');
+  // final normalise: run last so divider/dupe removal doesn't leave gaps
+  return text.replace(/[ \t]{2,}/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Detect machine-generated transactional mail (order confirmations, shipping
+// notices, receipts, invoices): a different content class than human email,
+// so the human-tuned cleaner above leaves it noisy. Routes to a tight summary.
+function isTransactionalEmail(subject, fromEmail, text) {
+  const subj = subject || '', from = fromEmail || '', body = text || '';
+  if (/\b(order confirmation|order received|order placed|your order|has shipped|shipping confirmation|out for delivery|tracking (number|info)|receipt|invoice|payment (received|confirmation))\b/i.test(subj)) return true;
+  // automated sender + a body order/shipping signal
+  if (/^(no-?reply|noreply|orders?|shop|store|sales|billing|receipts?|notifications?|auto)@/i.test(from)
+      && /\bOrder\s*#|\bOrder Summary\b|\bProduct\s*#|\bTracking\b|\bSubtotal\b|\bGrand Total\b/i.test(body)) return true;
+  // strong body signal regardless of sender
+  if (/\bOrder\s*#\s*\d/i.test(body)
+      && /\b(Order Summary|Product\s*#|Item\s*#|Subtotal|Grand Total|package is shipped|will be in touch)\b/i.test(body)) return true;
+  return false;
+}
+
+// Compress a transactional email to status / order # / line items / total /
+// tracking. Returns null if nothing useful was found (caller falls back).
+function summarizeTransactional(text, subject) {
+  const blob = (subject || '') + '\n' + (text || '');
+  const grab = re => { const m = blob.match(re); return m ? m[1].trim() : null; };
+
+  const orderNum = grab(/\bOrder\s*#\s*([A-Za-z0-9][A-Za-z0-9-]{2,})/i);
+  const tracking = grab(/\bTracking\s*(?:#|number|no\.?)?\s*:?\s*([A-Z0-9]{8,})/i);
+  let total = grab(/\b(?:Grand Total|Order Total|Total Paid|Amount (?:Paid|Due)|Total)\s*:?\s*\$?\s*([\d,]+\.\d{2})/i);
+  if (total) total = '$' + total;
+
+  let status = 'Order update';
+  if (/\bout for delivery\b/i.test(blob)) status = 'Out for delivery';
+  else if (/\bdelivered\b/i.test(blob)) status = 'Delivered';
+  else if (/\b(has shipped|have shipped|has been shipped|on its way|your shipment|shipment is on)\b/i.test(blob)) status = 'Shipped';
+  else if (/\bcancel(?:l)?ed\b/i.test(blob)) status = 'Cancelled';
+  else if (/\binvoice\b/i.test(blob)) status = 'Invoice';
+  else if (/\b(receipt|payment (?:received|confirmed))\b/i.test(blob)) status = 'Receipt';
+  else if (/\b(order (?:confirmation|received|placed)|received your order|thank you for your order)\b/i.test(blob)) status = 'Order received';
+
+  // line items: lines with a Product/Item/SKU/Part #, or lines sitting under an
+  // "Order Summary"/"Items" header until a totals/address header ends the block
+  const lines = (text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const items = [];
+  let inItems = false;
+  for (const l of lines) {
+    if (/^(order summary|items?|your items?|products?|order details)\b/i.test(l)) { inItems = true; continue; }
+    if (/^(subtotal|shipping|tax|grand total|order total|total|payment|billing|ship(ping)? to|shipping address|thank you|questions|need help)\b/i.test(l)) inItems = false;
+    const looksLikeItem = /\b(Product|Item|SKU|Part)\s*#/i.test(l) || (inItems && l.length > 6 && !/^https?:/i.test(l) && !/^order\s*#/i.test(l));
+    if (looksLikeItem && !/^order\s*#/i.test(l)) items.push(l);
+  }
+  const seen = new Set();
+  const uniqItems = items.filter(i => { const k = i.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8);
+
+  if (!orderNum && !uniqItems.length && !total && !tracking) return null;
+
+  const out = ['📦 ' + status + (orderNum ? '  ·  Order #' + orderNum : '')];
+  uniqItems.forEach(i => out.push('• ' + i));
+  if (total) out.push('Total: ' + total);
+  if (tracking) out.push('Tracking: ' + tracking);
+  return out.join('\n');
+}
+
+async function loadCorrespondence(projId) {
+  const container = document.getElementById('corr-items-' + projId);
+  const countEl = document.getElementById('corr-count-' + projId);
+  if (!container) return;
+  try {
+    const resp = await fetch('/api/projects/' + projId + '/correspondence?include_bodies=1');
+    const data = await resp.json();
+    if (!data.ok) return;
+    let items = data.correspondence || [];
+    const stats = data.stats || {};
+    if (countEl) {
+      const parts = [];
+      if (stats.email_count) parts.push(stats.email_count + ' email' + (stats.email_count > 1 ? 's' : ''));
+      if (stats.file_count) parts.push(stats.file_count + ' file' + (stats.file_count > 1 ? 's' : ''));
+      if (stats.total_file_size > 0) {
+        const mb = (stats.total_file_size / 1048576).toFixed(1);
+        parts.push(mb + ' MB');
+      }
+      countEl.textContent = parts.join(' · ') || 'empty';
+      _corrCountTxt[projId] = countEl.textContent;
+    }
+    if (!items.length) {
+      const empty = '<div style="color:var(--t4);font-size: max(10px, var(--fs-min, 0px));padding:8px;text-align:center">No correspondence yet</div>';
+      if (_corrHtml[projId] !== empty) container.innerHTML = empty;
+      _corrHtml[projId] = empty;
+      return;
+    }
+    // API returns newest-first; flip to chronological so it reads top→bottom
+    items = items.slice().reverse();
+
+    // counterparty (the non-self party) for a message; isSelf() reads PROF.user
+    const partyOf = (c) => {
+      if (c.direction === 'outbound') {
+        const tos = (c.to_list||'').split(/[;,]/).map(s=>s.trim()).filter(Boolean)
+                      .filter(e => !isSelf(e,''));
+        if (!tos.length) return {key:'__none__', emails:[], group:false};
+        if (tos.length === 1) return {key:tos[0].toLowerCase(), emails:tos, group:false};
+        return {key:'group:'+tos.map(e=>e.toLowerCase()).sort().join('|'), emails:tos, group:true};
+      }
+      const e = (c.from_email || c.from_name || 'unknown');
+      return {key:e.toLowerCase(), emails:[e], group:false};
+    };
+    const prettyName = (email) => {
+      if (!email) return 'Unknown';
+      const local = String(email).split('@')[0];
+      return local.replace(/[._]+/g,' ').replace(/\s+/g,' ').trim() || email;
+    };
+
+    // build one chat bubble (shared by both views)
+    const buildBubble = (c, opts={}) => {
+      const outbound = c.direction === 'outbound';
+      const when = c.received_at ? new Date(c.received_at) : null;
+      const stamp = when
+        ? when.toLocaleDateString([], {month:'short', day:'numeric'}) + ' ' +
+          when.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})
+        : '';
+      let name = outbound ? 'You' : esc(c.from_name || c.from_email || 'Unknown');
+      if (opts.recipientLabel && outbound) {
+        const p = partyOf(c);
+        const to = p.emails.length ? p.emails.map(prettyName).join(', ') : '-';
+        name = 'You <span style="color:var(--c-8fb0d6)">&rarr; ' + esc(to) + '</span>';
+      }
+      const rawBody = c.body_html || c.body_preview || '';
+      const cleaned = cleanEmailBody(rawBody, !!c.body_html);
+      let display = cleaned;
+      if (!outbound && isTransactionalEmail(c.subject, c.from_email, cleaned)) {
+        const summary = summarizeTransactional(cleaned, c.subject);
+        if (summary) display = summary;  // "show original" toggle keeps full text
+      }
+      const bubbleText = esc(display || (c.body_preview || '').trim() || '(no message body)');
+      const origText = esc(htmlToText(rawBody, !!c.body_html) || (c.body_preview || '').trim());
+      let attachHtml = '';
+      const fileCount = c.file_count || 0;
+      if (fileCount > 0) {
+        attachHtml = `<div class="corr-attach" id="corr-attach-${c.id}">
+          <a class="corr-chip" href="#" data-on-click="${EH({pd:1}, EK('loadCorrFiles', c.id))}">📎 ${fileCount} file${fileCount>1?'s':''}</a>
+        </div>`;
+      }
+      let origHtml = '';
+      if (origText && origText !== bubbleText) {
+        origHtml = `<a class="corr-orig-toggle" data-on-click="${EH(null, EK('toggleOrig', c.id))}">show original</a>
+          <div class="corr-orig" id="corr-orig-${c.id}">${origText}</div>`;
+      }
+      return `<div class="corr-row ${outbound ? 'outbound' : 'inbound'}">
+        <div class="corr-meta"><span class="corr-name">${name}</span><span>${stamp}</span></div>
+        <div class="corr-bubble">${bubbleText}${attachHtml}${origHtml}</div>
+      </div>`;
+    };
+
+    // group messages into lanes by counterparty
+    const laneMap = new Map();
+    items.forEach(c => {
+      const p = partyOf(c);
+      if (!laneMap.has(p.key)) {
+        laneMap.set(p.key, {key:p.key, emails:p.emails.slice(), group:p.group,
+                            msgs:[], firstTime: c.received_at||''});
+      }
+      const lane = laneMap.get(p.key);
+      lane.msgs.push(c);
+      if (c.direction === 'inbound' && c.from_name && !lane.fromName) lane.fromName = c.from_name;
+    });
+    const lanes = [...laneMap.values()]
+      .sort((a,b)=> String(a.firstTime).localeCompare(String(b.firstTime)));
+
+    const PALETTE = ['#5b9bd5','#e0883b','#5bb85b','#c264c2','#d9534f','#3bc4c4','#d4b03b','#8a8aff'];
+    const laneLabel = (lane) => {
+      if (lane.key === '__none__') return '(no recipient)';
+      if (lane.group) return 'Group: ' + lane.emails.map(prettyName).join(', ');
+      return lane.fromName ? lane.fromName : prettyName(lane.emails[0] || lane.key);
+    };
+
+    // view mode (persisted); auto-collapse to timeline when only one party
+    let mode;
+    try { mode = localStorage.getItem('corrViewMode') || 'lanes'; } catch(e){ mode = 'lanes'; }
+    const effMode = (lanes.length <= 1) ? 'timeline' : mode;
+
+    let html =
+      `<div class="corr-viewbar">
+        <span class="corr-viewlbl">${lanes.length} thread${lanes.length!==1?'s':''}</span>
+        <button class="corr-viewbtn ${effMode==='lanes'?'on':''}" data-on-click="${EH(null, EK('setCorrView', String(projId), 'lanes'))}">Lanes</button>
+        <button class="corr-viewbtn ${effMode==='timeline'?'on':''}" data-on-click="${EH(null, EK('setCorrView', String(projId), 'timeline'))}">Timeline</button>
+      </div>`;
+
+    if (effMode !== 'lanes') {
+      // classic single column, chronological, with recipient labels on outbound
+      let lastSubj = null, body = '';
+      items.forEach(c => {
+        const subj = (c.subject || '').replace(/^\s*(re|fwd?):\s*/i, '').trim();
+        if (subj && subj !== lastSubj) { body += `<div class="corr-subj">${esc(subj)}</div>`; lastSubj = subj; }
+        body += buildBubble(c, {recipientLabel:true});
+      });
+      html += `<div class="corr-thread">${body}</div>`;
+    } else {
+      // swimlanes: one column per counterparty
+      let lanesHtml = '';
+      lanes.forEach((lane, i) => {
+        const color = PALETTE[i % PALETTE.length];
+        const bubbles = lane.msgs.map(c => buildBubble(c)).join('');
+        const n = lane.msgs.length;
+        lanesHtml += `<div class="corr-lane" style="--lane-color:${color}">
+          <div class="corr-lane-head">
+            <span class="corr-lane-dot"></span>
+            <span>${esc(laneLabel(lane))}</span>
+            <span class="corr-lane-sub">${n} msg${n!==1?'s':''}</span>
+          </div>
+          <div class="corr-lane-body">${bubbles}</div>
+        </div>`;
+      });
+      html += `<div class="corr-lanes">${lanesHtml}</div>`;
+    }
+
+    // Nothing changed and the pane is already showing it: leave the DOM alone.
+    // This is what makes a 30s refresh cycle invisible while reading a thread.
+    if (html === _corrHtml[projId] && container.innerHTML) {
+      const firstOpen = _corrSeen[projId] === undefined;
+      _corrSeen[projId] = items.length;
+      if (firstOpen) {
+        // Seeded markup from a previous session of this panel: still needs to
+        // land on the newest message the way a fresh open always does.
+        const sc0 = container.querySelector('.corr-thread');
+        const jump = () => {
+          if (sc0) sc0.scrollTop = sc0.scrollHeight;
+          container.querySelectorAll('.corr-lane-body').forEach(el => el.scrollTop = el.scrollHeight);
+          if (!sc0) container.scrollTop = container.scrollHeight;
+        };
+        jump(); requestAnimationFrame(jump);
+      }
+      return;
+    }
+
+    // A seeded pane may have been scrolled since renderPanel captured it: the
+    // live position wins over the snapshot.
+    {
+      const lt = container.querySelector('.corr-thread');
+      const ll = [...container.querySelectorAll('.corr-lane-body')];
+      if (container.innerHTML && (container.scrollTop || (lt && lt.scrollTop) || ll.some(e => e.scrollTop))) {
+        _corrScroll[projId] = {
+          container: container.scrollTop,
+          thread: lt ? lt.scrollTop : 0,
+          lanes: ll.map(e => e.scrollTop)
+        };
+      }
+    }
+
+    container.innerHTML = html;
+    _corrHtml[projId] = html;
+
+    // Jump to newest ONLY on first open or when a new message actually landed.
+    // Otherwise restore where the user was reading.
+    const prevCount = _corrSeen[projId];
+    const isNew = prevCount === undefined || items.length > prevCount;
+    _corrSeen[projId] = items.length;
+    const saved = _corrScroll[projId];
+    const sc = container.querySelector('.corr-thread');
+    const laneEls = [...container.querySelectorAll('.corr-lane-body')];
+
+    if (isNew || !saved) {
+      if (sc) sc.scrollTop = sc.scrollHeight;
+      laneEls.forEach(el => el.scrollTop = el.scrollHeight);
+      if (!sc && !laneEls.length) container.scrollTop = container.scrollHeight;
+    } else {
+      const apply = () => {
+        if (!container.isConnected) return;
+        if (sc && saved.thread) sc.scrollTop = saved.thread;
+        laneEls.forEach((el, i) => { if (saved.lanes[i]) el.scrollTop = saved.lanes[i]; });
+        if (saved.container) container.scrollTop = saved.container;
+      };
+      apply();
+      requestAnimationFrame(apply);
+    }
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--c-ff6b6b);font-size: max(10px, var(--fs-min, 0px));padding:8px">Error loading correspondence</div>';
+  }
+}
+
+function toggleOrig(corrId) {
+  const el = document.getElementById('corr-orig-' + corrId);
+  if (el) el.style.display = el.style.display === 'block' ? 'none' : 'block';
+}
+
+function setCorrView(projId, mode) {
+  try { localStorage.setItem('corrViewMode', mode); } catch(e) {}
+  // Layout changes shape: saved offsets are meaningless, jump to newest
+  delete _corrScroll[projId];
+  delete _corrSeen[projId];
+  loadCorrespondence(projId);
+}
+
+async function loadCorrFiles(corrId) {
+  const container = document.getElementById('corr-attach-' + corrId);
+  if (!container) return;
+  try {
+    const resp = await fetch('/api/correspondence/' + corrId + '/files');
+    const data = await resp.json();
+    if (!data.ok || !data.files.length) {
+      container.innerHTML = '<span style="font-size: max(9px, var(--fs-min, 0px));color:var(--t3)">No files</span>';
+      return;
+    }
+    let html = '';
+    data.files.forEach(f => {
+      const size = f.file_size > 1048576
+        ? (f.file_size / 1048576).toFixed(1) + ' MB'
+        : (f.file_size / 1024).toFixed(0) + ' KB';
+      html += `<a class="corr-chip" href="/api/correspondence/files/${f.id}/download"
+           download="${esc(f.filename)}" title="${f.file_type} · ${size}">📎 ${esc(f.filename)}</a>`;
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<span style="font-size: max(9px, var(--fs-min, 0px));color:var(--c-ff6b6b)">Error</span>';
+  }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// SOUND + SETTINGS (2026-08-12)
+// Every SFX is SYNTHESIZED in the Web Audio API: no asset files to ship, no
+// licensing question, works offline. Each event has a LIBRARY of variants and
+// one is picked at random per fire (never the same one twice in a row), so
+// clicking twenty boxes doesn't sound like a stuck doorbell.
+// the user can drop his own clips in per event (Settings → Audio → +SOUND); those
+// join that event's pool. Stored as data URLs in localStorage, so keep them
+// short: hard cap 400KB per clip.
+// ══════════════════════════════════════════════════════════════════════════
+const UI_SETTINGS_KEY = 'pb_ui_settings';
+const UI_SFX_KEY = 'pb_custom_sfx';
+
+const UI_DEFAULTS = {
+  sound: true,
+  masterVol: 0.55,
+  mixBuiltins: true,          // custom clips play alongside the synth variants
+  on:  { ding: true, attack: true, oof: true, levelup: true, bosslevel: true },
+  vol: { ding: 0.6, attack: 0.75, oof: 0.8, levelup: 0.9, bosslevel: 0.85 },
+  oofThreshold: 100,          // boss HP gain that earns an OOF
+  refreshSec: 30,
+  fct: true,                  // floating combat numbers
+  arcs: true,                 // electric arcs on quick-action cards
+  flip: true,                 // card move animation
+  levelFx: true               // level-up burst overlay
+};
+
+const SFX_EVENTS = [
+  ['ding',      'Subtask checked',     'Ticking a box'],
+  ['attack',    'Damage dealt',        'Green numbers: backlog urgency dropped'],
+  ['oof',       'Damage taken',        'Boss HP climbed past the threshold below'],
+  ['levelup',   'You level up',        'XP crossed a level'],
+  ['bosslevel', 'Boss levels up',      'New quote requests leveled the backlog']
+];
+
+let UI = (() => {
+  const d = JSON.parse(JSON.stringify(UI_DEFAULTS));
+  try {
+    const raw = JSON.parse(localStorage.getItem(UI_SETTINGS_KEY) || '{}');
+    Object.keys(raw).forEach(k => {
+      if (k === 'on' || k === 'vol') Object.assign(d[k], raw[k] || {});
+      else if (k in d) d[k] = raw[k];
+    });
+  } catch(e) {}
+  return d;
+})();
+let _customSfx = (() => {
+  try { return JSON.parse(localStorage.getItem(UI_SFX_KEY) || '{}'); } catch(e) { return {}; }
+})();
+
+function uiGet(k) { return UI[k]; }
+function uiSave() {
+  try { localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify(UI)); } catch(e) {}
+}
+function uiSaveSfx() {
+  try { localStorage.setItem(UI_SFX_KEY, JSON.stringify(_customSfx)); } catch(e) {
+    toast('Sound library full: remove a clip first');
+  }
+}
+
+// ── audio context (created lazily; browsers block audio before a gesture) ──
+let _actx = null;
+function actx() {
+  try {
+    if (!_actx) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return null;
+      _actx = new C();
+    }
+    if (_actx.state === 'suspended') _actx.resume();
+    return _actx;
+  } catch(e) { return null; }
+}
+document.addEventListener('pointerdown', () => { actx(); }, {once: true});
+
+function _noise(ctx, dur) {
+  const n = Math.max(1, Math.floor(ctx.sampleRate * dur));
+  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  return src;
+}
+// One shaped oscillator voice
+function _tone(ctx, {type='sine', f0, f1, t0, dur, peak, delay=0, curve='exp'}) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  const s = t0 + delay;
+  o.type = type;
+  o.frequency.setValueAtTime(f0, s);
+  if (f1 && f1 !== f0) {
+    if (curve === 'exp') o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), s + dur);
+    else o.frequency.linearRampToValueAtTime(f1, s + dur);
+  }
+  g.gain.setValueAtTime(0.0001, s);
+  g.gain.linearRampToValueAtTime(peak, s + Math.min(0.02, dur * 0.2));
+  g.gain.exponentialRampToValueAtTime(0.0001, s + dur);
+  o.connect(g).connect(ctx.destination);
+  o.start(s); o.stop(s + dur + 0.02);
+  return o;
+}
+
+// ── the variant libraries. index = one distinct sound ──
+const SFX_LIB = {
+  ding: [
+    // bright two-tone bell
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sine', f0:988, t0:t, dur:0.40, peak:g*0.85});
+      _tone(c, {type:'sine', f0:1319, t0:t, dur:0.34, peak:g*0.5, delay:0.055}); },
+    // glassy triad ping
+    (c, g) => { const t = c.currentTime;
+      [1046, 1568, 2093].forEach((f, i) =>
+        _tone(c, {type:'sine', f0:f, t0:t, dur:0.30 - i*0.05, peak:g*(0.7 - i*0.16), delay:i*0.03})); },
+    // soft marimba blip
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'triangle', f0:784, f1:770, t0:t, dur:0.26, peak:g*0.9});
+      _tone(c, {type:'sine', f0:1568, t0:t, dur:0.10, peak:g*0.25}); },
+    // rising click-pop
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sine', f0:620, f1:1240, t0:t, dur:0.16, peak:g*0.8}); }
+  ],
+  attack: [
+    // crit slice: noise sweep + thump
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'triangle', f0:220, f1:58, t0:t, dur:0.22, peak:g*0.9});
+      const nb = _noise(c, 0.2), bp = c.createBiquadFilter(), ng = c.createGain();
+      bp.type = 'bandpass'; bp.Q.value = 1.3;
+      bp.frequency.setValueAtTime(2800, t); bp.frequency.exponentialRampToValueAtTime(700, t+0.18);
+      ng.gain.setValueAtTime(g*0.6, t); ng.gain.exponentialRampToValueAtTime(0.0001, t+0.19);
+      nb.connect(bp).connect(ng).connect(c.destination); nb.start(t); },
+    // blunt impact
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sine', f0:150, f1:45, t0:t, dur:0.28, peak:g});
+      const nb = _noise(c, 0.09), lp = c.createBiquadFilter(), ng = c.createGain();
+      lp.type = 'lowpass'; lp.frequency.value = 1100;
+      ng.gain.setValueAtTime(g*0.5, t); ng.gain.exponentialRampToValueAtTime(0.0001, t+0.09);
+      nb.connect(lp).connect(ng).connect(c.destination); nb.start(t); },
+    // metallic clang
+    (c, g) => { const t = c.currentTime;
+      [1860, 2490, 3110].forEach((f, i) =>
+        _tone(c, {type:'square', f0:f, f1:f*0.85, t0:t, dur:0.34 - i*0.06, peak:g*(0.22 - i*0.05), delay:i*0.012}));
+      _tone(c, {type:'triangle', f0:320, f1:90, t0:t, dur:0.2, peak:g*0.6}); },
+    // arcane zap
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sawtooth', f0:1400, f1:180, t0:t, dur:0.24, peak:g*0.45});
+      _tone(c, {type:'sine', f0:2200, f1:600, t0:t, dur:0.14, peak:g*0.3, delay:0.02}); },
+    // heal-flavored chime hit (satisfying, less violent)
+    (c, g) => { const t = c.currentTime;
+      [784, 988, 1319].forEach((f, i) =>
+        _tone(c, {type:'sine', f0:f, t0:t, dur:0.42, peak:g*(0.5 - i*0.1), delay:i*0.045})); }
+  ],
+  oof: [
+    // classic descending "oof": sawtooth through two vowel formants + f tail
+    (c, g) => { const t = c.currentTime, dur = 0.32;
+      const src = c.createOscillator(); src.type = 'sawtooth';
+      src.frequency.setValueAtTime(340, t);
+      src.frequency.exponentialRampToValueAtTime(120, t + dur);
+      const f1 = c.createBiquadFilter(), f2 = c.createBiquadFilter(), mix = c.createGain();
+      f1.type = 'bandpass'; f1.frequency.value = 390; f1.Q.value = 6;
+      f2.type = 'bandpass'; f2.frequency.value = 860; f2.Q.value = 9;
+      mix.gain.setValueAtTime(0.0001, t);
+      mix.gain.linearRampToValueAtTime(g, t + 0.035);
+      mix.gain.setValueAtTime(g, t + dur * 0.55);
+      mix.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(f1); src.connect(f2); f1.connect(mix); f2.connect(mix); mix.connect(c.destination);
+      src.start(t); src.stop(t + dur + 0.02);
+      const nb = _noise(c, 0.13), hp = c.createBiquadFilter(), ng = c.createGain();
+      hp.type = 'highpass'; hp.frequency.value = 2400;
+      ng.gain.setValueAtTime(0.0001, t + dur*0.7);
+      ng.gain.linearRampToValueAtTime(g*0.4, t + dur*0.8);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.1);
+      nb.connect(hp).connect(ng).connect(c.destination); nb.start(t + dur*0.7); },
+    // short grunt
+    (c, g) => { const t = c.currentTime, dur = 0.2;
+      const src = c.createOscillator(); src.type = 'square';
+      src.frequency.setValueAtTime(230, t);
+      src.frequency.exponentialRampToValueAtTime(110, t + dur);
+      const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 520; bp.Q.value = 4;
+      const gn = c.createGain();
+      gn.gain.setValueAtTime(0.0001, t); gn.gain.linearRampToValueAtTime(g*0.9, t+0.03);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(bp).connect(gn).connect(c.destination); src.start(t); src.stop(t + dur + 0.02); },
+    // wobble ooof
+    (c, g) => { const t = c.currentTime, dur = 0.42;
+      const src = c.createOscillator(); src.type = 'sawtooth';
+      src.frequency.setValueAtTime(300, t);
+      src.frequency.exponentialRampToValueAtTime(105, t + dur);
+      const lfo = c.createOscillator(), lg = c.createGain();
+      lfo.frequency.value = 11; lg.gain.value = 22;
+      lfo.connect(lg).connect(src.frequency); lfo.start(t); lfo.stop(t + dur);
+      const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 440; bp.Q.value = 5;
+      const gn = c.createGain();
+      gn.gain.setValueAtTime(0.0001, t); gn.gain.linearRampToValueAtTime(g*0.95, t+0.04);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(bp).connect(gn).connect(c.destination); src.start(t); src.stop(t + dur + 0.02); },
+    // dull "took one on the chin" thud
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sine', f0:120, f1:48, t0:t, dur:0.3, peak:g});
+      _tone(c, {type:'triangle', f0:260, f1:150, t0:t, dur:0.16, peak:g*0.4, delay:0.03}); }
+  ],
+  levelup: [
+    // major arpeggio + shimmer
+    (c, g) => { const t = c.currentTime;
+      [523, 659, 784, 1046].forEach((f, i) =>
+        _tone(c, {type:'triangle', f0:f, t0:t, dur:0.5, peak:g*0.55, delay:i*0.085}));
+      _tone(c, {type:'sine', f0:2093, t0:t, dur:0.7, peak:g*0.2, delay:0.34}); },
+    // fanfare fifths
+    (c, g) => { const t = c.currentTime;
+      [[392,0],[587,0.1],[784,0.2],[1175,0.3]].forEach(([f, d]) => {
+        _tone(c, {type:'square', f0:f, t0:t, dur:0.42, peak:g*0.3, delay:d});
+        _tone(c, {type:'sine', f0:f*2, t0:t, dur:0.3, peak:g*0.16, delay:d}); }); },
+    // shimmer riser
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sine', f0:440, f1:1760, t0:t, dur:0.65, peak:g*0.5, curve:'exp'});
+      [1046,1319,1568].forEach((f,i) => _tone(c, {type:'sine', f0:f, t0:t, dur:0.5, peak:g*0.28, delay:0.4+i*0.05})); }
+  ],
+  bosslevel: [
+    // low minor gong
+    (c, g) => { const t = c.currentTime;
+      [110, 131, 165].forEach((f, i) =>
+        _tone(c, {type:'sawtooth', f0:f, f1:f*0.97, t0:t, dur:1.1, peak:g*(0.34 - i*0.07)}));
+      const nb = _noise(c, 0.8), lp = c.createBiquadFilter(), ng = c.createGain();
+      lp.type = 'lowpass'; lp.frequency.value = 900;
+      ng.gain.setValueAtTime(g*0.35, t); ng.gain.exponentialRampToValueAtTime(0.0001, t+0.8);
+      nb.connect(lp).connect(ng).connect(c.destination); nb.start(t); },
+    // growl riser
+    (c, g) => { const t = c.currentTime;
+      _tone(c, {type:'sawtooth', f0:70, f1:190, t0:t, dur:0.9, peak:g*0.45});
+      _tone(c, {type:'square', f0:105, f1:285, t0:t, dur:0.9, peak:g*0.2, delay:0.05}); },
+    // doom drum triple
+    (c, g) => { const t = c.currentTime;
+      [0, 0.24, 0.48].forEach(d => {
+        _tone(c, {type:'sine', f0:98, f1:42, t0:t, dur:0.3, peak:g*0.85, delay:d}); });
+      _tone(c, {type:'sawtooth', f0:147, f1:139, t0:t, dur:1.0, peak:g*0.15, delay:0.48}); }
+  ]
+};
+
+// Per-variant loudness trim: measured peak amplitude off an OfflineAudioContext
+// render, normalized so no variant is noticeably louder than its siblings
+// (the formant-filtered oof voices lose most of their gain in the bandpass).
+const SFX_TRIM = {
+  ding:      [1.0, 1.05, 0.9, 1.05],
+  attack:    [1.0, 0.95, 1.1, 1.7, 1.4],
+  oof:       [1.6, 2.3, 2.9, 0.65],
+  levelup:   [1.15, 1.45, 1.4],
+  bosslevel: [1.4, 1.6, 0.75]
+};
+
+const _lastVariant = {};
+function _pickVariant(name) {
+  const builtins = (SFX_LIB[name] || []).map((fn, i) =>
+    ({kind:'synth', fn, key:'s'+i, trim:(SFX_TRIM[name] || [])[i] || 1}));
+  const customs = (_customSfx[name] || []).map((d, i) => ({kind:'file', url:d.url || d, key:'c'+i}));
+  let pool = customs.length ? (UI.mixBuiltins ? customs.concat(builtins) : customs) : builtins;
+  if (!pool.length) return null;
+  if (pool.length > 1 && _lastVariant[name]) {
+    const filtered = pool.filter(v => v.key !== _lastVariant[name]);
+    if (filtered.length) pool = filtered;
+  }
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  _lastVariant[name] = pick.key;
+  return pick;
+}
+
+// Fire an event sound. opts.scale multiplies volume (bigger hit = louder).
+function sfx(name, opts) {
+  opts = opts || {};
+  if (!UI.sound) return;
+  if (UI.on[name] === false) return;
+  const vol = Math.max(0, Math.min(1,
+    (UI.masterVol || 0) * (UI.vol[name] != null ? UI.vol[name] : 0.7) * (opts.scale || 1)));
+  if (vol < 0.005) return;
+  const pick = opts.force || _pickVariant(name);
+  if (!pick) return;
+  try {
+    if (pick.kind === 'file') {
+      const a = new Audio(pick.url);
+      a.volume = vol;
+      a.play().catch(() => {});
+      return;
+    }
+    const c = actx();
+    if (c) pick.fn(c, Math.min(1.2, vol * (pick.trim || 1)));
+  } catch(e) {}
+}
+
+// Combat sounds off the same deltas that drive the floating numbers.
+// Positive delta = urgency climbed = the user took the hit. Negative = he landed one.
+function sfxCombat(changes) {
+  let dealt = 0, taken = 0;
+  changes.forEach(([, d]) => { if (d < 0) dealt += -d; else taken += d; });
+  if (dealt > 0) sfx('attack', { scale: Math.min(1.35, 0.75 + dealt / 400) });
+  if (taken >= (UI.oofThreshold || 100)) {
+    setTimeout(() => sfx('oof', { scale: Math.min(1.3, 0.8 + taken / 600) }), dealt > 0 ? 220 : 0);
+  }
+}
+
+// ── settings panel ──
+let _setTab = 'general';
+const SET_TABS = [['general', 'General'], ['display', 'Display'], ['fields', 'Fields'], ['workflows', 'Stages'], ['mail', 'Mail'], ['ai', 'AI'], ['license', 'License']];
+function openSettings(tab) {
+  if (tab) _setTab = tab;
+  document.getElementById('set-overlay').classList.add('open');
+  renderSettings();
+}
+function closeSettings() { document.getElementById('set-overlay').classList.remove('open'); _aiNote = ''; _aiChoice = null; }
+function setSettingsTab(tab) { if (tab !== _setTab) _aiNote = ''; _setTab = tab; renderSettings(); }
+function resetSettings() {
+  if (!confirm('Reset all audio + interface settings to defaults? (your uploaded sounds are kept)')) return;
+  UI = JSON.parse(JSON.stringify(UI_DEFAULTS));
+  uiSave(); applyRefreshInterval(); renderSettings(); toast('Settings reset');
+}
+function setSetting(key, val, rerender) {
+  UI[key] = val; uiSave();
+  if (key === 'refreshSec') applyRefreshInterval();
+  if (rerender) renderSettings();
+}
+function setSfxFlag(name, on) { UI.on[name] = !!on; uiSave(); renderSettings(); }
+function setSfxVol(name, v) {
+  UI.vol[name] = parseFloat(v); uiSave();
+  const el = document.getElementById('setv-' + name);
+  if (el) el.textContent = Math.round(UI.vol[name] * 100) + '%';
+}
+function testSfx(name) { actx(); sfx(name); }
+
+function addCustomSfx(name, input) {
+  const files = [...(input.files || [])];
+  input.value = '';
+  if (!files.length) return;
+  files.forEach(f => {
+    if (f.size > 400 * 1024) { toast(f.name + ' is too big (400KB max)'); return; }
+    const r = new FileReader();
+    r.onload = () => {
+      _customSfx[name] = _customSfx[name] || [];
+      _customSfx[name].push({ name: f.name, url: r.result });
+      uiSaveSfx(); renderSettings();
+      toast('Added ' + f.name);
+    };
+    r.readAsDataURL(f);
+  });
+}
+function removeCustomSfx(name, idx) {
+  if (!_customSfx[name]) return;
+  _customSfx[name].splice(idx, 1);
+  if (!_customSfx[name].length) delete _customSfx[name];
+  uiSaveSfx(); renderSettings();
+}
+function playCustomSfx(name, idx) {
+  const c = (_customSfx[name] || [])[idx];
+  if (!c) return;
+  const a = new Audio(c.url || c);
+  a.volume = Math.min(1, (UI.masterVol||0) * (UI.vol[name] != null ? UI.vol[name] : 0.7));
+  a.play().catch(() => {});
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SETTINGS → WORKFLOWS EDITOR (2026-09-02)
+// Unlimited workflows, stages, extra tasks and tabs. Everything is edited in a
+// DRAFT (a deep clone) and only leaves the browser on SAVE → PUT /api/workflows;
+// the server backs the file up, validates, and answers 400 on a bad shape or
+// 409 on deleting a stage that still holds projects. Nothing here writes to a
+// project: moving projects off a stage is an explicit, separate action.
+// ══════════════════════════════════════════════════════════════════════════
+let _wfDraft = null;
+let _wfErr = '';
+let _wfBlocked = null;   // {stage, count, projects[]} from a 409
+
+function DATE_TYPE_OPTS() { return dateTypes().map(d => [d.id, d.label || d.id]); }
+const TAB_URGENCY = ['max', 'sum', 'deadline', 'none'];
+const STAGE_ROLES = ['todo', 'waiting', 'out', 'won', 'in_progress', 'closed', 'cold', 'ignored'];
+// Plain names for the roles in the stage editor (the id is what is stored).
+const STAGE_ROLE_LABELS = { todo: 'To do', waiting: 'Waiting on someone', out: 'Sent, awaiting answer', won: 'Won',
+                            in_progress: 'In progress', closed: 'Done', cold: 'Gone quiet', ignored: 'Hidden' };
+
+function wfDraftInit(force) {
+  if (_wfDraft && !force) return _wfDraft;
+  const src = WORKFLOWS || {
+    version: 1,
+    user: {},
+    workflows: [],
+    tabs: [],
+    tab_rules: { auto_stage_tabs: true },
+    hud: { hp: showMoney() ? 'won_vs_goal' : 'responsiveness', mp: showMoney() ? 'quoted_vs_goal' : 'capacity' },
+    theme: { skin: 'default' }
+  };
+  try { _wfDraft = JSON.parse(JSON.stringify(src)); } catch (e) { _wfDraft = src; }
+  if (!Array.isArray(_wfDraft.workflows)) _wfDraft.workflows = [];
+  if (!Array.isArray(_wfDraft.tabs)) _wfDraft.tabs = [];
+  if (!_wfDraft.tab_rules) _wfDraft.tab_rules = { auto_stage_tabs: true };
+  if (!_wfDraft.hud) _wfDraft.hud = {};
+  if (!_wfDraft.theme) _wfDraft.theme = { skin: 'default' };
+  delete _wfDraft.__roles;
+  wfSortDraft();
+  return _wfDraft;
+}
+
+// ── SORT PRIORITY ────────────────────────────────────────────────────────
+// The draft always carries a sort block once the editor is opened; SAVING it is
+// what turns subtask ordering on for a file that never had one. Opening
+// settings alone changes nothing: the draft only leaves the browser on SAVE.
+function SORT_MATCH_DATE_TYPES() { return [['', 'any type']].concat(dateTypes().map(d => [d.id, d.label || d.id])); }
+const SORT_MATCH_SOURCES = [['', 'any source'], ['triage', 'from triage'], ['assistant', 'from the assistant'],
+                            ['manual', 'added by hand'], ['system', 'system']];
+function wfSortDraft() {
+  if (!_wfDraft) return null;
+  if (!_wfDraft.sort || typeof _wfDraft.sort !== 'object') {
+    // Seed from the live config if there is one, else from the date types.
+    const live = wfSort();
+    _wfDraft.sort = live ? JSON.parse(JSON.stringify(live)) : {
+      mode: 'subtask',
+      priority: dateTypes().map(d => ({ id: d.id, label: d.label || d.id, match: { date_type: d.id } }))
+        .concat([{ id: 'other', label: 'Everything else', match: {} }])
+    };
+  }
+  if (!Array.isArray(_wfDraft.sort.priority)) _wfDraft.sort.priority = [];
+  if (!_wfDraft.sort.priority.some(r => r && !Object.keys(r.match || {}).length)) {
+    _wfDraft.sort.priority.push({ id: 'other', label: 'Everything else', match: {} });
+  }
+  return _wfDraft.sort;
+}
+function wfSortIsCatchAll(r) { return !r || !Object.keys(r.match || {}).length; }
+// The catch-all is always last: it matches everything, so any rule under it
+// would be dead code.
+function wfSortPinCatchAll(s) {
+  if (!s || !Array.isArray(s.priority)) return;
+  const ca = s.priority.filter(wfSortIsCatchAll);
+  const rest = s.priority.filter(r => !wfSortIsCatchAll(r));
+  s.priority = rest.concat(ca.length ? [ca[ca.length - 1]] : []);
+}
+function wfSortModeSet(mode) { wfSortDraft().mode = mode; renderWfEditor(); }
+function wfSortEdit(ri, field, val) {
+  const r = (wfSortDraft().priority || [])[ri];
+  if (!r) return;
+  if (field === 'id') val = _wfSlug(val);
+  r[field] = val;
+}
+function wfSortMatchEdit(ri, key, val) {
+  const r = (wfSortDraft().priority || [])[ri];
+  if (!r) return;
+  if (!r.match) r.match = {};
+  if (val === '' || val == null) delete r.match[key]; else r.match[key] = val;
+  renderWfEditor();   // clearing the last key turns a rule INTO a catch-all -
+                      // the row has to redraw so that reads honestly
+}
+function wfSortMove(ri, dir) {
+  const s = wfSortDraft();
+  const j = ri + dir;
+  if (j < 0 || j >= s.priority.length) return;
+  if (wfSortIsCatchAll(s.priority[ri]) || wfSortIsCatchAll(s.priority[j])) return;
+  wfMove(s.priority, ri, dir);
+  renderWfEditor();
+}
+function wfSortAdd() {
+  const s = wfSortDraft();
+  const n = s.priority.length;
+  s.priority.push({ id: 'rule_' + n, label: 'New rule',
+                    match: { date_type: 'follow_up' } });
+  wfSortPinCatchAll(s);
+  renderWfEditor();
+}
+function wfSortDel(ri) {
+  const s = wfSortDraft();
+  if (wfSortIsCatchAll(s.priority[ri])) return;   // never removable
+  s.priority.splice(ri, 1);
+  renderWfEditor();
+}
+function _wfSlug(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'stage';
+}
+// Field edits mutate the draft in place and do NOT re-render: re-rendering on
+// every keystroke would steal focus out of the box being typed in.
+function wfEdit(wi, field, val)  { const w = _wfDraft.workflows[wi]; if (w) w[field] = val; }
+function wfStageEdit(wi, si, field, val) {
+  const s = ((_wfDraft.workflows[wi] || {}).stages || [])[si];
+  if (!s) return;
+  if (field === 'id') val = _wfSlug(val);
+  s[field] = val;
+}
+function wfTaskEdit(wi, si, field, val) {
+  const s = ((_wfDraft.workflows[wi] || {}).stages || [])[si];
+  if (!s) return;
+  if (!s.owning_task) s.owning_task = { text: '', date_type: 'follow_up' };
+  if (field === 'days' || field === 'sla_hours') {
+    const n = parseFloat(val);
+    if (isNaN(n)) delete s.owning_task[field]; else s.owning_task[field] = n;
+  } else s.owning_task[field] = val;
+  if (!s.owning_task.text) delete s.owning_task;
+}
+function wfExtraEdit(wi, ei, field, val) {
+  const t = ((_wfDraft.workflows[wi] || {}).extra_tasks || [])[ei];
+  if (!t) return;
+  if (field === 'days' || field === 'sla_hours') {
+    const n = parseFloat(val);
+    if (isNaN(n)) delete t[field]; else t[field] = n;
+  } else t[field] = val;
+}
+function wfTabEdit(ti, field, val) {
+  const t = _wfDraft.tabs[ti];
+  if (!t) return;
+  if (field === 'filter') {
+    try { t.filter = JSON.parse(val || '{}'); _wfErr = ''; }
+    catch (e) { _wfErr = 'Tab filter must be JSON: e.g. {"stage_in":["quote_sent"]}'; renderWfEditor(); }
+    return;
+  }
+  t[field] = val;
+}
+// Structural edits DO re-render.
+function wfAddWorkflow() {
+  wfDraftInit();
+  const n = _wfDraft.workflows.length + 1;
+  _wfDraft.workflows.push({
+    id: 'workflow_' + n, label: 'New workflow', icon: '🗂', color: '#8a8580',
+    project_type: 'task',
+    stages: [{ id: 'todo_' + n, label: 'To Do', column: true },
+             { id: 'complete', label: 'Closed', column: false, closed: true }],
+    entry_stage: 'todo_' + n, extra_tasks: []
+  });
+  renderWfEditor();
+}
+function wfDelWorkflow(wi) {
+  if (!confirm('Remove this workflow? Projects already on its stages keep their status.')) return;
+  _wfDraft.workflows.splice(wi, 1); renderWfEditor();
+}
+function wfMove(arr, i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= arr.length) return;
+  const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+}
+function wfMoveWorkflow(wi, dir) { wfMove(_wfDraft.workflows, wi, dir); renderWfEditor(); }
+function wfAddStage(wi) {
+  const w = _wfDraft.workflows[wi]; if (!w) return;
+  if (!Array.isArray(w.stages)) w.stages = [];
+  w.stages.push({ id: 'stage_' + (w.stages.length + 1), label: 'New stage', column: true });
+  renderWfEditor();
+}
+function wfDelStage(wi, si) {
+  const w = _wfDraft.workflows[wi]; if (!w) return;
+  const s = (w.stages || [])[si]; if (!s) return;
+  const held = (DATA && DATA.projects || []).filter(p => p.status === s.id).length;
+  if (held && !confirm(`${held} project${held > 1 ? 's are' : ' is'} on "${s.label || s.id}". The server will refuse the save until they are moved. Remove the stage anyway?`)) return;
+  w.stages.splice(si, 1); renderWfEditor();
+}
+function wfMoveStage(wi, si, dir) { wfMove(_wfDraft.workflows[wi].stages, si, dir); renderWfEditor(); }
+function wfAddExtra(wi) {
+  const w = _wfDraft.workflows[wi]; if (!w) return;
+  if (!Array.isArray(w.extra_tasks)) w.extra_tasks = [];
+  w.extra_tasks.push({ text: 'New task', date_type: 'follow_up', days: 3, arm_on_stage: w.entry_stage || '' });
+  renderWfEditor();
+}
+function wfDelExtra(wi, ei) { _wfDraft.workflows[wi].extra_tasks.splice(ei, 1); renderWfEditor(); }
+function wfAddTab() {
+  wfDraftInit();
+  _wfDraft.tabs.push({ id: 'tab_' + (_wfDraft.tabs.length + 1), label: 'New tab',
+                       filter: { closed: false }, urgency: 'max' });
+  renderWfEditor();
+}
+function wfDelTab(ti) { _wfDraft.tabs.splice(ti, 1); renderWfEditor(); }
+function wfMoveTab(ti, dir) { wfMove(_wfDraft.tabs, ti, dir); renderWfEditor(); }
+function wfToggleAutoTabs(on) { _wfDraft.tab_rules.auto_stage_tabs = !!on; renderWfEditor(); }
+function wfHudEdit(slot, val) { _wfDraft.hud[slot] = val; }
+function wfSkinEdit(val) { _wfDraft.theme.skin = val; }
+function wfRevert() { _wfDraft = null; _wfErr = ''; _wfBlocked = null; wfDraftInit(true); renderWfEditor(); }
+
+// Move every project off a stage the server refuses to let go of.
+async function wfMoveStageProjects(fromStage) {
+  const sel = document.getElementById('wf-move-target');
+  const to = sel ? sel.value : '';
+  if (!to) { toast('Pick a stage to move them to'); return; }
+  const targets = (DATA && DATA.projects || []).filter(p => p.status === fromStage);
+  if (!targets.length) { _wfBlocked = null; renderWfEditor(); return; }
+  if (!confirm(`Move ${targets.length} project${targets.length > 1 ? 's' : ''} from "${stageLabel(fromStage)}" to "${stageLabel(to)}"?`)) return;
+  let moved = 0, failed = 0;
+  for (const p of targets) {
+    try { await apiPut(p.id, { status: to }); moved++; }
+    catch (e) { failed++; }
+  }
+  await loadData();
+  toast(`Moved ${moved}${failed ? ` · ${failed} failed` : ''}`);
+  _wfBlocked = null;
+  renderWfEditor();
+}
+
+async function wfSave() {
+  wfDraftInit();
+  _wfErr = ''; _wfBlocked = null;
+  // Local sanity first: a bad entry stage is the one mistake that would leave
+  // a workflow unable to create anything.
+  for (const w of _wfDraft.workflows) {
+    const ids = (w.stages || []).map(s => s.id);
+    if (!ids.length) { _wfErr = `Workflow "${w.label || w.id}" has no stages.`; renderWfEditor(); return; }
+    if (!w.entry_stage || !ids.includes(w.entry_stage)) w.entry_stage = ids[0];
+    (w.stages || []).forEach(s => {
+      if (s.advance_on_task_complete && !ids.includes(s.advance_on_task_complete)) {
+        delete s.advance_on_task_complete;
+      }
+      if (s.role === '') delete s.role;
+    });
+    if (w.won_transition && !w.won_transition.from && !w.won_transition.to) w.won_transition = null;
+  }
+  // The catch-all goes last no matter how the rules were reordered: a rule
+  // under it could never match.
+  if (_wfDraft.sort) wfSortPinCatchAll(_wfDraft.sort);
+  try {
+    const r = await fetch('/api/workflows', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(_wfDraft)
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 409) {
+      _wfErr = body.detail || body.error || 'A stage still has projects on it.';
+      // {stages: {stage_id: {count, project_ids}}} (workflows_api) or the flat shape
+      const first = body.stages && typeof body.stages === 'object' ? Object.keys(body.stages)[0] : null;
+      _wfBlocked = {
+        stage: first || body.stage || body.stage_id || '',
+        count: first ? (body.stages[first].count || 0) : (body.count != null ? body.count : (Array.isArray(body.projects) ? body.projects.length : 0))
+      };
+      renderWfEditor();
+      return;
+    }
+    if (!r.ok) { _wfErr = (Array.isArray(body.errors) ? body.errors.join('; ') : body.error) || ('Save failed: HTTP ' + r.status); renderWfEditor(); return; }
+    const saved = wfDocFrom(body) || _wfDraft;
+    try { saved.__roles = (body && body.derived && body.derived.roles) || {}; } catch (e) {}
+    WORKFLOWS = saved; WF_STATE = 'live';
+    _wfDraft = null;
+    applyThemeSkin();
+    await loadBoardTabs();
+    renderBoard();
+    renderWfEditor();
+    toast('Workflows saved');
+  } catch (e) {
+    _wfErr = 'Save failed: ' + e.message;
+    renderWfEditor();
+  }
+}
+
+function renderWfEditor() {
+  const el = document.getElementById('set-wf-body');
+  if (!el) return;
+  const d = wfDraftInit();
+  const sel = (val, opts, oc, width) =>
+    `<select class="wf-in ${width || 'mid'}" data-on-change="${oc}">` +
+    opts.map(o => {
+      const [k, lbl] = Array.isArray(o) ? o : [o, o];
+      return `<option value="${escA(k)}" ${String(val) === String(k) ? 'selected' : ''}>${esc(lbl)}</option>`;
+    }).join('') + '</select>';
+  const box = (val, oc, cls, ph) =>
+    `<input class="wf-in ${cls || 'mid'}" value="${escA(val == null ? '' : String(val))}"
+      placeholder="${escA(ph || '')}" data-on-change="${oc}">`;
+  const cb = (on, oc) => `<input type="checkbox" ${on ? 'checked' : ''} data-on-change="${oc}"
+      style="width:13px;height:13px;accent-color:var(--c-4ecdc4);cursor:pointer">`;
+
+  let h = '';
+  if (WF_STATE !== 'live') {
+    h += `<div class="wf-err">The workflow API isn't answering. The board has no stages until it does;
+      edits here can't be saved until the server is reachable.</div>`;
+  }
+  if (_wfErr) h += `<div class="wf-err">${esc(_wfErr)}</div>`;
+  if (_wfBlocked && _wfBlocked.stage) {
+    const opts = wfDraftInit().workflows.flatMap(w => (w.stages || []).map(s => [s.id, (w.label || w.id) + ' · ' + (s.label || s.id)]))
+      .filter(o => o[0] !== _wfBlocked.stage);
+    h += `<div class="wf-err">
+      ${_wfBlocked.count || ''} project${_wfBlocked.count === 1 ? '' : 's'} still on
+      "${esc(stageLabel(_wfBlocked.stage))}". Move them:
+      <select class="wf-in mid" id="wf-move-target">${opts.map(o => `<option value="${escA(o[0])}">${esc(o[1])}</option>`).join('')}</select>
+      <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStageProjects', String(_wfBlocked.stage)))}">MOVE THEM</button>
+    </div>`;
+  }
+
+  // ── workflows ──
+  d.workflows.forEach((w, wi) => {
+    const stageOpts = (w.stages || []).map(s => [s.id, s.label || s.id]);
+    h += `<div class="wf-card">
+      <div class="wf-head">
+        ${box(w.icon, EH(null, EK('wfEdit', wi, 'icon', $V)), 'narrow', 'icon')}
+        ${box(w.label, EH(null, EK('wfEdit', wi, 'label', $V)), 'wide', 'label')}
+        ${box(w.id, EH(null, EK('wfEdit', wi, 'id', $V)), 'mid', 'id')}
+        ${box(w.color || '', EH(null, EK('wfEdit', wi, 'color', $V)), 'narrow', '#color')}
+        <span class="wf-lbl">entry</span>
+        ${sel(w.entry_stage || '', stageOpts, EH(null, EK('wfEdit', wi, 'entry_stage', $V)))}
+        <span style="margin-left:auto"></span>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveWorkflow', wi, -1))}" title="Move up">▲</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveWorkflow', wi, 1))}" title="Move down">▼</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfDelWorkflow', wi))}" title="Remove workflow">✕</button>
+      </div>
+      <div class="wf-head">
+        <span class="wf-lbl">won moves</span>
+        ${sel((w.won_transition || {}).from || '', [['','-']].concat(stageOpts), EH(null, EK('wfWonEdit', wi, 'from', $V)))}
+        <span class="wf-lbl">to</span>
+        ${sel((w.won_transition || {}).to || '', [['','-']].concat(stageOpts), EH(null, EK('wfWonEdit', wi, 'to', $V)))}
+      </div>`;
+
+    (w.stages || []).forEach((s, si) => {
+      const t = s.owning_task || {};
+      h += `<div class="wf-stage">
+        ${box(s.label, EH(null, EK('wfStageEdit', wi, si, 'label', $V)), 'wide', 'stage label')}
+        ${box(s.id, EH(null, EK('wfStageEdit', wi, si, 'id', $V)), 'mid', 'stage id')}
+        <span class="wf-lbl">role</span>${sel(s.role || '', [['', '-']].concat(STAGE_ROLES.map(r => [r, STAGE_ROLE_LABELS[r] || r])), EH(null, EK('wfStageEdit', wi, si, 'role', $V)), 'mid')}
+        <span class="wf-lbl">col</span>${cb(s.column, EH(null, EK('wfStageEdit', wi, si, 'column', $C), EK('renderWfEditor')))}
+        <span class="wf-lbl">closed</span>${cb(s.closed, EH(null, EK('wfStageEdit', wi, si, 'closed', $C)))}
+        ${box(t.text || '', EH(null, EK('wfTaskEdit', wi, si, 'text', $V), EK('renderWfEditor')), 'wide', 'owning task')}
+        ${sel(t.date_type || 'follow_up', DATE_TYPE_OPTS(), EH(null, EK('wfTaskEdit', wi, si, 'date_type', $V), EK('renderWfEditor')), 'narrow')}
+        ${(t.date_type === 'sla')
+          ? `${box(t.sla_hours == null ? '' : t.sla_hours, EH(null, EK('wfTaskEdit', wi, si, 'sla_hours', $V)), 'narrow', 'hrs')}<span class="wf-lbl">hrs</span>`
+          : `${box(t.days == null ? '' : t.days, EH(null, EK('wfTaskEdit', wi, si, 'days', $V)), 'narrow', 'days')}<span class="wf-lbl">days</span>`}
+        <span class="wf-lbl" title="advance to this stage when the owning task is completed">done, go to</span>
+        ${sel(s.advance_on_task_complete || '', [['','-']].concat(stageOpts), EH(null, EK('wfStageEdit', wi, si, 'advance_on_task_complete', $V)))}
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStage', wi, si, -1))}">▲</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfMoveStage', wi, si, 1))}">▼</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfDelStage', wi, si))}">✕</button>
+      </div>`;
+    });
+    h += `<div class="wf-stage"><button class="set-btn" data-on-click="${EH(null, EK('wfAddStage', wi))}">+ STAGE</button>`;
+    h += `<button class="set-btn" data-on-click="${EH(null, EK('wfAddExtra', wi))}">+ EXTRA TASK</button></div>`;
+
+    (w.extra_tasks || []).forEach((t, ei) => {
+      h += `<div class="wf-stage">
+        <span class="wf-lbl">extra</span>
+        ${box(t.text, EH(null, EK('wfExtraEdit', wi, ei, 'text', $V)), 'wide', 'task text')}
+        ${sel(t.date_type || 'follow_up', DATE_TYPE_OPTS(), EH(null, EK('wfExtraEdit', wi, ei, 'date_type', $V), EK('renderWfEditor')), 'narrow')}
+        ${(t.date_type === 'sla')
+          ? `${box(t.sla_hours == null ? '' : t.sla_hours, EH(null, EK('wfExtraEdit', wi, ei, 'sla_hours', $V)), 'narrow', 'hrs')}<span class="wf-lbl">hrs</span>`
+          : `${box(t.days == null ? '' : t.days, EH(null, EK('wfExtraEdit', wi, ei, 'days', $V)), 'narrow', 'days')}<span class="wf-lbl">days</span>`}
+        <span class="wf-lbl">arm at</span>
+        ${sel(t.arm_on_stage || '', [['','-']].concat(stageOpts), EH(null, EK('wfExtraEdit', wi, ei, 'arm_on_stage', $V)))}
+        <button class="set-btn" data-on-click="${EH(null, EK('wfDelExtra', wi, ei))}">✕</button>
+      </div>`;
+    });
+    h += `</div>`;
+  });
+  h += `<div style="margin:6px 0"><button class="set-btn" data-on-click='{"f":"wfAddWorkflow"}'>+ WORKFLOW</button></div>`;
+
+  // ── tabs ──
+  h += `<div class="wf-card"><div class="wf-head">
+    <span class="wf-lbl">HEADER TABS</span>
+    <span class="wf-lbl" style="margin-left:auto">a tab per column stage</span>
+    ${cb(d.tab_rules.auto_stage_tabs !== false, EH(null, EK('wfToggleAutoTabs', $C)))}
+  </div>`;
+  d.tabs.forEach((t, ti) => {
+    h += `<div class="wf-stage">
+      ${box(t.label, EH(null, EK('wfTabEdit', ti, 'label', $V)), 'wide', 'tab label')}
+      ${box(t.id, EH(null, EK('wfTabEdit', ti, 'id', $V)), 'mid', 'tab id')}
+      ${sel(t.urgency || 'max', TAB_URGENCY, EH(null, EK('wfTabEdit', ti, 'urgency', $V)), 'narrow')}
+      ${box(JSON.stringify(t.filter || {}), EH(null, EK('wfTabEdit', ti, 'filter', $V)), 'wide', '{"stage_in":["..."]}')}
+      <button class="set-btn" data-on-click="${EH(null, EK('wfMoveTab', ti, -1))}">▲</button>
+      <button class="set-btn" data-on-click="${EH(null, EK('wfMoveTab', ti, 1))}">▼</button>
+      <button class="set-btn" data-on-click="${EH(null, EK('wfDelTab', ti))}">✕</button>
+    </div>`;
+  });
+  h += `<div class="wf-stage"><button class="set-btn" data-on-click='{"f":"wfAddTab"}'>+ TAB</button></div></div>`;
+
+  // ── sort priority ──
+  const _sd = wfSortDraft();
+  const _subtaskMode = _sd.mode !== 'project';
+  h += `<div class="wf-card"><div class="wf-head">
+      <span class="wf-lbl">SORT PRIORITY</span>
+      ${sel(_sd.mode || 'subtask',
+            [['subtask', 'by subtask: hottest task pulls its project up'],
+             ['project', 'by project: total urgency (the old order)']],
+            EH(null, EK('wfSortModeSet', $V)), 'wide')}
+    </div>
+    <div class="wf-stage" style="border-top:none">
+      <span class="wf-lbl" style="line-height:1.5">
+        Score always wins: a 999 follow-up outranks a 600 deadline. This list only
+        breaks TIES, then the OLDEST of the tied tasks goes first.
+      </span>
+    </div>`;
+  if (!_subtaskMode) {
+    h += `<div class="wf-stage"><span class="wf-lbl">Priority rules are unused
+      while the board sorts by project.</span></div>`;
+  }
+  const _wfOpts = [['', 'any workflow']].concat(d.workflows.map(w => [w.id, w.label || w.id]));
+  (_sd.priority || []).forEach((r, ri) => {
+    const ca = wfSortIsCatchAll(r);
+    const m = r.match || {};
+    h += `<div class="wf-stage" style="${_subtaskMode ? '' : 'opacity:.45'}">
+      <span class="wf-lbl" style="min-width:18px">${ri + 1}</span>
+      ${box(r.label, EH(null, EK('wfSortEdit', ri, 'label', $V)), 'wide', 'rule label')}
+      ${box(r.id, EH(null, EK('wfSortEdit', ri, 'id', $V)), 'mid', 'rule id')}`;
+    if (ca) {
+      h += `<span class="wf-lbl">catch-all: everything nothing above matched,
+        always last</span>`;
+    } else {
+      h += `${sel(m.date_type || '', SORT_MATCH_DATE_TYPES(), EH(null, EK('wfSortMatchEdit', ri, 'date_type', $V)), 'narrow')}
+        ${sel(m.source || '', SORT_MATCH_SOURCES, EH(null, EK('wfSortMatchEdit', ri, 'source', $V)), 'wide')}
+        ${sel(m.workflow || '', _wfOpts, EH(null, EK('wfSortMatchEdit', ri, 'workflow', $V)))}
+        ${box(m.text_prefix || '', EH(null, EK('wfSortMatchEdit', ri, 'text_prefix', $V)), 'mid', 'text starts with')}
+        <button class="set-btn" data-on-click="${EH(null, EK('wfSortMove', ri, -1))}" title="Higher priority">▲</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfSortMove', ri, 1))}" title="Lower priority">▼</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('wfSortDel', ri))}" title="Remove rule">✕</button>`;
+    }
+    h += `</div>`;
+  });
+  h += `<div class="wf-stage"><button class="set-btn" data-on-click='{"f":"wfSortAdd"}'>+ RULE</button></div></div>`;
+
+  // ── HUD + skin ──
+  const hudOpts = Object.keys(HUD_METRICS).filter(k => showMoney() || !_MONEY_HUD[k]);
+  h += `<div class="wf-card"><div class="wf-head">
+      <span class="wf-lbl">HUD: the frame is locked, the two bars are the preset's</span></div>
+    <div class="wf-stage"><span class="wf-lbl">HP</span>
+      ${sel(d.hud.hp || hudFormulaId('hp'), hudOpts, EH(null, EK('wfHudEdit', 'hp', $V)), 'wide')}
+      <span class="wf-lbl">MP</span>
+      ${sel(d.hud.mp || hudFormulaId('mp'), hudOpts, EH(null, EK('wfHudEdit', 'mp', $V)), 'wide')}</div>
+    <div class="wf-stage"><span class="wf-lbl">Skin (cosmetic only)</span>
+      ${sel((d.theme || {}).skin || 'default', THEME_SKINS, EH(null, EK('wfSkinEdit', $V)), 'wide')}</div>
+  </div>`;
+
+  h += `<div class="wf-stage" style="border-top:none">
+    <button class="set-btn primary" data-on-click='{"f":"wfSave"}'>SAVE WORKFLOWS</button>
+    <button class="set-btn" data-on-click='{"f":"wfRevert"}'>REVERT</button>
+  </div>`;
+  el.innerHTML = h;
+}
+
+function renderSettings() {
+  const el = document.getElementById('set-body');
+  if (!el) return;
+  const tabsEl = document.getElementById('set-tabs');
+  if (tabsEl) {
+    tabsEl.innerHTML = SET_TABS.map(([id, lbl]) =>
+      `<button class="set-tab ${_setTab === id ? 'active' : ''}" data-on-click="${EH(null, EK('setSettingsTab', String(id)))}">${esc(lbl)}</button>`).join('');
+  }
+  let h = '';
+  if (_setTab === 'workflows') h = renderSettingsWorkflows();
+  else if (_setTab === 'display') h = renderSettingsDisplay();
+  else if (_setTab === 'fields') h = renderSettingsFields();
+  else if (_setTab === 'mail') h = renderSettingsMail();
+  else if (_setTab === 'ai') h = renderSettingsAI();
+  else if (_setTab === 'license') h = renderSettingsLicense();
+  else h = renderSettingsGeneral();
+  el.innerHTML = h;
+  if (_setTab === 'workflows') renderWfEditor();
+  if (_setTab === 'mail') loadMailSettings();
+  if (_setTab === 'ai') loadAISettings();
+  if (_setTab === 'license') loadLicenseSettings();
+}
+
+const _chk = (on, oc, extra) =>
+  `<input type="checkbox" ${on ? 'checked' : ''} data-on-change="${oc}" ${extra||''} style="width:14px;height:14px;accent-color:var(--c-4ecdc4);cursor:pointer">`;
+
+function renderSettingsGeneral() {
+  const chk = _chk;
+  let h = '';
+
+  // PROFILE (read-only summary; the wizard and the config file own it)
+  const u = PROF.user || {};
+  h += `<div class="set-sec"><div class="set-sec-lbl">Profile</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">${esc(u.name || 'Not set')}${u.role ? `<span class="set-chip">${esc(u.role)}</span>` : ''}</div>
+      <div class="set-row-sub">${esc(u.email || '')}${u.company ? ' · ' + esc(u.company) : ''}</div>
+    </div></div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Profession: ${esc(PROF.label || PROF.id || 'General')}</div>
+      <div class="set-row-sub">${esc(PROF.description || '')} Business hours ${esc(bizHoursText())}. Change the template or the user in Setup (<a href="/setup" style="color:var(--c-4fc3f7)">open</a>).</div>
+    </div></div>
+  </div>`;
+
+  h += renderHoursSection();
+
+  // INTERFACE
+  h += `<div class="set-sec"><div class="set-sec-lbl">Interface</div>`;
+  h += `<div class="set-row">
+    <div class="set-row-main">
+      <div class="set-row-name">Auto-refresh</div>
+      <div class="set-row-sub">Seconds between board refreshes (0 = manual only)</div>
+    </div>
+    <input type="number" min="0" max="600" step="5" value="${UI.refreshSec}"
+      data-on-change='{"f":"setSettingInt","a":["refreshSec",0,0,{"$":"value"}]}'>
+  </div>`;
+  h += `<div class="set-row">
+    <div class="set-row-main"><div class="set-row-name">Card move animation</div><div class="set-row-sub">Cards slide when they re-sort</div></div>
+    ${chk(UI.flip, EH(null, EK('setSetting', 'flip', $C)))}
+  </div>`;
+  if (showMoney()) {
+    h += `<div class="set-row">
+      <div class="set-row-main"><div class="set-row-name">Annual goal</div>
+        <div class="set-row-sub">Drives the HP / MP / XP bars${PROF.money && PROF.money.annual_goal ? ' (set by the profession template)' : ''}</div></div>
+      <input type="number" min="0" step="1000" value="${annualGoal()}" ${PROF.money && PROF.money.annual_goal ? 'disabled' : ''}
+        data-on-change='{"f":"localGoal","a":["pb_annual_goal","float",0,0,{"$":"value"}]}'>
+    </div>`;
+  } else {
+    h += `<div class="set-row">
+      <div class="set-row-main"><div class="set-row-name">Threads closed goal</div>
+        <div class="set-row-sub">Per rolling 28 days; drives the XP bar</div></div>
+      <input type="number" min="1" step="1" value="${parseFloat(localStorage.getItem('pb_threads_goal')) || 20}"
+        data-on-change='{"f":"localGoal","a":["pb_threads_goal","int",1,20,{"$":"value"}]}'>
+    </div>`;
+  }
+  h += `</div>`;
+
+  // GAME LAYER (audio + effects): only when the feature is on
+  if (feat('game_layer')) {
+    h += `<div class="set-sec"><div class="set-sec-lbl">Audio</div>`;
+    h += `<div class="set-row">
+      <div class="set-row-main">
+        <div class="set-row-name">Sound effects</div>
+        <div class="set-row-sub">Master switch: synthesized in the browser, no files needed</div>
+      </div>
+      ${chk(UI.sound, EH(null, EK('setSetting', 'sound', $C, true)))}
+    </div>`;
+    h += `<div class="set-row">
+      <div class="set-row-main"><div class="set-row-name">Master volume</div></div>
+      <input type="range" min="0" max="1" step="0.05" value="${UI.masterVol}"
+        data-on-input='{"f":"masterVol","a":[{"$":"value"}]}'>
+      <span class="set-val" id="setv-master">${Math.round(UI.masterVol*100)}%</span>
+      <button class="set-btn" data-on-click='{"f":"testSfx","a":["ding"]}'>TEST</button>
+    </div>`;
+
+    SFX_EVENTS.forEach(([name, label, sub]) => {
+      const customs = _customSfx[name] || [];
+      const builtinCount = (SFX_LIB[name] || []).length;
+      const poolSize = customs.length
+        ? (UI.mixBuiltins ? customs.length + builtinCount : customs.length)
+        : builtinCount;
+      h += `<div class="set-row">
+        <div class="set-row-main">
+          <div class="set-row-name">${label}<span class="set-chip">${poolSize} sound${poolSize!==1?'s':''}</span></div>
+          <div class="set-row-sub">${sub}</div>
+          ${customs.length ? '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px">' + customs.map((c, i) =>
+            `<span class="set-chip" style="color:var(--c-c0dd97);border-color:var(--c-2a3a1a);background:var(--c-141a10)">
+              <a data-on-click="${EH(null, EK('playCustomSfx', String(name), i))}" style="cursor:pointer">&#9654; ${esc((c.name||'clip').slice(0,22))}</a>
+              <a data-on-click="${EH(null, EK('removeCustomSfx', String(name), i))}" style="cursor:pointer;color:var(--c-e2726b);margin-left:4px">&times;</a>
+            </span>`).join('') + '</div>' : ''}
+        </div>
+        ${chk(UI.on[name] !== false, EH(null, EK('setSfxFlag', String(name), $C)))}
+        <input type="range" min="0" max="1" step="0.05" value="${UI.vol[name] != null ? UI.vol[name] : 0.7}"
+          data-on-input="${EH(null, EK('setSfxVol', String(name), $V))}">
+        <span class="set-val" id="setv-${name}">${Math.round((UI.vol[name] != null ? UI.vol[name] : 0.7)*100)}%</span>
+        <button class="set-btn" data-on-click="${EH(null, EK('testSfx', String(name)))}">TEST</button>
+        <button class="set-btn" data-on-click="${EH(null, EK('clickEl', 'sfxfile-'+(name)))}" title="Add your own clip (mp3/wav/ogg, 400KB max)">+SOUND</button>
+        <input type="file" id="sfxfile-${name}" accept="audio/*" multiple style="display:none"
+          data-on-change="${EH(null, EK('addCustomSfx', String(name), $T))}">
+      </div>`;
+    });
+
+    h += `<div class="set-row">
+      <div class="set-row-main">
+        <div class="set-row-name">Mix my clips with the built-ins</div>
+        <div class="set-row-sub">Off = only your uploaded clips play for events that have them</div>
+      </div>
+      ${chk(UI.mixBuiltins, EH(null, EK('setSetting', 'mixBuiltins', $C, true)))}
+    </div>`;
+    h += `<div class="set-row">
+      <div class="set-row-main">
+        <div class="set-row-name">OOF threshold</div>
+        <div class="set-row-sub">Boss HP gain needed before you hear about it</div>
+      </div>
+      <input type="number" min="1" max="2000" step="10" value="${UI.oofThreshold}"
+        data-on-change='{"f":"setSettingInt","a":["oofThreshold",1,100,{"$":"value"}]}'>
+    </div>`;
+    h += `</div>`;
+
+    h += `<div class="set-sec"><div class="set-sec-lbl">Effects</div>`;
+    [['fct','Floating combat numbers','The big green/red damage numbers'],
+     ['arcs','Electric arcs','Static discharge on quick-action cards'],
+     ['levelFx','Level-up burst','The overlay flash on level up']
+    ].forEach(([k, label, sub]) => {
+      h += `<div class="set-row">
+        <div class="set-row-main"><div class="set-row-name">${label}</div><div class="set-row-sub">${sub}</div></div>
+        ${chk(UI[k], EH(null, EK('setSetting', String(k), $C)))}
+      </div>`;
+    });
+    h += `</div>`;
+  }
+  return h;
+}
+
+function renderSettingsWorkflows() {
+  return `<div class="set-sec">
+    <div class="set-sec-lbl">Workflows: stages, tabs, tasks</div>
+    <div class="set-row-sub" style="margin-bottom:6px">
+      Stage ids are the ${esc(ent('project').toLowerCase())} statuses. Each stage has a role that tells the
+      board what it means: To do, Waiting on someone, Sent, awaiting answer, Won, In progress, Done,
+      Gone quiet or Hidden. Unlimited workflows, stages, extra tasks and tabs. Nothing is written until SAVE.
+    </div>
+    <div id="set-wf-body"></div>
+  </div>`;
+}
+
+// ── MAIL TAB ──────────────────────────────────────────────────────────────
+let _mailStatus = null;
+function renderSettingsMail() {
+  const m = _mailStatus || (HEALTH && HEALTH.mail) || {};
+  const prov = m.provider || (APP_CONFIG && APP_CONFIG.mail && APP_CONFIG.mail.provider) || 'none';
+  const labels = { none: 'None', pa_folder: 'Drop folder (Power Automate)', imap: 'IMAP', gmail: 'Gmail API', graph: 'Microsoft 365 (Graph)' };
+  const mc = (APP_CONFIG && APP_CONFIG.mail) || {};
+  const smtp = mc.smtp || {};
+  return `<div class="set-sec"><div class="set-sec-lbl">Mail</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Provider: ${esc(labels[prov] || prov)}
+        <span class="set-chip ${m.ok ? 'ok' : (prov === 'none' ? '' : 'bad')}">${prov === 'none' ? 'off' : (m.ok ? 'connected' : 'not connected')}</span></div>
+      <div class="set-row-sub" id="set-mail-sub">${m.last_fetch ? 'Last fetch ' + esc(m.last_fetch) : 'No fetch yet'}${m.error ? ' · ' + esc(m.error) : ''}${m.pending != null ? ' · ' + m.pending + ' pending' : ''}</div>
+    </div>
+    <button class="set-btn" data-on-click='{"f":"loadMailSettings","a":[true]}'>REFRESH</button>
+    <button class="set-btn primary" id="set-mail-test" data-on-click='{"f":"testMail"}' ${prov === 'none' ? 'disabled' : ''}>TEST</button>
+    </div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-sub">Mail is captured into the triage panel. The assistant only ever writes drafts.
+      Change the provider or credentials in Setup (<a href="/setup" style="color:var(--c-4fc3f7)">open</a>).</div>
+    </div></div>
+    <div id="set-mail-result" class="set-row-sub" style="margin-top:6px"></div>
+  </div>
+  <div class="set-sec"><div class="set-sec-lbl">Mail client</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">MAIL view <span class="set-chip ${mc.client_enabled !== false ? 'ok' : ''}">${mc.client_enabled !== false ? 'on' : 'off'}</span></div>
+      <div class="set-row-sub">Browse folders, read, reply, file messages onto ${esc(ent('projects').toLowerCase())} and stage them for triage. Needs IMAP, Gmail or Microsoft 365 (the drop folder cannot browse a mailbox).</div>
+    </div>
+    <button class="set-btn" data-on-click="${EH(null, EK('setMailFlag', 'client_enabled', mc.client_enabled !== false ? false : true))}">${mc.client_enabled !== false ? 'TURN OFF' : 'TURN ON'}</button>
+    </div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Allow sending <span class="set-chip ${mc.send_enabled ? 'bad' : ''}">${mc.send_enabled ? 'ON: Send button live' : 'off: drafts only'}</span></div>
+      <div class="set-row-sub">Off (the default): the composer can only save drafts. On: a person pressing Send in the MAIL view sends through ${esc(labels[prov] || prov)}${prov === 'imap' ? ' (SMTP, see the fields below)' : ''}. Automation never sends either way.${prov === 'graph' ? ' Microsoft 365 asks you to sign in again so the token gains Mail.Send.' : ''}</div>
+    </div>
+    <button class="set-btn ${mc.send_enabled ? '' : 'primary'}" data-on-click="${EH(null, EK('setMailFlag', 'send_enabled', mc.send_enabled ? false : true))}">${mc.send_enabled ? 'TURN OFF' : 'ALLOW SENDING'}</button>
+    </div>
+    ${prov === 'imap' ? `<div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">SMTP for sending</div>
+      <div class="set-row-sub">Blank host = the preset that matches your IMAP service (Gmail, Outlook.com, iCloud) or smtp.&lt;your IMAP host&gt;. Same login as IMAP.</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+        <input class="pf-input" id="set-smtp-host" placeholder="smtp host (blank = preset)" value="${escA(smtp.host || '')}" style="flex:2;min-width:160px">
+        <input class="pf-input" id="set-smtp-port" placeholder="587" value="${escA(smtp.port || '')}" style="width:70px">
+        <label class="set-row-sub" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="set-smtp-starttls" ${smtp.starttls === false ? '' : 'checked'}>STARTTLS</label>
+        <label class="set-row-sub" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="set-smtp-ssl" ${smtp.ssl ? 'checked' : ''}>implicit TLS (465)</label>
+        <button class="set-btn" data-on-click='{"f":"saveSmtp"}'>SAVE</button>
+      </div>
+    </div></div>` : ''}
+    <div id="set-mail-flag-result" class="set-row-sub" style="margin-top:6px"></div>
+  </div>`;
+}
+async function setMailFlag(key, value) {
+  const out = document.getElementById('set-mail-flag-result');
+  try {
+    const r = await fetch('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ mail: { [key]: value } }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    APP_CONFIG = j.config || APP_CONFIG;
+    if (window.PBMail) PBMail.resetCaps();
+    if (out) { out.style.color = 'var(--c-97dda5)'; out.textContent = key === 'send_enabled' ? (value ? 'Sending allowed. The composer now has a Send button.' : 'Sending off. Drafts only.') : (value ? 'Mail client on.' : 'Mail client off.'); }
+    renderSettings(); renderBoard();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+async function saveSmtp() {
+  const out = document.getElementById('set-mail-flag-result');
+  const smtp = { host: (document.getElementById('set-smtp-host').value || '').trim(),
+                 port: parseInt(document.getElementById('set-smtp-port').value, 10) || 587,
+                 starttls: document.getElementById('set-smtp-starttls').checked,
+                 ssl: document.getElementById('set-smtp-ssl').checked };
+  try {
+    const r = await fetch('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ mail: { smtp } }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    APP_CONFIG = j.config || APP_CONFIG;
+    if (window.PBMail) PBMail.resetCaps();
+    if (out) { out.style.color = 'var(--c-97dda5)'; out.textContent = 'SMTP settings saved.'; }
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+async function loadMailSettings(force) {
+  if (_mailStatus && !force) return;
+  try {
+    const r = await fetch('/api/mail/status?' + Date.now());
+    _mailStatus = r.ok ? await r.json() : { error: 'HTTP ' + r.status };
+  } catch (e) { _mailStatus = { error: String(e) }; }
+  if (_setTab === 'mail') renderSettings();
+}
+async function testMail() {
+  const out = document.getElementById('set-mail-result');
+  const btn = document.getElementById('set-mail-test');
+  if (btn) { btn.disabled = true; btn.textContent = 'TESTING...'; }
+  if (out) out.textContent = '';
+  try {
+    const r = await fetch('/api/mail/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (out) {
+      out.style.color = (r.ok && j.ok) ? 'var(--c-97dda5)' : 'var(--c-e06c6c)';
+      out.textContent = (r.ok && j.ok) ? ('Connection OK' + (j.detail ? ': ' + j.detail : '')) : ('Test failed: ' + (j.error || j.detail || ('HTTP ' + r.status)));
+    }
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Test failed: ' + e.message; } }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'TEST'; } }
+  loadMailSettings(true);
+}
+
+// ── AI TAB ────────────────────────────────────────────────────────────────
+let _aiProviders = null, _aiUsage = null, _assistantLog = null, _assistantStatus = null, _aiBalance = null, _aiChoice = null;
+let _helperResult = { text: '', bad: false };
+function _aiCurrent() {
+  const pv = _aiProviders || {};
+  const c = pv.current;
+  return (c && typeof c === 'object' ? c.provider : c) || (APP_CONFIG && APP_CONFIG.ai && APP_CONFIG.ai.provider) || 'none';
+}
+function _aiKind(prov) { return prov === 'emailboss' ? 'builtin' : (!prov || prov === 'none') ? 'off' : 'own'; }
+// Plain sentence for an assistant summary / log detail. Never [object Object].
+function helperSentence(sm) {
+  if (sm === null || sm === undefined) return '';
+  if (typeof sm === 'string') return sm;
+  if (typeof sm !== 'object') return String(sm);
+  if (sm.message && typeof sm.message === 'string') return sm.message;
+  if (sm.summary && typeof sm.summary === 'string') return sm.summary;
+  if (sm.counts && typeof sm.counts === 'object') {
+    const c = sm.counts, tr = sm.triage || {};
+    sm = Object.assign({}, sm, { drafted: c.drafted, asked: c.question_posted, acted: c.acted, deferred: c.deferred,
+                                 approved: (tr.approved || 0) + (tr.created || 0) });
+  }
+  const n = (k) => parseInt(sm[k], 10) || 0;
+  const pl = (c, one, many) => `${c} ${c === 1 ? one : many}`;
+  const parts = [];
+  const looked = n('item_count') || n('items') || n('seen');
+  if (looked) parts.push('looked at ' + pl(looked, 'item', 'items'));
+  if (n('triaged') || n('approved')) parts.push('sorted ' + pl(n('triaged') || n('approved'), 'email', 'emails'));
+  if (n('acted')) parts.push('took care of ' + pl(n('acted'), 'thing', 'things'));
+  if (n('drafted')) parts.push('wrote ' + pl(n('drafted'), 'draft', 'drafts'));
+  if (n('questions') || n('asked')) parts.push('asked you ' + pl(n('questions') || n('asked'), 'question', 'questions'));
+  if (n('deferred')) parts.push('left ' + pl(n('deferred'), 'item', 'items') + ' for you');
+  if (n('errors') || n('failed')) parts.push(pl(n('errors') || n('failed'), 'step', 'steps') + ' did not work');
+  if (sm.reason && !parts.length) parts.push(String(sm.reason).replace(/_/g, ' '));
+  if (!parts.length) return 'Nothing needed doing.';
+  const s = parts.join(', ');
+  return s.charAt(0).toUpperCase() + s.slice(1) + '.';
+}
+const _OUTCOME_WORDS = { drafted: 'Wrote a draft', deferred: 'Left for you', acted: 'Done', asked: 'Asked you', question: 'Asked you',
+                         skipped: 'Skipped', error: 'Problem', failed: 'Problem', triaged: 'Sorted', approved: 'Sorted' };
+function renderSettingsAI() {
+  const cur = _aiCurrent();
+  const kind = _aiChoice || _aiKind(cur);
+  const u = _aiUsage || {};
+  const st = _assistantStatus || {};
+  const log = Array.isArray(_assistantLog) ? _assistantLog : [];
+  const bal = _aiBalance || {};
+  const card = (id, title, body) => `<div class="eb-card ${kind === id ? 'on' : ''}" data-on-click="${EH(null, EK('aiChoice', String(id)))}"><div class="h">${title}</div><div class="b">${body}</div></div>`;
+  let h = '';
+  if (_aiNote) h += `<div class="eb-banner show" style="margin-top:10px">${esc(_aiNote)}</div>`;
+  h += `<div class="set-sec"><div class="set-sec-lbl">Email Boss AI</div>
+    <div class="eb-cards">
+      ${card('builtin', 'Email Boss AI (built in, recommended)', 'Works right away. Pay only for what you use with credits.')}
+      ${card('own', 'My own key (advanced)', 'Use your own Anthropic, OpenAI or local model account.')}
+      ${card('off', 'Off', 'No AI. Sorting still works by rules.')}
+    </div>`;
+  if (kind === 'builtin') {
+    const month = u.month || {};
+    h += `<div class="set-row"><div class="set-row-main">
+        <div class="set-row-name">Credits left: ${bal.balance != null ? esc(String(bal.balance)) : (cur === 'emailboss' ? 'checking...' : '-')}${bal.low ? '<span class="set-chip bad">running low</span>' : ''}${bal.credits_exhausted ? '<span class="set-chip bad">empty</span>' : ''}</div>
+        <div class="set-row-sub">Used this month: ${month.calls != null ? pl0(month.calls, 'request') + (month.credits != null ? ', ' + month.credits + ' credits' : '') : 'nothing yet'}.</div>
+      </div>
+      ${cur !== 'emailboss' ? `<button class="set-btn primary" data-on-click='{"f":"setAIProvider","a":["emailboss"]}'>TURN ON</button>` : ''}
+      </div>`;
+    if (cur === 'emailboss') {
+      const packs = Array.isArray(bal.packs) ? bal.packs : [];
+      h += `<div class="set-row" style="flex-wrap:wrap;gap:6px"><div class="set-row-main"><div class="set-row-name">Buy credits</div>
+          <div class="set-row-sub">Opens a secure checkout page in your browser.</div></div>
+        ${packs.length ? packs.map(pk => `<button class="set-btn primary" data-on-click="${EH(null, EK('buyCredits', String(pk.id)))}">${esc(pk.label || (pk.credits + ' credits'))}</button>`).join('')
+                       : `<button class="set-btn" disabled title="No credit packs are on sale right now">Buy credits</button>`}
+      </div>`;
+    }
+    h += `<div class="set-row-sub" style="margin-top:6px">Your mail stays on this computer. When AI helps, the text of that one email goes to Email Boss AI and is not stored.</div>`;
+  } else if (kind === 'own') {
+    const ownProv = (cur !== 'emailboss' && cur !== 'none') ? cur : 'anthropic';
+    const pv = _aiProviders || {};
+    h += `<div class="set-row" style="flex-wrap:wrap;gap:6px">
+        <select id="ai-own-prov" class="pf-input" style="width:200px">
+          ${[['anthropic', 'Anthropic (Claude)'], ['openai', 'OpenAI or compatible'], ['ollama', 'Ollama on this computer']].map(([v, l]) => `<option value="${v}" ${v === ownProv ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+        <input type="password" id="ai-own-key" class="pf-input" style="flex:1;min-width:200px" autocomplete="new-password"
+          placeholder="${pv.key_present ? 'A key is saved. Paste a new one to replace it.' : 'Paste your API key'}">
+        <input id="ai-own-model" class="pf-input" style="width:180px" placeholder="model (optional)" value="${escA((APP_CONFIG && APP_CONFIG.ai && APP_CONFIG.ai.model) || '')}">
+        <button class="set-btn primary" data-on-click='{"f":"saveOwnKey"}'>SAVE</button>
+        <button class="set-btn" id="set-ai-test" data-on-click='{"f":"testAI"}' ${cur === 'none' ? 'disabled' : ''}>TEST</button>
+      </div>
+      <div class="set-row-sub">The key is kept in this computer's password store, never in a file. With your own key the email text goes to that provider.</div>`;
+  } else {
+    h += `<div class="set-row"><div class="set-row-main"><div class="set-row-sub">AI is ${cur === 'none' ? 'off' : 'on'}. With it off, the AI buttons stay visible and bring you here.</div></div>
+      ${cur !== 'none' ? `<button class="set-btn" data-on-click='{"f":"setAIProvider","a":["none"]}'>TURN OFF</button>` : ''}</div>`;
+  }
+  h += `<div id="set-ai-result" class="set-row-sub"></div></div>`;
+
+  h += `<div class="set-sec"><div class="set-sec-lbl">Helper</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">Helper${st.installed === false ? '<span class="set-chip bad">not installed</span>' : (st.enabled ? '<span class="set-chip ok">runs on its own</span>' : '<span class="set-chip">runs when you ask</span>')}</div>
+      <div class="set-row-sub">It reads your new mail and your board, sorts what it can, writes reply drafts and asks you when it is unsure. It never sends anything.${cur === 'none' ? ' With AI off it sorts by rules only.' : ''} ${st.last_run ? 'Last checked ' + esc(fmtTs(st.last_run)) + '.' : 'Not run yet.'}</div>
+    </div>
+    <button class="set-btn primary" id="set-ai-run" data-on-click='{"f":"runAssistantNow"}' ${st.installed === false ? 'disabled' : ''}>Check my inbox and board now</button>
+    </div>
+    <div id="set-ai-run-result" class="set-row-sub" style="${_helperResult.bad ? 'color:var(--c-e06c6c)' : (_helperResult.text ? 'color:var(--c-97dda5)' : '')}">${esc(_helperResult.text || '')}</div>
+    <div class="set-row" style="flex-direction:column;align-items:stretch">
+      <div class="set-row-name" style="margin-bottom:4px">What the helper did<span class="set-chip">${log.length}</span></div>
+      <div class="set-log">${log.length ? log.slice(0, 60).map(r => {
+          const p = r.project_id ? projById(r.project_id) : null;
+          const what = p ? p.name : (r.project_id ? ent('project') : (r.item_type === 'triage' ? 'New mail' : ''));
+          return `<div class="set-log-row">
+          <span class="set-log-ts">${esc(String(r.ts || '').slice(5, 16).replace('T', ' '))}</span>
+          <span class="set-log-outcome o-${escA(r.outcome || '')}">${esc(_OUTCOME_WORDS[r.outcome] || String(r.outcome || '').replace(/_/g, ' '))}</span>
+          <span class="set-log-item">${esc(what)}</span>
+          <span class="set-log-detail">${esc(helperSentence(r.detail))}</span>
+        </div>`; }).join('') : '<div class="set-row-sub">Nothing yet.</div>'}</div>
+    </div>
+  </div>`;
+  return h;
+}
+function pl0(c, one) { return `${c} ${c === 1 ? one : one + 's'}`; }
+async function loadAISettings(force) {
+  if (_aiProviders && !force) return;
+  const get = async (u) => { try { const r = await fetch(u + (u.includes('?') ? '&' : '?') + Date.now()); return r.ok ? await r.json() : null; } catch (e) { return null; } };
+  const [pv, us, lg, st, bl] = await Promise.all([get('/api/ai/providers'), get('/api/ai/usage'), get('/api/assistant/log'), get('/api/assistant/status'), get('/api/ai/balance')]);
+  _aiProviders = pv || {}; _aiUsage = us || {}; _assistantLog = (lg && (lg.log || lg.entries)) || []; _assistantStatus = st || {}; _aiBalance = bl || {};
+  if (_setTab === 'ai') renderSettings();
+}
+async function setAIProvider(prov) {
+  const out = document.getElementById('set-ai-result');
+  try {
+    await putConfig({ ai: { provider: prov } });
+    _aiChoice = null; _aiNote = '';
+    toast(prov === 'none' ? 'AI is off' : 'Email Boss AI is on');
+    await loadAISettings(true); loadHealthBadges();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+// The key rides ONE request to the same endpoint the setup wizard uses
+// (POST /api/setup, force), which stores it in the OS keyring. Everything
+// else in the body is the current config, so nothing else changes.
+async function saveOwnKey() {
+  const out = document.getElementById('set-ai-result');
+  const prov = document.getElementById('ai-own-prov').value;
+  const key = (document.getElementById('ai-own-key').value || '').trim();
+  const model = (document.getElementById('ai-own-model').value || '').trim();
+  if (prov !== 'ollama' && !key && !(_aiProviders && _aiProviders.key_present)) {
+    if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Paste your API key first.'; } return;
+  }
+  const u = (APP_CONFIG && APP_CONFIG.user) || PROF.user || {};
+  const body = { force: true, user: { name: u.name || '', email: u.email || '', aliases: u.aliases || [], company: u.company || '',
+                                      role: u.role || '', internal_domains: u.internal_domains || [] },
+                 profession: (APP_CONFIG && APP_CONFIG.profession && APP_CONFIG.profession.template) || PROF.id || 'general',
+                 ai: Object.assign({ provider: prov, model }, key ? { api_key: key } : {}) };
+  try {
+    const r = await fetch('/api/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) throw new Error(j.error || ('HTTP ' + r.status));
+    document.getElementById('ai-own-key').value = '';
+    const probs = (j.problems || []).filter(x => /AI key/i.test(x));
+    if (out) { out.style.color = probs.length ? 'var(--c-e06c6c)' : 'var(--c-97dda5)'; out.textContent = probs.length ? probs[0] : 'Saved.'; }
+    CFG_STATE = 'init'; await loadAppConfig();
+    _aiChoice = null; _aiNote = '';
+    await loadAISettings(true); loadHealthBadges();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+async function buyCredits(pack) {
+  const out = document.getElementById('set-ai-result');
+  try {
+    const r = await fetch('/api/ai/checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pack }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.url) throw new Error(j.error || ('HTTP ' + r.status));
+    const api = window.pywebview && window.pywebview.api;
+    if (api && typeof api.open_external === 'function') api.open_external(j.url);
+    else window.open(j.url, '_blank', 'noopener');
+    if (out) { out.style.color = ''; out.textContent = 'Checkout opened in your browser. Credits show up here a minute after you pay.'; }
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not open checkout: ' + e.message; } }
+}
+async function testAI() {
+  const out = document.getElementById('set-ai-result'), btn = document.getElementById('set-ai-test');
+  if (btn) { btn.disabled = true; btn.textContent = 'TESTING...'; }
+  try {
+    const r = await fetch('/api/ai/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (out) { out.style.color = (r.ok && j.ok) ? 'var(--c-97dda5)' : 'var(--c-e06c6c)'; out.textContent = (r.ok && j.ok) ? ('Working' + (j.model ? ' (' + j.model + ')' : '') + '.') : ('Not working: ' + (j.error || ('HTTP ' + r.status))); }
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Not working: ' + e.message; } }
+  finally { if (btn) { btn.disabled = false; btn.textContent = 'TEST'; } }
+}
+async function runAssistantNow() {
+  const out = document.getElementById('set-ai-run-result'), btn = document.getElementById('set-ai-run');
+  const label = 'Check my inbox and board now';
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+  if (out) { out.style.color = ''; out.textContent = 'Checking your inbox and board...'; }
+  try {
+    const r = await fetch('/api/assistant/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    _helperResult = { bad: !(r.ok && j.ok),
+      text: (r.ok && j.ok) ? ('Done. ' + helperSentence(j.message || j.summary)) : (r.status === 409 ? 'The helper is already checking. Try again in a minute.' : 'That did not work: ' + (j.error || ('HTTP ' + r.status))) };
+    if (out) { out.style.color = _helperResult.bad ? 'var(--c-e06c6c)' : 'var(--c-97dda5)'; out.textContent = _helperResult.text; }
+    _draftsCache = null;
+    await loadAISettings(true);
+    loadTriageItems(); loadData();
+  } catch (e) { _helperResult = { bad: true, text: 'That did not work: ' + e.message }; if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = _helperResult.text; } }
+  finally { const b = document.getElementById('set-ai-run'); if (b) { b.disabled = false; b.textContent = label; } }
+}
+
+// ── LICENSE TAB ───────────────────────────────────────────────────────────
+let _license = null;
+function renderSettingsLicense() {
+  const l = _license || (HEALTH && HEALTH.license) || {};
+  const st = String(l.status || 'unknown');
+  const good = ['ok', 'valid', 'active', 'grace', 'dev'].includes(st.toLowerCase());
+  const readOnly = _licGate || l.read_only === true || ['unlicensed', 'invalid', 'expired'].includes(st.toLowerCase());
+  const words = { ok: 'Active', valid: 'Active', active: 'Active', grace: 'Active (offline)', dev: 'Developer mode',
+                  unlicensed: 'Not started', invalid: 'Not valid', expired: 'Expired', unknown: 'Checking...' };
+  const email = (PROF.user && PROF.user.email) || (APP_CONFIG && APP_CONFIG.user && APP_CONFIG.user.email) || '';
+  let h = '';
+  if (_licGate || (readOnly && !good)) {
+    h += `<div class="eb-banner show" style="margin-top:10px">Your board is read-only until your trial starts or a license key is entered.</div>`;
+  }
+  h += `<div class="set-sec"><div class="set-sec-lbl">License</div>
+    <div class="set-row"><div class="set-row-main">
+      <div class="set-row-name">${esc(words[st.toLowerCase()] || st)}${l.plan ? `<span class="set-chip ${good ? 'ok' : ''}">${esc(l.plan === 'trial' ? 'free trial' : l.plan)}</span>` : ''}</div>
+      <div class="set-row-sub">${l.message ? esc(l.message) + ' ' : ''}${l.email ? esc(l.email) + ' · ' : ''}${l.expires ? 'ends ' + esc(String(l.expires).slice(0, 10)) : ''}${l.grace_days_left ? ' · ' + l.grace_days_left + ' offline days left' : ''}</div>
+    </div>
+    <button class="set-btn" data-on-click='{"f":"loadLicenseSettings","a":[true]}'>REFRESH</button>
+    ${l.key_present && good ? `<button class="set-btn" data-on-click='{"f":"deactivateLicense"}'>DEACTIVATE</button>` : ''}
+    </div>`;
+  if (!good) {
+    h += `<div class="set-row" style="flex-wrap:wrap"><div class="set-row-main"><div class="set-row-name">Start a free trial</div>
+        <div class="set-row-sub">14 days, no card needed. The key is also emailed to you.</div></div>
+      <input type="email" id="set-trial-email" class="pf-input" style="min-width:220px" value="${escA(email)}" placeholder="you@example.com">
+      <button class="set-btn primary" data-on-click='{"f":"startTrial"}'>Start free trial</button></div>`;
+  }
+  h += `<div class="set-row" style="flex-wrap:wrap">
+      <div class="set-row-main"><div class="set-row-name">${l.key_present ? 'Replace license key' : 'I have a license key'}</div>
+        <div class="set-row-sub">Paste the key from your email.</div></div>
+      <input type="text" id="set-lic-key" class="set-input" placeholder="license key" style="min-width:260px;flex:1" autocomplete="off" spellcheck="false">
+      <button class="set-btn primary" id="set-lic-activate" data-on-click='{"f":"activateLicense"}'>ACTIVATE</button>
+    </div>
+    <div id="set-lic-result" class="set-row-sub"></div>
+  </div>`;
+  return h;
+}
+async function loadLicenseSettings(force) {
+  if (_license && !force) return;
+  try {
+    const r = await fetch('/api/license?' + Date.now());
+    _license = r.ok ? await r.json() : { status: 'unknown', error: 'HTTP ' + r.status };
+  } catch (e) { _license = { status: 'unknown', error: String(e) }; }
+  if (_license && ['ok', 'valid', 'active', 'grace', 'dev'].includes(String(_license.status || '').toLowerCase())) _licGate = false;
+  if (_setTab === 'license') renderSettings();
+}
+async function activateLicense() {
+  const key = ((document.getElementById('set-lic-key') || {}).value || '').trim();
+  const out = document.getElementById('set-lic-result'), btn = document.getElementById('set-lic-activate');
+  if (!key) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Paste a license key first.'; } return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'ACTIVATING...'; }
+  try {
+    const r = await fetch('/api/license/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+    const j = await r.json().catch(() => ({}));
+    const ok = r.ok && j.ok !== false;
+    if (ok) _licGate = false;
+    if (out) { out.style.color = ok ? 'var(--c-97dda5)' : 'var(--c-e06c6c)'; out.textContent = ok ? 'Activated. Thank you!' : ('Activation failed: ' + (j.error || ('HTTP ' + r.status))); }
+    await loadLicenseSettings(true);
+    loadHealthBadges();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Activation failed: ' + e.message; } }
+  finally { const b = document.getElementById('set-lic-activate'); if (b) { b.disabled = false; b.textContent = 'ACTIVATE'; } }
+}
+async function deactivateLicense() {
+  if (!confirm('Deactivate this computer? The seat frees up for another computer.')) return;
+  try {
+    const r = await fetch('/api/license/deactivate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    toast((r.ok && j.ok !== false) ? 'Deactivated' : ('Deactivate failed: ' + (j.error || ('HTTP ' + r.status))));
+  } catch (e) { toast('Deactivate failed: ' + e.message); }
+  loadLicenseSettings(true);
+}
+
+// Refresh cadence is user-controlled now
+let _refreshTimer = null;
+function applyRefreshInterval() {
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  _refreshTimer = null;
+  const secs = parseInt(UI.refreshSec, 10);
+  if (secs > 0) _refreshTimer = setInterval(fullRefresh, secs * 1000);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1.3.0 LAYER: Today view, Decisions, AI surfaces, Drafts, Display modes,
+// license gate, urgency words, keyboard. Every call to an endpoint that may
+// not exist on an older engine degrades: a 404 hides the control or falls
+// back to the previous behavior.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── urgency words ──────────────────────────────────────────────────────────
+// Nearest pending date on a project: the earliest open subtask date, falling
+// back to the project's own follow-up date. null = nothing dated.
+function nearestDue(p) {
+  let best = null;
+  (p.subtasks || []).forEach(s => {
+    if (s.status === 'complete' || !s.follow_up_date) return;
+    const d = daysUntil(s.follow_up_date);
+    if (d !== null && (best === null || d < best)) best = d;
+  });
+  if (best === null && p.follow_up_date) best = daysUntil(p.follow_up_date);
+  return best;
+}
+function dueWord(days, ds) {
+  if (days === null || days === undefined) return 'No date';
+  if (days < 0) return `${-days} day${days === -1 ? '' : 's'} late`;
+  if (days === 0) return 'Due today';
+  if (days === 1) return 'Due tomorrow';
+  const d = ds ? parseLocalDate(ds) : (() => { const x = new Date(); x.setDate(x.getDate() + days); return x; })();
+  if (days < 7) return 'Due ' + d.toLocaleDateString(undefined, { weekday: 'short' });
+  return 'Due ' + d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+function urgencyWordHtml(p, score, rc) {
+  const days = nearestDue(p);
+  const word = dueWord(days);
+  const late = days !== null && days < 0;
+  const bg = late ? 'var(--c-2a1515)' : (rc ? rc.bg : 'var(--c-0c1a2a)');
+  const fg = late ? 'var(--c-f09595)' : (rc ? rc.text : 'var(--c-4fc3f7)');
+  return `<span class="urg-word" title="Urgency score ${Math.round(score)}" style="background:${bg};color:${fg}">${esc(word)}</span>`;
+}
+
+// ── display modes (Settings > Display) ─────────────────────────────────────
+function displayPref(k) {
+  const d = (APP_CONFIG && APP_CONFIG.display) || {};
+  return d[k];
+}
+function applyDisplayModes() {
+  const lightPref = displayPref('light_theme');
+  // Dark monospace stays the default only where the game layer is on.
+  const light = (lightPref === true || lightPref === false) ? lightPref : !feat('game_layer');
+  document.body.classList.toggle('light', !!light);
+  document.body.classList.toggle('plain', !feat('game_layer'));
+  document.body.classList.toggle('large-text', !!displayPref('large_text'));
+  const cs = document.querySelector('meta[name="color-scheme"]');
+  if (cs) cs.content = light ? 'light' : 'dark';
+  const tc = document.querySelector('meta[name="theme-color"]');
+  if (tc) tc.content = light ? '#f4f3ef' : '#0a0a0b';
+}
+function currentOverrides() {
+  const o = (APP_CONFIG && APP_CONFIG.profession && APP_CONFIG.profession.overrides) || {};
+  return JSON.parse(JSON.stringify(o));
+}
+async function putProfessionOverrides(over) {
+  const r = await fetch('/api/profession', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ overrides: over }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+  if (APP_CONFIG) { APP_CONFIG.profession = APP_CONFIG.profession || {}; APP_CONFIG.profession.overrides = over; }
+  PROF_STATE = 'init'; await loadProfession();
+  return j;
+}
+async function putConfig(patch) {
+  const r = await fetch('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+  if (j.config) APP_CONFIG = Object.assign({}, APP_CONFIG || {}, j.config);
+  return j;
+}
+async function setFeature(name, on) {
+  // The profession override is where an explicit Display choice lives; the
+  // config features block is the global switch (off wins), so keep it on.
+  const over = currentOverrides();
+  over.features = Object.assign({}, over.features || {}, { [name]: !!on });
+  try {
+    if (on && APP_CONFIG && APP_CONFIG.features && APP_CONFIG.features[name] === false) await putConfig({ features: { [name]: true } });
+    await putProfessionOverrides(over);
+    applyProfessionChrome(); applyDisplayModes(); _metricsHtml = ''; renderBoard(); renderSettings();
+    toast((on ? 'Showing ' : 'Hiding ') + name.replace('_', ' '));
+  } catch (e) { toast('Could not save: ' + e.message); }
+}
+async function setDisplay(key, val) {
+  try {
+    await putConfig({ display: { [key]: val } });
+    applyDisplayModes(); renderSettings();
+  } catch (e) { toast('Could not save: ' + e.message); }
+}
+function renderSettingsDisplay() {
+  const row = (name, sub, on, oc) => `<div class="set-row"><div class="set-row-main"><div class="set-row-name">${name}</div>
+    <div class="set-row-sub">${sub}</div></div>${_chk(on, oc)}</div>`;
+  const lp = displayPref('light_theme');
+  const lightOn = (lp === true || lp === false) ? lp : !feat('game_layer');
+  let h = `<div class="set-sec"><div class="set-sec-lbl">What to show</div>`;
+  h += row('Money', 'Amounts, quotes, pipeline and won totals.', feat('money'), EH(null, EK('setFeature', 'money', $C)));
+  h += row('Game layer', 'Health bars, levels, sounds and effects.', feat('game_layer'), EH(null, EK('setFeature', 'game_layer', $C)));
+  h += row('Analytics', 'The email analytics view.', feat('analytics'), EH(null, EK('setFeature', 'analytics', $C)));
+  h += `</div><div class="set-sec"><div class="set-sec-lbl">Look</div>`;
+  h += row('Large text', 'Bigger, easier to read text everywhere.', !!displayPref('large_text'), EH(null, EK('setDisplay', 'large_text', $C)));
+  h += row('Light theme', 'Dark text on a light background.', lightOn, EH(null, EK('setDisplay', 'light_theme', $C)));
+  h += `</div>`;
+  return h;
+}
+
+// ── timezone + business hours (Settings > General) ─────────────────────────
+function tzOptions(cur) {
+  let zones = [];
+  try { if (Intl.supportedValuesOf) zones = Intl.supportedValuesOf('timeZone'); } catch (e) {}
+  const browser = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; } })();
+  if (!zones.length) zones = [browser || 'UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'Europe/London', 'UTC'];
+  if (cur && !zones.includes(cur)) zones = [cur].concat(zones);
+  return zones.map(z => `<option value="${escA(z)}" ${z === cur ? 'selected' : ''}>${esc(z.replace(/_/g, ' '))}${z === browser ? ' (this computer)' : ''}</option>`).join('');
+}
+function renderHoursSection() {
+  const bh = PROF.business_hours || {};
+  const tz = (APP_CONFIG && APP_CONFIG.timezone) || bh.tz || (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { return ''; } })();
+  const always = (bh.start === 0 && bh.end === 24 && (bh.days || []).length === 7);
+  const dayN = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const days = bh.days || [0, 1, 2, 3, 4];
+  const hrOpts = (sel) => Array.from({ length: 25 }, (_, i) => `<option value="${i}" ${i === sel ? 'selected' : ''}>${i === 0 ? '12 am' : i < 12 ? i + ' am' : i === 12 ? '12 pm' : i === 24 ? 'midnight' : (i - 12) + ' pm'}</option>`).join('');
+  return `<div class="set-sec"><div class="set-sec-lbl">Time zone and working hours</div>
+    <div class="set-row"><div class="set-row-main"><div class="set-row-name">Time zone</div>
+      <div class="set-row-sub">Used for "due today", reply clocks and the helper's schedule.</div></div>
+      <select id="set-tz" class="pf-input" style="max-width:240px">${tzOptions(tz)}</select></div>
+    <div class="set-row"><div class="set-row-main"><div class="set-row-name">Working hours</div>
+      <div class="set-row-sub">Reply-by clocks only count these hours.</div></div>
+      <label class="set-row-sub" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="set-247" ${always ? 'checked' : ''} data-on-change='{"f":"hoursBox","a":[{"$":"checked"}]}'>Always (24x7)</label></div>
+    <div class="set-row" id="set-hours-box" style="display:${always ? 'none' : 'flex'};flex-wrap:wrap;gap:6px">
+      <select id="set-h-start" class="pf-input" style="width:90px">${hrOpts(bh.start != null ? bh.start : 8)}</select> to
+      <select id="set-h-end" class="pf-input" style="width:100px">${hrOpts(bh.end != null ? bh.end : 17)}</select>
+      ${dayN.map((n, i) => `<label class="set-row-sub" style="display:flex;align-items:center;gap:2px"><input type="checkbox" class="set-h-day" value="${i}" ${days.includes(i) ? 'checked' : ''}>${n}</label>`).join('')}
+    </div>
+    <div class="set-row"><div class="set-row-main"></div><button class="set-btn primary" data-on-click='{"f":"saveHours"}'>SAVE</button></div>
+    <div id="set-hours-result" class="set-row-sub"></div>
+  </div>`;
+}
+async function saveHours() {
+  const out = document.getElementById('set-hours-result');
+  const tz = document.getElementById('set-tz').value;
+  const always = document.getElementById('set-247').checked;
+  let bh;
+  if (always) bh = { tz, start: 0, end: 24, days: [0, 1, 2, 3, 4, 5, 6] };
+  else {
+    const start = parseInt(document.getElementById('set-h-start').value, 10);
+    const end = parseInt(document.getElementById('set-h-end').value, 10);
+    const days = [...document.querySelectorAll('.set-h-day:checked')].map(x => parseInt(x.value, 10));
+    if (!(end > start) || !days.length) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Pick an end time after the start time and at least one day.'; } return; }
+    bh = { tz, start, end, days };
+  }
+  try {
+    await putConfig({ timezone: tz });
+    const over = currentOverrides();
+    over.business_hours = bh;
+    await putProfessionOverrides(over);
+    if (out) { out.style.color = 'var(--c-97dda5)'; out.textContent = 'Saved.'; }
+    renderBoard();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+
+// ── Settings > Fields: add a custom field without JSON ─────────────────────
+function renderSettingsFields() {
+  const fs = Array.isArray(PROF.fields) ? PROF.fields : [];
+  const tl = { text: 'Text', date: 'Date', money: 'Money', enum: 'Pick from a list', id: 'Reference', url: 'Link' };
+  let h = `<div class="set-sec"><div class="set-sec-lbl">Fields on each ${esc(ent('project').toLowerCase())}</div>`;
+  h += fs.length ? fs.map(f => `<div class="set-row"><div class="set-row-main"><div class="set-row-name">${esc(f.label || f.key)}</div>
+      <div class="set-row-sub">${esc(tl[f.type] || f.type || 'Text')}${(f.show_on || []).includes('card') ? ' · shown on the card' : ''}</div></div>
+      ${f.custom ? `<button class="set-btn" data-on-click="${EH(null, EK('removeCustomField', String(f.key)))}">REMOVE</button>` : ''}</div>`).join('')
+    : '<div class="set-row-sub">No fields yet.</div>';
+  h += `</div><div class="set-sec"><div class="set-sec-lbl">Add a field</div>
+    <div class="set-row" style="flex-wrap:wrap;gap:6px">
+      <input class="pf-input" id="cf-label" placeholder="Name, for example: Hearing date" style="flex:2;min-width:180px">
+      <select class="pf-input" id="cf-type" style="width:150px" data-on-change='{"f":"cfOpts","a":[{"$":"value"}]}'>
+        <option value="text">Text</option><option value="date">Date</option>${showMoney() ? '<option value="money">Money</option>' : ''}<option value="select">Pick from a list</option>
+      </select>
+      <label class="set-row-sub" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="cf-card" checked>Show on the card</label>
+    </div>
+    <input class="pf-input" id="cf-opts" placeholder="Choices, separated by commas" style="display:none;width:100%;margin-top:4px">
+    <div class="set-row"><div class="set-row-main"></div><button class="set-btn primary" data-on-click='{"f":"addCustomField"}'>ADD FIELD</button></div>
+    <div id="cf-result" class="set-row-sub"></div>
+  </div>`;
+  return h;
+}
+function _slugKey(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40); }
+async function addCustomField() {
+  const out = document.getElementById('cf-result');
+  const label = (document.getElementById('cf-label').value || '').trim();
+  const type = document.getElementById('cf-type').value;
+  const onCard = document.getElementById('cf-card').checked;
+  if (!label) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Give the field a name.'; } return; }
+  let key = _slugKey(label) || 'field';
+  const fs = (Array.isArray(PROF.fields) ? PROF.fields : []).map(f => Object.assign({}, f));
+  while (fs.some(f => f.key === key)) key += '_2';
+  const f = { key, label, type: type === 'select' ? 'enum' : type, group: 'Custom', source: 'key_details', custom: true,
+              show_on: onCard ? ['card', 'drawer', 'list'] : ['drawer'] };
+  if (type === 'select') {
+    f.options = (document.getElementById('cf-opts').value || '').split(',').map(x => x.trim()).filter(Boolean)
+      .map(x => ({ id: _slugKey(x) || x, label: x }));
+    if (!f.options.length) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Add at least one choice.'; } return; }
+  }
+  const over = currentOverrides();
+  over.fields = fs.concat([f]);   // lists replace wholesale in the merge, so send the whole list
+  try { await putProfessionOverrides(over); toast('Field added: ' + label); renderSettings(); if (openProjectId) renderPanel(openProjectId, { force: true }); }
+  catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not save: ' + e.message; } }
+}
+async function removeCustomField(key) {
+  const f = (PROF.fields || []).find(x => x.key === key);
+  if (!f || !confirm(`Remove the field "${f.label || key}"? Values already typed stay in the data.`)) return;
+  const over = currentOverrides();
+  over.fields = (PROF.fields || []).filter(x => x.key !== key);
+  try { await putProfessionOverrides(over); renderSettings(); } catch (e) { toast('Could not save: ' + e.message); }
+}
+
+// ── Mark won / lost (drawer) ───────────────────────────────────────────────
+function wonLostButtons(p) {
+  const wid = projectWorkflowId(p);
+  const won = stageWithRole('won', wid, true);
+  const lost = stageWithRole('closed', wid, true);
+  if (!won && !lost) return '';
+  const r = projRole(p);
+  return `${won && r !== 'won' ? `<button class="eb-btn" data-on-click="${EH(null, EK('changeStatus', String(p.id), String(won)))}">Mark won</button>` : ''}
+          ${lost && r !== 'closed' ? `<button class="eb-btn" data-on-click="${EH(null, EK('confirmLost', p.id, lost, stageLabel(lost)))}">Mark lost</button>` : ''}`;
+}
+function drawerActionsHtml(p) {
+  return `<div class="panel-section"><div class="panel-label">Quick actions</div>
+    <div class="eb-ai-row">
+      <button class="eb-btn" data-on-click="${EH(null, EK('aiDraftReply', String(p.id)))}">Write a reply for me</button>
+      <button class="eb-btn" data-on-click="${EH(null, EK('aiFollowUp', String(p.id)))}">Write a follow-up</button>
+      <button class="eb-btn" data-on-click="${EH(null, EK('aiStatus', String(p.id)))}">What's the status?</button>
+      ${wonLostButtons(p)}
+    </div></div>`;
+}
+
+// ── AI surfaces ────────────────────────────────────────────────────────────
+// State: 'off' (provider none), 'nocredits' (built-in wallet empty), 'on'.
+function aiState() {
+  const prov = (HEALTH && HEALTH.ai && HEALTH.ai.provider) || (APP_CONFIG && APP_CONFIG.ai && APP_CONFIG.ai.provider) || 'none';
+  if (!prov || prov === 'none') return 'off';
+  if (HEALTH && HEALTH.ai && (HEALTH.ai.credits_exhausted || HEALTH.ai.balance === 0)) return 'nocredits';
+  return 'on';
+}
+let _aiNote = '';
+function aiGate(state) {
+  _aiNote = state === 'nocredits' ? 'Out of AI credits. Buy credits to keep using Email Boss AI.' : 'Turn on Email Boss AI to use this button.';
+  openSettings('ai');
+}
+// POST/GET an AI endpoint. Returns the JSON, or null after routing the user
+// to Settings > AI when AI is off / out of credits.
+async function aiFetch(url, body, method) {
+  const st = aiState();
+  if (st !== 'on') { aiGate(st); return null; }
+  showAiPanel({ title: 'Working on it...', text: '', busy: true });
+  let r, j;
+  try {
+    r = await fetch(url, method === 'GET' ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { showAiPanel({ title: 'Could not reach Email Boss', text: String(e.message || e) }); return null; }
+  const err = String((j && (j.error || j.message)) || '');
+  if (r.status === 503 || /offline|turned off/i.test(err)) { closeAiPanel(); aiGate('off'); return null; }
+  if (r.status === 402 && j.error !== 'license_required' || /credit/i.test(err)) { closeAiPanel(); aiGate('nocredits'); return null; }
+  if (r.status === 402) { closeAiPanel(); return null; }
+  if (!r.ok || j.ok === false) { showAiPanel({ title: 'That did not work', text: err || ('HTTP ' + r.status) }); return null; }
+  return j;
+}
+function projById(id) { return ((DATA && DATA.projects) || []).find(x => x.id === id) || null; }
+async function lastInbound(pid) {
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(pid)}/correspondence`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const items = (d.correspondence || []).filter(c => c.direction !== 'outbound');
+    return items.length ? items[items.length - 1] : null;
+  } catch (e) { return null; }
+}
+async function aiDraftReply(pid) {
+  const p = projById(pid);
+  if (aiState() !== 'on') { aiGate(aiState()); return; }
+  const m = await lastInbound(pid);
+  const body = { project_id: pid };
+  if (m) Object.assign(body, { subject: m.subject || '', body: htmlToText(m.body_html || m.body_preview || '', !!m.body_html),
+                               from_name: m.from_name || '', from_email: m.from_email || '' });
+  const j = await aiFetch('/api/ai/draft-reply', body);
+  if (!j) return;
+  const to = (m && m.from_email) || (((p && p.contacts) || [])[0] || {}).email || '';
+  const subj = m && m.subject ? (/^re:/i.test(m.subject) ? m.subject : 'Re: ' + m.subject) : (p ? p.name : '');
+  showAiPanel({ title: 'Reply draft', text: j.draft || '', editable: true, draft: { project_id: pid, to, subject: subj } });
+}
+async function aiFollowUp(pid) {
+  const p = projById(pid);
+  const j = await aiFetch('/api/ai/draft-follow-up', { project_id: pid });
+  if (!j) return;
+  const to = (((p && p.contacts) || [])[0] || {}).email || '';
+  showAiPanel({ title: 'Follow-up draft', text: j.draft || '', editable: true,
+                draft: { project_id: pid, to, subject: 'Following up: ' + (p ? p.name : '') } });
+}
+async function aiStatus(pid) {
+  const j = await aiFetch('/api/ai/project-health', { project_id: pid });
+  if (!j) return;
+  const a = j.assessment || {};
+  const text = [a.health ? 'Status: ' + a.health : '', a.recommendation ? 'Next step: ' + a.recommendation : '', a.reason || '']
+    .filter(Boolean).join('\n\n');
+  showAiPanel({ title: "What's the status?", text: text || 'No assessment came back.' });
+}
+async function aiTriageReply(tid) {
+  const it = (TRIAGE_ITEMS || []).find(x => x.triage_id === tid);
+  if (!it) return;
+  const pid = it.matched_project && !String(it.matched_project).startsWith('__') ? it.matched_project : '';
+  const j = await aiFetch('/api/ai/draft-reply', { project_id: pid || undefined, subject: it.subject || '',
+    body: htmlToText(it.body_raw || it.body_preview || '', /<[a-z]/i.test(it.body_raw || '')), from_name: it.from_name || '', from_email: it.from_email || '' });
+  if (!j) return;
+  const subj = it.subject ? (/^re:/i.test(it.subject) ? it.subject : 'Re: ' + it.subject) : '';
+  showAiPanel({ title: 'Reply draft', text: j.draft || '', editable: true, draft: { project_id: pid, to: it.from_email || '', subject: subj } });
+}
+async function aiWeeklyDigest() {
+  const j = await aiFetch('/api/ai/weekly-digest', {}, 'POST');
+  if (!j) return;
+  showAiPanel({ title: 'Your week', text: j.text || j.digest || '', items: j.items || [],
+                draft: { project_id: '', to: (PROF.user && PROF.user.email) || '', subject: 'My week' } });
+}
+let _askMode = false;
+function toggleAskMode() {
+  _askMode = !_askMode;
+  const b = document.getElementById('ask-toggle'), sb = document.getElementById('search');
+  if (b) b.classList.toggle('active', _askMode);
+  if (sb) {
+    if (_askMode) sb.placeholder = 'Ask, for example: what is waiting on a reply? (press Enter)';
+    else applyProfessionChrome();   // restores the normal search placeholder
+    sb.focus();
+  }
+}
+async function aiAsk(q) {
+  q = (q || '').trim();
+  if (!q) return;
+  // Ask works without AI too: the engine falls back to a plain name filter.
+  showAiPanel({ title: 'Looking...', text: '', busy: true });
+  try {
+    const r = await fetch('/api/ai/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { showAiPanel({ title: 'That did not work', text: j.error || ('HTTP ' + r.status) }); return; }
+    const items = j.items || (j.results || []).map(p => ({ project_id: p.id, label: p.name, detail: p.location || '' }));
+    const text = j.text || (items.length ? `Found ${items.length}.` : 'Nothing matched.');
+    showAiPanel({ title: q, text, items });
+  } catch (e) { showAiPanel({ title: 'That did not work', text: String(e.message || e) }); }
+}
+
+let _aiPanelState = null;
+function showAiPanel(st) {
+  _aiPanelState = st;
+  const m = document.getElementById('ai-modal');
+  if (!m) return;
+  const items = Array.isArray(st.items) ? st.items : [];
+  m.innerHTML = `<h3>${esc(st.title || '')}</h3>
+    ${st.busy ? '<div class="sub">One moment.</div>' : ''}
+    ${st.draft && st.draft.to ? `<div class="sub">To: ${esc(st.draft.to)}${st.draft.subject ? ' · ' + esc(st.draft.subject) : ''}</div>` : ''}
+    ${st.busy ? '' : (st.editable ? `<textarea class="eb-textarea" id="ai-text">${esc(st.text || '')}</textarea>`
+                                   : `<div class="eb-note" style="white-space:pre-wrap;color:var(--t1)">${esc(st.text || '')}</div>`)}
+    ${items.length ? `<div style="margin-top:8px">${items.map(it => {
+        const pid = it.project_id || it.id || '';
+        return `<div class="today-row" ${pid ? `data-on-click="${EH(null, EK('closeAiPanel'), EK('openPanel', pid))}"` : ''}><div class="what"><div class="t">${esc(it.label || it.name || it.text || '')}</div>${it.detail ? `<div class="s">${esc(it.detail)}</div>` : ''}</div></div>`;
+      }).join('')}</div>` : ''}
+    <div class="eb-row">
+      ${st.busy ? '' : `<button class="eb-btn" data-on-click='{"f":"aiCopy"}'>Copy</button>`}
+      ${!st.busy && st.draft ? `<button class="eb-btn primary" data-on-click='{"f":"aiSaveDraft"}'>Save as draft</button>` : ''}
+      <button class="eb-btn" data-on-click='{"f":"closeAiPanel"}'>Close</button>
+    </div>
+    ${st.draft ? '<div class="eb-note">Nothing is sent. A saved draft waits in the Drafts tab.</div>' : ''}
+    <div class="eb-note" id="ai-note"></div>`;
+  document.getElementById('ai-overlay').classList.add('open');
+}
+function closeAiPanel() { const o = document.getElementById('ai-overlay'); if (o) o.classList.remove('open'); _aiPanelState = null; }
+function _aiText() { const t = document.getElementById('ai-text'); return t ? t.value : ((_aiPanelState && _aiPanelState.text) || ''); }
+async function copyText(txt) {
+  try { await navigator.clipboard.writeText(txt); return true; }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select();
+    let ok = false; try { ok = document.execCommand('copy'); } catch (e2) {}
+    ta.remove(); return ok;
+  }
+}
+async function aiCopy() { toast((await copyText(_aiText())) ? 'Copied' : 'Could not copy'); }
+async function aiSaveDraft() {
+  const st = _aiPanelState; if (!st || !st.draft) return;
+  const note = document.getElementById('ai-note');
+  try {
+    const r = await fetch('/api/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: st.draft.project_id || '', to: st.draft.to || '', subject: st.draft.subject || '', body: _aiText(), created_by: 'user' }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+    closeAiPanel(); toast('Saved to Drafts'); _draftsCache = null;
+    if (currentView === 'drafts') renderDrafts();
+  } catch (e) { if (note) { note.className = 'eb-note bad'; note.textContent = 'Could not save: ' + e.message; } }
+}
+
+// ── Drafts tab ─────────────────────────────────────────────────────────────
+let _draftsCache = null, _draftFocus = null;
+async function renderDrafts() {
+  const el = document.getElementById('drafts-view');
+  if (!el) return;
+  if (!_draftsCache) {
+    el.innerHTML = '<div class="today-empty">Loading drafts...</div>';
+    try {
+      const r = await fetch('/api/drafts');
+      const j = r.ok ? await r.json() : {};
+      _draftsCache = Array.isArray(j.drafts) ? j.drafts : [];
+    } catch (e) { _draftsCache = []; }
+  }
+  const ds = _draftsCache;
+  const pname = id => { const p = projById(id); return p ? p.name : ''; };
+  el.innerHTML = `<div class="today-sec"><div class="today-sec-h">Drafts <span class="n">${ds.length}</span><span class="sp"></span>
+      <button class="eb-btn" data-on-click='{"f":"refreshDrafts"}'>Refresh</button></div>
+    ${ds.length ? ds.map(d => `<div class="draft-row" id="draft-${escA(d.id)}" ${_draftFocus === d.id ? 'style="outline:2px solid var(--c-4fc3f7)"' : ''}>
+        <div class="subj">${esc(d.subject || '(no subject)')}</div>
+        <div class="to">To: ${esc(d.to || 'nobody yet')}${d.project_id && pname(d.project_id) ? ' · ' + esc(pname(d.project_id)) : ''}${d.created_by === 'assistant' ? ' · written by the helper' : ''}</div>
+        <div class="pv">${esc(String(d.body || '').slice(0, 400))}</div>
+        <div class="eb-row">
+          <button class="eb-btn" data-on-click="${EH(null, EK('copyDraft', String(d.id)))}">Copy</button>
+          ${mailClientOn() ? `<button class="eb-btn" data-on-click="${EH(null, EK('openDraftInMail', String(d.id)))}">Open in my mail</button>` : ''}
+          ${d.project_id && pname(d.project_id) ? `<button class="eb-btn" data-on-click="${EH(null, EK('openPanel', String(d.project_id)))}">Open ${esc(ent('project').toLowerCase())}</button>` : ''}
+          <button class="eb-btn" data-on-click="${EH(null, EK('deleteDraft', String(d.id)))}">Delete</button>
+        </div></div>`).join('')
+      : '<div class="today-empty">No drafts. Drafts written for you show up here; nothing is ever sent without you.</div>'}
+  </div>`;
+  if (_draftFocus) { const x = document.getElementById('draft-' + _draftFocus); if (x) x.scrollIntoView({ block: 'center' }); }
+}
+function _draft(id) { return (_draftsCache || []).find(d => d.id === id); }
+async function copyDraft(id) {
+  const d = _draft(id); if (!d) return;
+  const txt = (d.to ? 'To: ' + d.to + '\n' : '') + (d.subject ? 'Subject: ' + d.subject + '\n\n' : '') + (d.body || '');
+  toast((await copyText(txt)) ? 'Copied' : 'Could not copy');
+}
+function openDraftInMail(id) {
+  const d = _draft(id); if (!d || !window.PBMail) return;
+  setView('mail');
+  const html = esc(String(d.body || '')).replace(/\r?\n/g, '<br>');
+  setTimeout(() => PBMail.compose({ to: d.to || '', cc: d.cc || '', subject: d.subject || '', body_html: html, project_id: d.project_id || '' }), 200);
+}
+async function deleteDraft(id) {
+  const d = _draft(id);
+  if (!confirm(`Delete the draft "${(d && d.subject) || 'untitled'}"?`)) return;
+  try {
+    const r = await fetch(`/api/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    _draftsCache = (_draftsCache || []).filter(x => x.id !== id);
+    renderDrafts(); toast('Draft deleted');
+  } catch (e) { toast('Could not delete: ' + e.message); }
+}
+function openDraft(id) { _draftFocus = id || null; _draftsCache = null; setView('drafts'); }
+
+// ── Decisions modal ────────────────────────────────────────────────────────
+let _openQList = [];
+let _dec = { list: [], i: 0, other: false, done: null };
+function updateDecisionsBadge() {
+  const b = document.getElementById('decisions-badge');
+  if (!b) return;
+  const n = _openQList.length;
+  b.textContent = String(n);
+  b.style.display = n ? 'inline-block' : 'none';
+}
+async function openDecisions(qid) {
+  await loadOpenQuestions();
+  _dec = { list: _openQList.slice(), i: 0, other: false, done: null };
+  if (qid) { const k = _dec.list.findIndex(q => q.id === qid); if (k >= 0) _dec.i = k; }
+  document.getElementById('dec-overlay').classList.add('open');
+  renderDecision();
+}
+function closeDecisions() {
+  document.getElementById('dec-overlay').classList.remove('open');
+  _tabStripSig = null; renderBoard();
+}
+function renderDecision() {
+  const m = document.getElementById('dec-modal');
+  if (!m) return;
+  if (_dec.done) {
+    m.innerHTML = `<h3>Draft ready</h3><div class="sub">Your answer was turned into a draft. Nothing has been sent.</div>
+      <div class="eb-row"><button class="eb-btn primary" data-on-click="${EH(null, EK('closeDecisions'), EK('openDraft', _dec.done))}">Open draft</button>
+      <button class="eb-btn" data-on-click='{"f":"decUndo"}'>${_dec.i < _dec.list.length ? 'Next question' : 'Done'}</button></div>`;
+    return;
+  }
+  const q = _dec.list[_dec.i];
+  if (!q) {
+    m.innerHTML = `<h3>Decisions for you</h3><div class="sub">${_dec.list.length ? 'That was the last one.' : 'Nothing needs your decision right now.'}</div>
+      <div class="eb-row"><button class="eb-btn primary" data-on-click='{"f":"closeDecisions"}'>Close</button></div>`;
+    return;
+  }
+  const p = projById(q.project_id);
+  const opts = (q.options || []).slice(0, 4).map(o => typeof o === 'string' ? { label: o } : o);
+  m.innerHTML = `<h3>Decisions for you</h3>
+    <div class="sub">${_dec.i + 1} of ${_dec.list.length}${p ? ' · ' + esc(p.name) : ''}</div>
+    <div class="q">${esc(q.question || '')}</div>
+    ${q.evidence ? `<div class="ev">${esc(q.evidence)}</div>` : ''}
+    ${opts.map((o, k) => {
+      const rec = q.recommend && o.label && String(q.recommend).toLowerCase().startsWith(String(o.label).toLowerCase());
+      return `<button class="eb-opt" data-on-click="${EH(null, EK('decAnswer', k))}"><span class="k">${k + 1}</span><span>${esc(o.label || '')}${rec ? ' (suggested)' : ''}${o.detail ? `<span class="d">${esc(o.detail)}</span>` : ''}</span></button>`;
+    }).join('')}
+    ${_dec.other ? `<textarea class="eb-input" id="dec-other" rows="3" placeholder="Type your answer"></textarea>
+       <div class="eb-row"><button class="eb-btn primary" data-on-click='{"f":"decAnswerText"}'>Send answer</button><button class="eb-btn" data-on-click='{"f":"decBack"}'>Back</button></div>`
+      : `<button class="eb-opt" data-on-click='{"f":"decOther"}'><span class="k">...</span><span>Something else...</span></button>`}
+    <div class="eb-row"><button class="eb-btn" data-on-click='{"f":"decSkip"}'>Skip</button><button class="eb-btn" data-on-click='{"f":"closeDecisions"}'>Close</button>
+      <span class="eb-note" style="margin:0">Keys 1 to ${Math.max(1, opts.length)} answer, Esc closes.</span></div>
+    <div class="eb-note" id="dec-note"></div>`;
+}
+function decSkip() { _dec.other = false; _dec.i++; renderDecision(); }
+function decAnswer(k) {
+  const q = _dec.list[_dec.i]; if (!q) return;
+  const o = (q.options || [])[k]; if (o === undefined) return;
+  submitDecision(q, typeof o === 'string' ? o : (o.label || ''));
+}
+function decAnswerText() {
+  const t = document.getElementById('dec-other');
+  const v = t ? t.value.trim() : '';
+  const q = _dec.list[_dec.i];
+  if (q && v) submitDecision(q, v);
+}
+async function submitDecision(q, answer) {
+  const note = document.getElementById('dec-note');
+  if (note) { note.className = 'eb-note'; note.textContent = 'Saving...'; }
+  let j = null;
+  try {
+    let r = await fetch(`/api/questions/${encodeURIComponent(q.id)}/answer`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer }) });
+    if (r.status === 404 || r.status === 405) {
+      // Older engine: record the answer the old way (no draft).
+      r = await fetch(`/api/questions/${encodeURIComponent(q.id)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'answered', answer }) });
+    }
+    j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  } catch (e) { if (note) { note.className = 'eb-note bad'; note.textContent = 'Could not save: ' + e.message; } return; }
+  _dec.other = false; _dec.i++;
+  _openQList = _openQList.filter(x => x.id !== q.id); updateDecisionsBadge();
+  if (j && j.drafted && j.draft_id) { _dec.done = j.draft_id; _draftsCache = null; }
+  else toast('Answer saved');
+  renderDecision();
+  loadOpenQuestions().then(() => { if (openProjectId === q.project_id) loadQuestions(q.project_id); });
+}
+
+// ── Today view ─────────────────────────────────────────────────────────────
+function _todayRow(p, text, days, ds) {
+  const w = dueWord(days, ds);
+  return `<div class="today-row" data-pid="${escA(p.id)}" data-on-click="${EH(null, EK('openPanel', String(p.id)))}">
+    <div class="what"><div class="t">${esc(p.name)}</div><div class="s">${esc(text || '')}</div></div>
+    <div class="when ${days !== null && days < 0 ? 'late' : ''}">${esc(w)}</div></div>`;
+}
+function renderToday() {
+  const el = document.getElementById('today-view');
+  if (!el || !DATA) return;
+  const live = (DATA.projects || []).filter(p => !p.archived && !isClosedStage(p.status, projectWorkflowId(p)) && !isMutedStatus(p.status, projectWorkflowId(p)));
+  const reply = [], nudge = [], overdue = [];
+  live.forEach(p => {
+    (p.subtasks || []).filter(s => s.status !== 'complete').forEach(s => {
+      const days = s.follow_up_date ? daysUntil(s.follow_up_date) : null;
+      const item = { p, s, days };
+      if (days !== null && days < 0) overdue.push(item);
+      else if (s.date_type === 'sla' || s.sla_type === 'response') reply.push(item);
+      else if (days === 0) nudge.push(item);
+    });
+  });
+  overdue.sort((a, b) => a.days - b.days);
+  const pending = (TRIAGE_ITEMS || []).filter(i => i.status === 'pending').length;
+  const sec = (title, rows, empty, extra) => `<div class="today-sec"><div class="today-sec-h">${title} <span class="n">${rows.length}</span><span class="sp"></span>${extra || ''}</div>
+    ${rows.length ? rows.join('') : `<div class="today-empty">${empty}</div>`}</div>`;
+  let h = '';
+  h += sec('Reply today', reply.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'No one is waiting on a reply.');
+  h += sec('Nudge today', nudge.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'No follow-ups due today.');
+  h += sec('Decisions for you', _openQList.map(q => {
+      const p = projById(q.project_id);
+      return `<div class="today-row" data-on-click="${EH(null, EK('openDecisions', String(q.id)))}"><div class="what"><div class="t">${esc(q.question || '')}</div>
+        <div class="s">${p ? esc(p.name) : ''}</div></div><div class="when">Answer</div></div>`;
+    }), 'Nothing needs your decision.', _openQList.length ? `<button class="eb-btn primary" data-on-click='{"f":"openDecisions","sp":1}'>Start</button>` : '');
+  h += `<div class="today-sec"><div class="today-sec-h">New mail to sort <span class="n">${pending}</span><span class="sp"></span>
+      ${pending ? `<button class="eb-btn primary" data-on-click='{"f":"focusTriage"}'>Sort mail</button>` : ''}</div>
+    <div class="today-empty">${pending ? `${pending} new email${pending === 1 ? '' : 's'} to add to the board or set aside.` : 'All sorted.'}</div></div>`;
+  h += sec('Overdue', overdue.map(x => _todayRow(x.p, x.s.text, x.days, x.s.follow_up_date)), 'Nothing is late.');
+  el.innerHTML = h;
+}
+function focusTriage() {
+  const panel = document.getElementById('triage-panel');
+  if (!panel) return;
+  panel.style.display = 'flex';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const first = panel.querySelector('.triage-card');
+  if (first) { _kbSel = { kind: 'triage', el: first }; markKbSel(); }
+}
+
+// ── License gate (any 402 license_required) ────────────────────────────────
+let _licGate = false;
+window.ebLicenseGate = function (j) {
+  if (_licGate && document.getElementById('set-overlay').classList.contains('open') && _setTab === 'license') return;
+  _licGate = true;
+  // The 402 body carries the license status that caused it; show that.
+  _license = Object.assign({ status: 'unlicensed', read_only: true }, (j && j.license) || {});
+  openSettings('license');
+};
+async function startTrial() {
+  const out = document.getElementById('set-lic-result');
+  const inp = document.getElementById('set-trial-email');
+  const email = ((inp && inp.value) || (PROF.user && PROF.user.email) || (APP_CONFIG && APP_CONFIG.user && APP_CONFIG.user.email) || '').trim();
+  if (!email) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Enter your email address first.'; } return; }
+  if (out) { out.style.color = ''; out.textContent = 'Starting your free trial...'; }
+  try {
+    const r = await fetch('/api/license/trial', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+    _licGate = false;
+    if (out) { out.style.color = 'var(--c-97dda5)'; out.textContent = 'Your free trial has started. The key is also in your email.'; }
+    await loadLicenseSettings(true); loadHealthBadges();
+  } catch (e) { if (out) { out.style.color = 'var(--c-e06c6c)'; out.textContent = 'Could not start the trial: ' + e.message; } }
+}
+
+// ── header: mail banner + decisions badge ──────────────────────────────────
+function renderMailBanner() {
+  const el = document.getElementById('mail-banner');
+  if (!el) return;
+  const m = (HEALTH && HEALTH.mail) || {};
+  const prov = m.provider || (APP_CONFIG && APP_CONFIG.mail && APP_CONFIG.mail.provider) || 'none';
+  let msg = '';
+  if (!prov || prov === 'none') msg = 'Mail not connected. Email Boss cannot see new mail yet.';
+  else if (m.ok === false || m.error) msg = 'Mail not connected right now' + (m.error ? ': ' + String(m.error).slice(0, 120) : '.');
+  el.classList.toggle('show', !!msg);
+  el.innerHTML = msg ? `<span>${esc(msg)}</span><a data-on-click='{"f":"openSettings","a":["mail"]}'>Connect mail in Settings</a>` : '';
+}
+
+// ── keyboard: j/k move, a/n/h triage, e open, ? cheat sheet ────────────────
+let _kbSel = null;   // { kind: 'triage' | 'row', el }
+function _kbItems() {
+  const tri = [...document.querySelectorAll('#triage-content .triage-card[id^="triage-"]')];
+  let rows = [];
+  if (currentView === 'today') rows = [...document.querySelectorAll('#today-view .today-row')];
+  else if (currentView === 'list') rows = [...document.querySelectorAll('#list-view .list-row[data-id]')];
+  else if (currentView === 'kanban') rows = [...document.querySelectorAll('#board .card[data-id]')];
+  if (_kbSel && _kbSel.kind === 'triage') return { kind: 'triage', items: tri };
+  return rows.length ? { kind: 'row', items: rows } : { kind: 'triage', items: tri };
+}
+function markKbSel() {
+  document.querySelectorAll('.kb-sel').forEach(x => x.classList.remove('kb-sel'));
+  if (_kbSel && _kbSel.el && document.body.contains(_kbSel.el)) {
+    _kbSel.el.classList.add('kb-sel');
+    _kbSel.el.scrollIntoView({ block: 'nearest' });
+  }
+}
+function kbMove(step) {
+  const { kind, items } = _kbItems();
+  if (!items.length) return;
+  let i = _kbSel && _kbSel.el ? items.indexOf(_kbSel.el) : -1;
+  if (i < 0 && _kbSel && _kbSel.el && _kbSel.el.id) i = items.findIndex(x => x.id === _kbSel.el.id);
+  i = Math.max(0, Math.min(items.length - 1, i + step));
+  if (i < 0) i = 0;
+  _kbSel = { kind, el: items[i] };
+  markKbSel();
+}
+function _kbTriageId() {
+  if (!_kbSel || _kbSel.kind !== 'triage' || !_kbSel.el) {
+    const first = document.querySelector('#triage-content .triage-card[id^="triage-"]');
+    if (!first) return null;
+    _kbSel = { kind: 'triage', el: first };
+  }
+  return _kbSel.el.id.replace(/^triage-/, '');
+}
+function _kbAfterTriage() { setTimeout(() => { _kbSel = { kind: 'triage', el: document.querySelector('#triage-content .triage-card[id^="triage-"]') }; markKbSel(); }, 900); }
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  const typing = t && (t.matches && t.matches('input,textarea,select') || t.isContentEditable);
+  // Modals first: Decisions owns 1-4 and Esc while open.
+  const dec = document.getElementById('dec-overlay');
+  if (dec && dec.classList.contains('open')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeDecisions(); return; }
+    if (!typing && /^[1-4]$/.test(e.key)) { e.preventDefault(); decAnswer(parseInt(e.key, 10) - 1); return; }
+    return;
+  }
+  const ai = document.getElementById('ai-overlay');
+  if (ai && ai.classList.contains('open')) { if (e.key === 'Escape') closeAiPanel(); return; }
+  const kb = document.getElementById('kbd-overlay');
+  if (kb && kb.classList.contains('open')) { if (e.key === 'Escape' || e.key === '?') kb.classList.remove('open'); return; }
+  if (t && t.id === 'search' && _askMode && e.key === 'Enter') { e.preventDefault(); aiAsk(t.value); return; }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (document.getElementById('set-overlay').classList.contains('open')) return;
+  const mc = document.getElementById('mail-compose-overlay');
+  if (mc && mc.classList.contains('open')) return;
+  if (currentView === 'mail') return;   // the mail client has its own keys
+  switch (e.key) {
+    case 'j': e.preventDefault(); kbMove(1); break;
+    case 'k': e.preventDefault(); kbMove(-1); break;
+    case 'e': case 'Enter': {
+      if (!_kbSel || !_kbSel.el) return;
+      e.preventDefault();
+      if (_kbSel.kind === 'triage') { const it = (TRIAGE_ITEMS || []).find(x => 'triage-' + x.triage_id === _kbSel.el.id); if (it && it.matched_project && !String(it.matched_project).startsWith('__')) openPanel(it.matched_project); }
+      else _kbSel.el.click();
+      break;
+    }
+    case 'a': { const id = _kbTriageId(); if (id) { e.preventDefault(); approveTriage(id); _kbAfterTriage(); } break; }
+    case 'n': { const id = _kbTriageId(); if (id) { e.preventDefault(); dismissTriage(id); _kbAfterTriage(); } break; }
+    case 'h': { const id = _kbTriageId(); if (id) { e.preventDefault(); ignoreTriage(id); _kbAfterTriage(); } break; }
+    case '?': e.preventDefault(); document.getElementById('kbd-overlay').classList.add('open'); break;
+  }
+});
+
+// ── triage helpers ─────────────────────────────────────────────────────────
+function leaveReasonText(r) {
+  if (!r) return '';
+  const map = { multi_project: 'Two possible projects, pick one', no_project: 'No matching project yet',
+                ambiguous: 'Two possible projects, pick one', multiple_matches: 'Two possible projects, pick one',
+                two_matches: 'Two possible projects, pick one', no_match: 'No matching project yet', unmatched: 'No matching project yet',
+                needs_human: 'Needs your decision', needs_decision: 'Needs your decision', question: 'Needs your decision' };
+  const k = String(r).toLowerCase().trim();
+  if (map[k]) return map[k].replace('project', ent('project').toLowerCase());
+  // Already a sentence from the engine: show it as-is, first letter upper.
+  const s = String(r).replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+fullRefresh();
+applyRefreshInterval();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) fullRefresh(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('set-overlay').classList.contains('open')) closeSettings();
+});
+
+// ── DOT TICK: sub-day score progression ──
+// Every 60s, recalculate scores from fractional time decay (no API call).
+// Only re-renders if any project score changed by ≥1 point (rounded).
+// The quadratic curve means more-overdue items tick faster:
+//   2→3 days: ~1 tick/1.6hr | 5→6 days: ~1 tick/45min | 7→8 days: ~1 tick/30min
+let _dotPrevScores = {};
+setInterval(() => {
+  if (!DATA || !DATA.projects) return;
+  if (document.hidden) return;  // skip if tab not visible
+  // Snapshot current rounded scores
+  const oldScores = {};
+  DATA.projects.forEach(p => { oldScores[p.id] = getUrgencyScore(p); });
+  // Scores may have shifted because fractionalDaysUntil returns a new value
+  // (time passed since last calc). Detect any ≥1 point deltas.
+  let anyChanged = false;
+  const dotDeltas = {};
+  DATA.projects.forEach(p => {
+    const prev = _dotPrevScores[p.id];
+    const curr = oldScores[p.id];
+    if (prev !== undefined && prev !== curr) {
+      const delta = curr - prev;
+      if (Math.abs(delta) >= 1) {
+        dotDeltas[p.id] = delta;
+        anyChanged = true;
+      }
+    }
+  });
+  _dotPrevScores = oldScores;
+  if (anyChanged) {
+    // Feed deltas into the existing change detection system
+    _prevScores = {};
+    DATA.projects.forEach(p => {
+      _prevScores[p.id] = (_dotPrevScores[p.id] || 0) - (dotDeltas[p.id] || 0);
+    });
+    detectChanges();
+    _fctSource = 'dot';   // one consolidated number, not one per job
+    renderBoard();
+  }
+}, 60000);
+// Initialize DoT baseline on first load
+setTimeout(() => {
+  if (DATA && DATA.projects) {
+    DATA.projects.forEach(p => { _dotPrevScores[p.id] = getUrgencyScore(p); });
+  }
+}, 3000);
+
+// ── ELECTRIC ARC SYSTEM ──
+// Aggressive static discharge along card/row edges for quick_action subtasks.
+// Multiple arcs, multi-fork branching, impact nodes, burst mode, flicker variants.
+const ARC_INTERVAL = 200;      // ms between spawn attempts: fast
+
+function spawnArc(el) {
+  const w = el.offsetWidth, h = el.offsetHeight;
+  if (!w) return;
+  el.style.position = 'relative';
+  const cleanup = [];
+
+  // Pick an edge and position
+  const side = Math.floor(Math.random() * 4);
+  let x, y, angle;
+  const len = 15 + Math.random() * 45;  // 15-60px arcs
+  const thick = 1 + Math.random() * 1.5;
+  const dur = 100 + Math.random() * 250;
+  const useFlicker = Math.random() < 0.3;  // 30% get flicker animation
+
+  if (side === 0) {        // top
+    x = Math.random() * (w - len); y = -1;
+    angle = (Math.random() - 0.5) * 30;
+  } else if (side === 1) { // right
+    x = w - thick; y = Math.random() * (h - len);
+    angle = 90 + (Math.random() - 0.5) * 30;
+  } else if (side === 2) { // bottom
+    x = Math.random() * (w - len); y = h - thick;
+    angle = (Math.random() - 0.5) * 30;
+  } else {                 // left
+    x = -1; y = Math.random() * (h - len);
+    angle = 90 + (Math.random() - 0.5) * 30;
+  }
+
+  // Main arc
+  const arc = document.createElement('div');
+  arc.className = 'arc-segment' + (useFlicker ? ' flicker' : '');
+  arc.style.setProperty('--arc-dur', dur + 'ms');
+  arc.style.left = x + 'px';
+  arc.style.top = y + 'px';
+  arc.style.width = len + 'px';
+  arc.style.height = thick + 'px';
+  arc.style.transform = `rotate(${angle}deg)`;
+  el.appendChild(arc);
+  cleanup.push([arc, dur]);
+
+  // Impact node at arc origin: bright contact point
+  if (Math.random() < 0.6) {
+    const node = document.createElement('div');
+    node.className = 'arc-node';
+    node.style.setProperty('--arc-dur', (dur * 0.8) + 'ms');
+    node.style.left = (x - 2) + 'px';
+    node.style.top = (y - 2) + 'px';
+    el.appendChild(node);
+    cleanup.push([node, dur * 0.8]);
+  }
+
+  // Fork branches: up to 3 per arc
+  const forkCount = Math.random() < 0.5 ? 0 : Math.random() < 0.6 ? 1 : Math.random() < 0.7 ? 2 : 3;
+  for (let f = 0; f < forkCount; f++) {
+    const fork = document.createElement('div');
+    fork.className = 'arc-segment';
+    const forkDur = dur * (0.5 + Math.random() * 0.3);
+    fork.style.setProperty('--arc-dur', forkDur + 'ms');
+    const forkLen = 8 + Math.random() * 18;
+    const forkAngle = angle + (Math.random() > 0.5 ? 1 : -1) * (25 + Math.random() * 50);
+    const along = 0.2 + Math.random() * 0.6;  // position along main arc
+    const rad = angle * Math.PI / 180;
+    const forkX = x + len * along * Math.cos(rad);
+    const forkY = y + len * along * Math.sin(rad);
+    fork.style.left = forkX + 'px';
+    fork.style.top = forkY + 'px';
+    fork.style.width = forkLen + 'px';
+    fork.style.height = '1px';
+    fork.style.transform = `rotate(${forkAngle}deg)`;
+    fork.style.opacity = String(0.5 + Math.random() * 0.4);
+    el.appendChild(fork);
+    cleanup.push([fork, forkDur]);
+
+    // Sub-fork (fork off the fork): 20% chance
+    if (Math.random() < 0.2) {
+      const sf = document.createElement('div');
+      sf.className = 'arc-segment';
+      const sfDur = forkDur * 0.6;
+      sf.style.setProperty('--arc-dur', sfDur + 'ms');
+      const sfLen = 4 + Math.random() * 8;
+      const sfAngle = forkAngle + (Math.random() > 0.5 ? 1 : -1) * (30 + Math.random() * 30);
+      const sfRad = forkAngle * Math.PI / 180;
+      sf.style.left = (forkX + forkLen * 0.6 * Math.cos(sfRad)) + 'px';
+      sf.style.top = (forkY + forkLen * 0.6 * Math.sin(sfRad)) + 'px';
+      sf.style.width = sfLen + 'px';
+      sf.style.height = '1px';
+      sf.style.transform = `rotate(${sfAngle}deg)`;
+      sf.style.opacity = '0.4';
+      el.appendChild(sf);
+      cleanup.push([sf, sfDur]);
+    }
+  }
+
+  // Cleanup all elements
+  const maxDur = Math.max(...cleanup.map(c => c[1]));
+  setTimeout(() => cleanup.forEach(([el]) => el.remove()), maxDur + 50);
+}
+
+// Arc loop: spawn arcs on all electrified elements
+// High frequency (200ms), with occasional burst mode (2-3 arcs at once)
+setInterval(() => {
+  if (document.hidden) return;
+  if (typeof UI !== 'undefined' && !UI.arcs) return;
+  document.querySelectorAll('[data-sparkle="true"]').forEach(el => {
+    if (Math.random() < 0.65) {
+      spawnArc(el);
+      // 20% chance of burst: fire 1-2 extra arcs simultaneously
+      if (Math.random() < 0.2) {
+        spawnArc(el);
+        if (Math.random() < 0.4) spawnArc(el);
+      }
+    }
+  });
+}, ARC_INTERVAL);
+
+// ── Quick Task Modal ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+// NEW PROJECT FORM
+// ══════════════════════════════════════════════════════════════════════
+function showNewProjectForm() {
+  let overlay = document.getElementById('np-overlay');
+  if (overlay) overlay.remove();   // rebuilt each open: labels follow PROF
+  overlay = document.createElement('div');
+  overlay.id = 'np-overlay';
+  overlay.className = 'qt-overlay';
+  const wts = workTypes();
+  overlay.innerHTML = `
+    <div class="qt-modal" style="min-width:380px">
+      <h3>New ${esc(ent('project'))}</h3>
+      <div style="margin-bottom:8px">
+        <div style="font-size: max(11px, var(--fs-min, 0px));color:var(--t3);margin-bottom:3px">${esc(ent('location'))}</div>
+        <input type="text" id="np-site" placeholder="${escA(ent('location'))} (optional)" autocomplete="off" list="np-site-list">
+        <datalist id="np-site-list">${[...new Set((DATA && DATA.projects || []).map(p => p.site).filter(Boolean))].sort().slice(0, 200).map(sname => `<option value="${escA(sname)}">`).join('')}</datalist>
+      </div>
+      <div style="margin-bottom:8px">
+        <div style="font-size: max(11px, var(--fs-min, 0px));color:var(--t3);margin-bottom:3px">${esc(ent('project'))} name</div>
+        <input type="text" id="np-name" autocomplete="off" placeholder="${escA(ent('project'))} name">
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        ${wts.length ? `<div style="flex:1">
+          <div style="font-size: max(11px, var(--fs-min, 0px));color:var(--t3);margin-bottom:3px">Type</div>
+          <select id="np-worktype" style="width:100%;padding:8px;background:var(--bg2);border:1px solid var(--line2);border-radius:4px;color:var(--t1b);font-size: max(13px, var(--fs-base, 0px))">
+            ${wts.map(wt => `<option value="${escA(wt.id)}">${esc(wt.label || wt.id)}</option>`).join('')}
+          </select>
+        </div>` : ''}
+        <div style="flex:1">
+          <div style="font-size: max(11px, var(--fs-min, 0px));color:var(--t3);margin-bottom:3px">Follow-up</div>
+          <input type="date" id="np-followup" style="width:100%;box-sizing:border-box">
+        </div>
+      </div>
+      <textarea id="np-note" placeholder="Notes (optional)"></textarea>
+      <div class="qt-actions">
+        <button class="qt-cancel" data-on-click='{"f":"closeNewProject"}'>Cancel</button>
+        <button class="qt-create" data-on-click='{"f":"createNewProject"}'>Create</button>
+      </div>
+    </div>`;
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeNewProject(); });
+  document.body.appendChild(overlay);
+  const soon = new Date(); soon.setDate(soon.getDate() + 3);
+  document.getElementById('np-followup').value = ymd(soon);
+  requestAnimationFrame(() => overlay.classList.add('open'));
+  setTimeout(() => document.getElementById('np-name').focus(), 50);
+}
+
+function closeNewProject() {
+  const overlay = document.getElementById('np-overlay');
+  if (overlay) overlay.classList.remove('open');
+}
+
+async function createNewProject() {
+  const site = document.getElementById('np-site').value.trim();
+  const name = document.getElementById('np-name').value.trim();
+  if (!site && !name) { toast(`Need at least a ${ent('location').toLowerCase()} or a name`); return; }
+  const wtEl = document.getElementById('np-worktype');
+  const workType = wtEl ? wtEl.value : '';
+  const followUp = document.getElementById('np-followup').value;
+  const note = document.getElementById('np-note').value.trim();
+
+  const displayName = [site, name].filter(Boolean).join(' / ');
+  // The name carries the location so it shows on the card: "{location} {name}".
+  const projName = (site && name && !name.toLowerCase().startsWith(site.toLowerCase())) ? `${site} ${name}` : (name || site);
+
+  try {
+    // Entry stage = the work type's workflow entry_stage (the server resolves
+    // it too; sending it keeps an older server honest).
+    const wt = workTypeDef(workType);
+    const wid = (wt && wt.workflow_id) || (wfAll()[0] || {}).id || '';
+    const w = wfById(wid);
+    const body = {
+      name: projName,
+      location: site,
+      work_type: workType,
+      follow_up_date: followUp || null,
+    };
+    if (wid) body.workflow_id = wid;
+    if (w && w.entry_stage) body.status = w.entry_stage;
+    if (note) {
+      body.notes = [{ text: note, time: new Date().toLocaleString() }];
+    }
+    const r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || `Failed to create ${ent('project').toLowerCase()}`); }
+    const data = await r.json();
+    toast(`${ent('project')} created: ${displayName}`);
+    closeNewProject();
+    await loadData();
+    // Open the new project's panel
+    if (data.project?.id) setTimeout(() => openPanel(data.project.id), 300);
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// DISMISSED TRIAGE BROWSER
+// ══════════════════════════════════════════════════════════════════════
+async function openDismissedBrowser() {
+  try {
+    const r = await fetch('/api/triage/dismissed');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const items = data.items || [];
+
+    if (items.length === 0) {
+      toast('No dismissed cards found');
+      return;
+    }
+
+    // Sort newest first
+    items.sort((a, b) => (b.staged_at || '').localeCompare(a.staged_at || ''));
+
+    let html = `<div class="merge-picker-overlay" id="dismissed-overlay" data-on-click='{"f":"closeDismissedBrowser","g":"self"}'>
+      <div class="merge-picker" style="min-width:480px;max-width:560px">
+        <h3>Dismissed Cards</h3>
+        <div class="merge-subtitle">${items.length} dismissed cards: click revive to re-stage</div>
+        <input type="text" id="dismissed-search" autocomplete="off" placeholder="Search by subject, ${escA(ent('location').toLowerCase())}, type..." data-on-input='{"f":"filterDismissedList"}'>
+        <div style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap">
+          <button class="dismissed-filter-btn" data-filter="" data-on-click='{"f":"setDismissedFilter","a":[{"$":"this"},""]}' style="font-size: max(10px, var(--fs-min, 0px));padding:2px 8px;border-radius:3px;background:var(--line2);border:1px solid var(--line3);color:var(--t1b);cursor:pointer">ALL</button>
+          <button class="dismissed-filter-btn" data-filter="email" data-on-click='{"f":"setDismissedFilter","a":[{"$":"this"},"email"]}' style="font-size: max(10px, var(--fs-min, 0px));padding:2px 8px;border-radius:3px;background:var(--bg3);border:1px solid var(--line2);color:var(--t3);cursor:pointer">EMAIL</button>
+          <button class="dismissed-filter-btn" data-filter="acknowledgment" data-on-click='{"f":"setDismissedFilter","a":[{"$":"this"},"acknowledgment"]}' style="font-size: max(10px, var(--fs-min, 0px));padding:2px 8px;border-radius:3px;background:var(--bg3);border:1px solid var(--line2);color:var(--t3);cursor:pointer">ACK</button>
+          <button class="dismissed-filter-btn" data-filter="subtask_proposal" data-on-click='{"f":"setDismissedFilter","a":[{"$":"this"},"subtask_proposal"]}' style="font-size: max(10px, var(--fs-min, 0px));padding:2px 8px;border-radius:3px;background:var(--bg3);border:1px solid var(--line2);color:var(--t3);cursor:pointer">SUBTASK</button>
+        </div>
+        <div class="merge-picker-list" id="dismissed-list">`;
+
+    items.forEach(item => {
+      const ct = item.card_type || 'email';
+      const typeClass = ct === 'email' ? 'dismissed-type-email' : 'dismissed-type-other';
+      const typeLabel = ct === 'acknowledgment' ? 'ACK'
+                      : ct === 'subtask_proposal' ? 'SUBTASK'
+                      : ct === 'reassign_subtask' ? 'REASSIGN'
+                      : ct === 'email' ? 'EMAIL' : ct.toUpperCase();
+
+      const subject = item.subject || item.proposed_subtask || item.new_project_name || '(no subject)';
+      const site = item.new_project_location || item.new_project_site || '';
+      const from = item.from_name || item.from_email || '';
+      const dateStr = (item.staged_at || '').slice(0, 10);
+      const searchStr = [subject, site, from, ct, typeLabel, dateStr].join(' ').toLowerCase();
+
+      html += `<div class="dismissed-item" data-type="${ct}" data-search="${esc(searchStr)}" id="dismissed-${item.triage_id}">
+        <div class="dismissed-item-header">
+          <span class="dismissed-item-type ${typeClass}">${typeLabel}</span>
+          <button class="dismissed-item-revive" data-on-click="${EH({sp:1}, EK('reviveDismissed', String(item.triage_id)))}">REVIVE</button>
+        </div>
+        <div class="dismissed-item-subject">${esc(subject)}</div>
+        <div class="dismissed-item-meta">
+          ${site ? esc(site) + ' · ' : ''}${from ? esc(from) + ' · ' : ''}${dateStr}
+        </div>
+      </div>`;
+    });
+
+    html += `</div>
+        <div class="merge-picker-btns">
+          <button class="mp-cancel" data-on-click='{"f":"closeDismissedBrowser"}'>Close</button>
+        </div>
+      </div>
+    </div>`;
+
+    document.body.insertAdjacentHTML('beforeend', html);
+    document.getElementById('dismissed-search').focus();
+  } catch(e) {
+    toast('Error loading dismissed: ' + e.message);
+  }
+}
+
+let _dismissedTypeFilter = '';
+
+function setDismissedFilter(btn, type) {
+  _dismissedTypeFilter = type;
+  document.querySelectorAll('.dismissed-filter-btn').forEach(b => {
+    b.style.background = 'var(--bg3)';
+    b.style.color = 'var(--t3)';
+    b.style.borderColor = 'var(--line2)';
+  });
+  btn.style.background = 'var(--line2)';
+  btn.style.color = 'var(--t1b)';
+  btn.style.borderColor = 'var(--line3)';
+  filterDismissedList();
+}
+
+function filterDismissedList() {
+  const q = (document.getElementById('dismissed-search')?.value || '').toLowerCase();
+  document.querySelectorAll('#dismissed-list .dismissed-item').forEach(el => {
+    const matchesSearch = !q || el.dataset.search.includes(q);
+    const matchesType = !_dismissedTypeFilter || el.dataset.type === _dismissedTypeFilter;
+    el.style.display = (matchesSearch && matchesType) ? '' : 'none';
+  });
+}
+
+function closeDismissedBrowser() {
+  const ov = document.getElementById('dismissed-overlay');
+  if (ov) ov.remove();
+  _dismissedTypeFilter = '';
+}
+
+async function reviveDismissed(triageId) {
+  try {
+    const r = await fetch(`/api/triage/${triageId}/revive`, { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || 'HTTP ' + r.status);
+    }
+    // Remove from the dismissed list UI
+    const el = document.getElementById('dismissed-' + triageId);
+    if (el) el.remove();
+    // Refresh triage panel
+    await loadTriageItems();
+    toast('Revived: check the triage panel');
+  } catch(e) {
+    toast('Revive failed: ' + e.message);
+  }
+}
+
+function showQuickTaskForm() {
+  let overlay = document.getElementById('qt-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'qt-overlay';
+    overlay.className = 'qt-overlay';
+    overlay.innerHTML = `
+      <div class="qt-modal">
+        <h3>Quick Task</h3>
+        <input type="text" id="qt-name" autocomplete="off" placeholder="Task name" autofocus>
+        <input type="date" id="qt-followup" value="${ymd(new Date())}">
+        <textarea id="qt-note" placeholder="Notes (optional)"></textarea>
+        <div class="qt-actions">
+          <button class="qt-cancel" data-on-click='{"f":"closeQuickTask"}'>Cancel</button>
+          <button class="qt-create" data-on-click='{"f":"createQuickTask"}'>Create</button>
+        </div>
+      </div>`;
+    overlay.addEventListener('click', e => { if (e.target === overlay) closeQuickTask(); });
+    document.body.appendChild(overlay);
+  }
+  // Reset fields
+  document.getElementById('qt-name').value = '';
+  document.getElementById('qt-followup').value = ymd(new Date());
+  document.getElementById('qt-note').value = '';
+  overlay.classList.add('open');
+  setTimeout(() => document.getElementById('qt-name').focus(), 50);
+}
+function closeQuickTask() {
+  const overlay = document.getElementById('qt-overlay');
+  if (overlay) overlay.classList.remove('open');
+}
+async function createQuickTask() {
+  const name = document.getElementById('qt-name').value.trim();
+  if (!name) { toast('Task name is required'); return; }
+  const followUp = document.getElementById('qt-followup').value;
+  const note = document.getElementById('qt-note').value.trim();
+
+  try {
+    // A quick task rides the 'task' work type when the profession has one,
+    // else the first work type; status = that workflow's entry stage.
+    const wts = workTypes();
+    const wt = wts.find(x => x.id === 'task') || wts[0] || null;
+    const wid = (wt && wt.workflow_id) || (wfAll()[0] || {}).id || '';
+    const w = wfById(wid);
+    const body = {
+      name: name,
+      location: '',
+      work_type: wt ? wt.id : 'task',
+      follow_up_date: followUp || null,
+    };
+    if (wid) body.workflow_id = wid;
+    if (w && w.entry_stage) body.status = w.entry_stage;
+    if (note) {
+      body.notes = [{ text: note, time: new Date().toLocaleString() }];
+    }
+    const r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || 'Failed to create task'); }
+    toast('Task created: ' + name);
+    closeQuickTask();
+    loadData();
+  } catch(e) { toast('Error: ' + e.message); }
+}
+
+// ---- handlers that used to be inline snippets (wired through data-on-*) ----
+Object.assign(window.EBH, {
+  noop() {},
+  blurEl(el) { el.blur(); },
+  removeOpen(el) { el.classList.remove('open'); },
+  closeOverlay(id) { const e = document.getElementById(id); if (e) e.classList.remove('open'); },
+  editLock(on) { _panelEditLock = !!on; },
+  triageDollar(tid, v) { updateTriageField(tid, 'dollar_amount', parseFloat(v) || null); },
+  triageQuoteFlag(tid, on) { updateTriageField(tid, 'is_quote_request', on ? 1 : 0); },
+  setSettingInt(key, min, dflt, v) { setSetting(key, Math.max(min, parseInt(v) || dflt)); },
+  localGoal(key, kind, min, dflt, v) {
+    const n = kind === 'float' ? parseFloat(v) : parseInt(v);
+    try { localStorage.setItem(key, Math.max(min, n || dflt)); } catch (e) {}
+    renderBoard();
+  },
+  masterVol(v) {
+    UI.masterVol = parseFloat(v); uiSave();
+    document.getElementById('setv-master').textContent = Math.round(UI.masterVol * 100) + '%';
+  },
+  clickEl(id) { const e = document.getElementById(id); if (e) e.click(); },
+  aiChoice(id) { _aiChoice = id; renderSettings(); },
+  hoursBox(on) { document.getElementById('set-hours-box').style.display = on ? 'none' : 'flex'; },
+  cfOpts(v) { document.getElementById('cf-opts').style.display = v === 'select' ? 'block' : 'none'; },
+  confirmLost(pid, lost, label) {
+    if (confirm('Mark this as lost? It moves to ' + label + '.')) changeStatus(pid, lost);
+  },
+  refreshDrafts() { _draftsCache = null; renderDrafts(); },
+  decUndo() { _dec.done = null; renderDecision(); },
+  decBack() { _dec.other = false; renderDecision(); },
+  decOther() {
+    _dec.other = true; renderDecision();
+    setTimeout(() => { const t = document.getElementById('dec-other'); if (t) t.focus(); }, 0);
+  },
+  wfWonEdit(wi, key, v) {
+    const w = _wfDraft.workflows[wi];
+    w.won_transition = w.won_transition || {};
+    w.won_transition[key] = v;
+  },
+});

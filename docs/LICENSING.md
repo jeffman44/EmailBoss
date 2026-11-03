@@ -211,9 +211,35 @@ Env vars: `ANTHROPIC_API_KEY`, `AI_MARKUP`, `AI_MIN_CREDITS_PER_CALL`, `AI_TRIAL
   to the session row; `SameSite=Lax` and `LIC_SECURE_COOKIES=1` behind HTTPS
   are what hold it. Do not serve the portal on a domain that shares cookies
   with untrusted subdomains.
-- `/v1/deactivate` is unauthenticated by design (a lost laptop must be
-  releasable); anyone who knows a `lid` and a fingerprint can release that
-  seat. The next heartbeat from the real device re-activates it.
+- Device proof (heartbeat, deactivate, `/v1/ai/*`, and `/v1/activate` for a
+  device that already holds a seat): `proof = HMAC-SHA256(k, lid|fingerprint|ts|path|nonce|body_sha256)`
+  with `k = sha256(device_secret)` as hex text, `body_sha256` over the
+  canonical JSON (sorted keys, compact, ASCII) of the body without
+  `ts`/`nonce`/`proof`. `ts` must be within 300 s; the server remembers each
+  `(lid, nonce)` for 600 s (table `proof_nonces`) and rejects reuse, so a
+  captured proof authorizes exactly one request. Known limitation: the key `k`
+  is the hash the server stores, so a leaked database lets an attacker forge
+  proofs for those devices. The upgrade path is a per-device Ed25519 key pair
+  (the device keeps the private key, the server stores only the public key),
+  which needs a client release.
+- A bare `/v1/activate` (license key only) for a fingerprint that already
+  holds a seat with a device secret is refused `409 device_bound`; the device
+  must send its own proof, or the seat must be released in the portal first
+  (this is also how a lost or reinstalled device recovers). Seats made before
+  1.3.0 have no secret and still upgrade with the key once.
+- `/v1/trial` never returns the license key. The key, the email confirmation
+  link and a set-password link go to the inbox; the device is bound at once
+  (activation and device secret come back) and the app runs from the signed
+  activation until the key is pasted in. An address that already has an
+  account answers the same generic 409 as one that already had a trial.
+  AI trial credits are funded when the email is confirmed (`/verify/<token>`
+  or a completed password reset), not by the trial call; until then
+  `/v1/ai/balance` returns `balance: 0, pending_verification: true`.
+  Budgets: `AI_TRIAL_PER_DAY` (200 trials a day, whole server) and
+  `TRIAL_PER_IP_DAY` (5 a day per /24 IPv4 or /64 IPv6), both 429
+  `trial_budget`.
+- `/v1/deactivate` needs the device proof (or, for a seat made before 1.3.0,
+  the license key). A lost laptop is released from the portal.
 - Key rotation has no `kid`: both sides hold exactly one public key, so a
   rotation re-signs every live license and needs a client release that
   ships the new key.

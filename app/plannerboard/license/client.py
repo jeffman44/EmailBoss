@@ -25,11 +25,21 @@ State lives in app_meta through the two callables passed in:
     license.device_secret  per-device secret from /v1/activate or /v1/trial
                            (proof of possession, see sign_request)
 
-Proof of possession: heartbeat, deactivate and every /v1/ai/* call carry
+Proof of possession: heartbeat, deactivate, every /v1/ai/* call (and
+/v1/activate when this device already holds a seat) carry
     ts    = unix seconds
-    proof = hex(HMAC-SHA256(device_key, f"{lid}|{fingerprint}|{ts}|{path}"))
+    nonce = random, single use (the server remembers it for 600 s)
+    proof = hex(HMAC-SHA256(device_key,
+                f"{lid}|{fingerprint}|{ts}|{path}|{nonce}|{body_sha256}"))
 with device_key = sha256(device_secret) as hex text (the value the server
-stores, so it can recompute the MAC without ever holding the secret).
+stores, so it can recompute the MAC without ever holding the secret) and
+body_sha256 the sha256 of the canonical JSON of the request body without
+ts, nonce and proof. One proof therefore authorizes one request.
+Limitation: the server's stored hash is the MAC key, so a leaked server
+database can forge proofs; per-device Ed25519 keys are the upgrade path.
+
+The license key and device secret are kept in the app's meta table (the
+local database), not the keyring; see docs/PRIVACY.md.
 
 Dependencies: stdlib + cryptography (Ed25519).
 """
@@ -40,6 +50,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -335,14 +346,28 @@ class LicenseClient:
                 pass
         return ""
 
-    def _proof(self, path: str, lid: str, secret: str) -> dict:
-        ts = int(time.time())   # real wall clock: the server checks it within 300 s
-        device_key = hashlib.sha256(secret.encode("utf-8")).hexdigest()
-        msg = f"{lid}|{self.fingerprint}|{ts}|{path}".encode("utf-8")
-        return {"ts": ts, "proof": hmac.new(device_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()}
+    @staticmethod
+    def body_digest(body: dict) -> str:
+        """sha256 of the canonical JSON of ``body`` minus ts, nonce and proof
+        (must match licserver.licenses.body_sha256)."""
+        d = {k: v for k, v in (body or {}).items() if k not in ("ts", "nonce", "proof")}
+        raw = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def sign_request(self, path: str) -> dict:
-        """{ts, proof} for a device call to `path` (e.g. "/v1/ai/complete").
+    def _proof(self, path: str, lid: str, secret: str, body: dict | None = None) -> dict:
+        ts = int(time.time())   # real wall clock: the server checks it within 300 s
+        nonce = secrets.token_hex(12)
+        device_key = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        msg = f"{lid}|{self.fingerprint}|{ts}|{path}|{nonce}|{self.body_digest(body or {})}".encode("utf-8")
+        return {"ts": ts, "nonce": nonce, "proof": hmac.new(device_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()}
+
+    def sign_request(self, path: str, body: dict | None = None) -> dict:
+        """{ts, nonce, proof} for a device call to `path` (e.g. "/v1/ai/complete").
+
+        ``body`` is the dict that will be sent (every field except ts, nonce
+        and proof; the proof covers its hash, so it must not change after
+        signing). Omitted, it is the plain identity body {lid, fingerprint,
+        activation}, which is all /v1/ai/balance sends.
 
         An activation from before 1.3.0 has no device secret yet; the first
         call upgrades it with one forced heartbeat (key-based, once). Returns
@@ -357,55 +382,39 @@ class LicenseClient:
         lid = self._lid()
         if not secret or not lid:
             return {}
-        return self._proof(path, lid, secret)
+        if body is None:
+            body = {"lid": lid, "fingerprint": self.fingerprint, "activation": self.stored_activation()}
+        return self._proof(path, lid, secret, body)
 
-    def start_trial(self, email: str) -> dict:
-        """POST /v1/trial: the server creates the account (if new), issues a
-        trial key (also emailed), activates this machine and returns the
-        device secret. Stores everything like activate()."""
-        email = (email or "").strip()
-        if "@" not in email:
-            raise LicenseError("a valid email is required", "bad_email", http_status=400)
-        data = self._post("/v1/trial", {"email": email, "fingerprint": self.fingerprint,
-                                        "app_version": self.app_version})
-        key = (data.get("key") or "").strip()
-        if not key:
-            raise LicenseError("server response had no license key", "server")
-        payload = self.parse_key(key)
-        with self._lock:
-            self._meta_set(META_KEY, key)
-        act = self._store_activation(data)
-        return {"license": payload, "activation": act}
-
-    def activate(self, key: str) -> dict:
+    def activate(self, key: str, use_proof: bool = True) -> dict:
         """Verify the key locally, then POST /v1/activate and store the activation."""
         key = (key or "").strip()
         payload = self.parse_key(key)
-        data = self._post("/v1/activate", {
-            "key": key, "fingerprint": self.fingerprint, "app_version": self.app_version,
-        })
+        body = {"key": key, "fingerprint": self.fingerprint, "app_version": self.app_version}
+        secret = self.device_secret()
+        if secret and use_proof and self._lid() == payload["lid"]:
+            # This device may already hold the seat; the server then wants its proof.
+            body.update(self._proof("/v1/activate", payload["lid"], secret, body))
+        data = self._post("/v1/activate", body)
         with self._lock:
             self._meta_set(META_KEY, key)
         act = self._store_activation(data)
         return {"license": payload, "activation": act}
 
     def start_trial(self, email: str) -> dict:
-        """POST /v1/trial: the server creates the trial license, claims this
-        machine, emails the key and returns it. Stored exactly like activate()."""
+        """POST /v1/trial: the server creates the account and a trial license,
+        binds this machine and returns the activation and device secret. The
+        license KEY is only emailed (with a confirmation link that funds the
+        AI trial credits), so this stores an activation and no key; status
+        works from the signed activation until the key is pasted in."""
         email = (email or "").strip()
         if not email or "@" not in email:
-            raise LicenseError("Enter a valid email address.", "bad_email")
+            raise LicenseError("Enter a valid email address.", "bad_email", http_status=400)
         data = self._post("/v1/trial", {
             "email": email, "fingerprint": self.fingerprint, "app_version": self.app_version,
         })
-        key = str(data.get("key") or "").strip()
-        if not key:
-            raise LicenseError("server response had no license key", "server")
-        payload = self.parse_key(key)
-        with self._lock:
-            self._meta_set(META_KEY, key)
         act = self._store_activation(data)
-        return {"license": payload, "activation": act, "key": key}
+        return {"license": data.get("license") or {}, "activation": act}
 
     def heartbeat(self, force: bool = False) -> dict:
         """Daily refresh of the activation. Returns {"ok", "skipped"?, "error"?}.
@@ -415,31 +424,39 @@ class LicenseClient:
         report it, and a 404 for a deactivated seat clears the activation.
         """
         key = self.stored_key()
-        if not key:
-            return {"ok": False, "skipped": "no_key"}
-        try:
-            payload = self.parse_key(key)
-        except LicenseError as exc:
-            return {"ok": False, "error": str(exc)}
+        lid = ""
+        if key:
+            try:
+                lid = str(self.parse_key(key)["lid"])
+            except LicenseError as exc:
+                return {"ok": False, "error": str(exc)}
+        else:
+            lid = self._lid()      # trial: activation only, the key is in the mailbox
+            if not lid:
+                return {"ok": False, "skipped": "no_key"}
         last = parse_iso(self._meta_get(META_LAST_HEARTBEAT, None))
         if not force and last and self._now() - last < HEARTBEAT_INTERVAL:
             return {"ok": True, "skipped": "recent"}
-        body = {"lid": payload["lid"], "fingerprint": self.fingerprint, "app_version": self.app_version}
+        body = {"lid": lid, "fingerprint": self.fingerprint, "app_version": self.app_version}
         secret = self.device_secret()
         if secret:
-            body.update(self._proof("/v1/heartbeat", payload["lid"], secret))
-        else:
+            body.update(self._proof("/v1/heartbeat", lid, secret, body))
+        elif key:
             body["key"] = key   # pre-1.3.0 activation: the server upgrades it once and returns a secret
+        else:
+            return {"ok": False, "skipped": "no_secret"}
         try:
             data = self._post("/v1/heartbeat", body)
         except LicenseError as exc:
             if exc.code == "offline" or exc.http_status >= 500:
                 return {"ok": False, "offline": True, "error": str(exc)}
-            if exc.code == "proof_invalid":
-                # Lost or rotated secret: re-activate with the stored key (the
-                # seat is already ours, so this refreshes rather than claims).
+            if exc.code == "proof_invalid" and key:
+                # Lost or rotated secret. The server will not hand a bound
+                # device a new secret on the key alone (device_bound): the
+                # user has to release this device in the portal first. If they
+                # already did, this succeeds.
                 try:
-                    self.activate(key)
+                    self.activate(key, use_proof=False)
                     return {"ok": True, "reactivated": True}
                 except LicenseError as exc2:
                     exc = exc2
@@ -459,12 +476,12 @@ class LicenseClient:
         """Release this machine's seat on the server and forget local state."""
         key = self.stored_key()
         result: dict = {"ok": True}
-        if key:
+        lid = self._lid()
+        if lid:
             try:
-                payload = self.parse_key(key)
-                body = {"lid": payload["lid"], "fingerprint": self.fingerprint}
+                body = {"lid": lid, "fingerprint": self.fingerprint}
                 secret = self.device_secret()
-                body.update(self._proof("/v1/deactivate", payload["lid"], secret) if secret else {"key": key})
+                body.update(self._proof("/v1/deactivate", lid, secret, body) if secret else {"key": key})
                 self._post("/v1/deactivate", body)
             except LicenseError as exc:
                 # Local state is cleared regardless; report the server side.
@@ -526,17 +543,35 @@ class LicenseClient:
         out.update(extra)
         return out
 
+    def _license_from_activation(self) -> Optional[dict]:
+        """A trial started in the app has a signed activation but no key (the
+        key is only emailed). Its payload carries what status needs."""
+        token = self.stored_activation()
+        if not token:
+            return None
+        try:
+            act = self.parse_activation(token)
+        except LicenseError:
+            return None
+        if not act.get("expires"):
+            return None
+        return {"lid": act["lid"], "plan": act.get("plan", ""), "expires": act["expires"], "email": "",
+                "features": list(act.get("features") or []), "seats": 1, "issued": act.get("issued", "")}
+
     def _compute_status(self) -> dict:
         if self.dev_mode():
             return self._base("dev", "Developer mode: license checks skipped (PB_LICENSE_DEV=1).",
                               plan="dev", features=["*"], seats=1)
         key = self.stored_key()
-        if not key:
-            return self._base("unlicensed", "No license key. Enter one in Settings or start a trial.")
-        try:
-            lic = self.parse_key(key)
-        except LicenseError as exc:
-            return self._base("invalid", f"License key rejected: {exc}")
+        if key:
+            try:
+                lic = self.parse_key(key)
+            except LicenseError as exc:
+                return self._base("invalid", f"License key rejected: {exc}")
+        else:
+            lic = self._license_from_activation()
+            if lic is None:
+                return self._base("unlicensed", "No license key. Enter one in Settings or start a trial.")
 
         now = self._effective_now()
         # Clock-rollback floor that cannot be deleted without losing the

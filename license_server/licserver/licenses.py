@@ -13,14 +13,21 @@ Both are <base64url(payload_json)>.<base64url(sig)>; see keys.py.
 Proof of possession: /v1/activate and /v1/trial return a random 32-byte
 `device_secret` (hex) exactly once; the server keeps only
 sha256(device_secret) on the activation row. Every later device call
-(/v1/heartbeat, /v1/deactivate, /v1/ai/*) carries
-    ts    = unix seconds (within PROOF_WINDOW_S of server time)
-    proof = hex(HMAC-SHA256(device_key, f"{lid}|{fingerprint}|{ts}|{path}"))
+(/v1/heartbeat, /v1/deactivate, /v1/ai/*, and /v1/activate for a device that
+already holds a seat) carries
+    ts     = unix seconds (within PROOF_WINDOW_S of server time)
+    nonce  = random string, single use per license for NONCE_TTL_S (600 s)
+    proof  = hex(HMAC-SHA256(device_key,
+                 f"{lid}|{fingerprint}|{ts}|{path}|{nonce}|{body_sha256}"))
 where device_key = sha256(device_secret) as hex text (the stored value, so
-the server can recompute the MAC). A stolen activation token alone no longer
-works. Activations made before 1.3.0 have no secret: one heartbeat that
-carries the license key (body.key, verified, same lid) upgrades them and
-returns a device_secret.
+the server can recompute the MAC) and body_sha256 is the sha256 of the
+canonical JSON (sort_keys, compact separators, ASCII) of the request body
+WITHOUT ts, nonce and proof. A captured proof therefore authorizes exactly one
+request. A stolen activation token alone does not work. Activations made
+before 1.3.0 have no secret: one heartbeat that carries the license key
+(body.key, verified, same lid) upgrades them and returns a device_secret.
+A bare /v1/activate for a fingerprint that already holds a seat (with a
+secret) is refused 409 device_bound; release the device in the portal first.
 
 Error bodies are always {"detail": {"code": "...", "message": "..."}} so the
 app client can surface a code without parsing prose.
@@ -29,13 +36,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import time
 from datetime import timedelta
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -53,34 +61,66 @@ PLANS: dict[str, dict[str, Any]] = {
 
 
 PROOF_WINDOW_S = 300
+PROOF_FIELDS = ("ts", "nonce", "proof")
+NONCE_MIN, NONCE_MAX = 8, 64
 
 
 def secret_hash(device_secret: str) -> str:
     return hashlib.sha256(device_secret.encode("utf-8")).hexdigest()
 
 
-def proof_message(lid: str, fingerprint: str, ts: int, path: str) -> bytes:
-    return f"{lid}|{fingerprint}|{int(ts)}|{path}".encode("utf-8")
+def body_sha256(body: Any) -> str:
+    """sha256 over the canonical JSON of the request body minus ts/nonce/proof."""
+    d = {k: v for k, v in (body or {}).items() if k not in PROOF_FIELDS} if isinstance(body, dict) else {}
+    raw = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def compute_proof(device_key: str, lid: str, fingerprint: str, ts: int, path: str) -> str:
+def proof_message(lid: str, fingerprint: str, ts: int, path: str, nonce: str = "", body_sha: str = "") -> bytes:
+    return f"{lid}|{fingerprint}|{int(ts)}|{path}|{nonce}|{body_sha}".encode("utf-8")
+
+
+def compute_proof(device_key: str, lid: str, fingerprint: str, ts: int, path: str,
+                  nonce: str = "", body_sha: str = "") -> str:
     """device_key is sha256(device_secret) hex; the client derives the same."""
-    return hmac.new(device_key.encode("utf-8"), proof_message(lid, fingerprint, ts, path), hashlib.sha256).hexdigest()
+    return hmac.new(device_key.encode("utf-8"), proof_message(lid, fingerprint, ts, path, nonce, body_sha),
+                    hashlib.sha256).hexdigest()
 
 
 def check_proof(act: Optional[dict], lid: str, fingerprint: str, ts: Any, proof: Any, path: str,
-                now: float | None = None) -> bool:
-    """True when the activation row has a secret and ts/proof are valid for path."""
+                now: float | None = None, *, nonce: Any = "", body: Any = None, db: Any = None) -> bool:
+    """True when the activation row has a secret and ts/nonce/proof are valid
+    for this path and body, and (when ``db`` is given) the nonce is unused.
+    The nonce is consumed only after the MAC verifies, so garbage cannot fill
+    the cache."""
     if not act or not act.get("secret_hash") or not proof:
         return False
     try:
         ts_i = int(ts)
     except (TypeError, ValueError):
         return False
-    if abs((now if now is not None else time.time()) - ts_i) > PROOF_WINDOW_S:
+    nonce = nonce if isinstance(nonce, str) else ""
+    if not (NONCE_MIN <= len(nonce) <= NONCE_MAX):
         return False
-    want = compute_proof(act["secret_hash"], lid, fingerprint, ts_i, path)
-    return hmac.compare_digest(want, str(proof).lower())
+    t_now = now if now is not None else time.time()
+    if abs(t_now - ts_i) > PROOF_WINDOW_S:
+        return False
+    want = compute_proof(act["secret_hash"], lid, fingerprint, ts_i, path, nonce, body_sha256(body))
+    if not hmac.compare_digest(want, str(proof).lower()):
+        return False
+    if db is not None and not db.claim_nonce(lid, nonce, int(t_now)):
+        return False
+    return True
+
+
+async def raw_json(request: Request) -> dict:
+    """The request body as the client sent it (the proof covers these exact
+    fields, so the pydantic model, which fills defaults, cannot be used)."""
+    try:
+        d = await request.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def issue_device_secret(db, lid: str, fingerprint: str) -> str:
@@ -228,6 +268,9 @@ class ActivateIn(BaseModel):
     key: str = Field(min_length=20)
     fingerprint: str = Field(min_length=16, max_length=128)
     app_version: str = ""
+    ts: Optional[int] = None
+    nonce: str = Field(default="", max_length=64)
+    proof: str = Field(default="", max_length=128)   # only for a device that already holds a seat
 
 
 class HeartbeatIn(BaseModel):
@@ -235,6 +278,7 @@ class HeartbeatIn(BaseModel):
     fingerprint: str = Field(min_length=16, max_length=128)
     app_version: str = ""
     ts: Optional[int] = None
+    nonce: str = Field(default="", max_length=64)
     proof: str = Field(default="", max_length=128)
     key: str = Field(default="", max_length=8192)   # legacy upgrade path only
 
@@ -243,6 +287,7 @@ class DeactivateIn(BaseModel):
     lid: str
     fingerprint: str = Field(min_length=16, max_length=128)
     ts: Optional[int] = None
+    nonce: str = Field(default="", max_length=64)
     proof: str = Field(default="", max_length=128)
     key: str = Field(default="", max_length=8192)   # legacy (no secret yet) only
 
@@ -282,7 +327,7 @@ def _activation_response(app, lic: dict, fingerprint: str, app_version: str, cla
 
 
 @router.post("/activate")
-def v1_activate(body: ActivateIn, request: Request):
+def v1_activate(body: ActivateIn, request: Request, raw: dict = Depends(raw_json)):
     app = request.app
     db: Database = app.state.db
     try:
@@ -290,10 +335,28 @@ def v1_activate(body: ActivateIn, request: Request):
     except SigningError as exc:
         raise _err(400, "bad_key", f"License key rejected: {exc}")
     lic = _check_license_live(db.get_license(str(payload.get("lid", ""))))
+    # A fingerprint that already holds a seat (with a device secret) is bound
+    # to that device: re-activating it needs the device's own proof, or a
+    # portal action that releases the seat first. Otherwise anyone holding the
+    # key could rotate the secret of someone else's device.
+    existing = db.get_activation(lic["lid"], body.fingerprint)
+    keep_secret = False
+    if existing and not existing["revoked"] and existing.get("secret_hash"):
+        if not body.proof:
+            db.audit("activate.device_bound", actor=body.fingerprint[:12], target=lic["lid"])
+            raise _err(409, "device_bound",
+                       "This device already holds a seat on that license. Release it in the portal, "
+                       "then activate again.")
+        if not check_proof(existing, lic["lid"], body.fingerprint, body.ts, body.proof, "/v1/activate",
+                           nonce=body.nonce, body=raw, db=db):
+            db.audit("activate.proof_invalid", actor=body.fingerprint[:12], target=lic["lid"])
+            raise _proof_denied()
+        keep_secret = True
     # The signed key carries its own expiry, but the DB row is authoritative
     # (renewals re-sign; an old key string for a renewed license still works).
     # The seat count and the insert happen in one transaction (claim_seat).
-    out = _activation_response(app, lic, body.fingerprint, body.app_version, claim=True, new_secret=True)
+    out = _activation_response(app, lic, body.fingerprint, body.app_version, claim=True,
+                               new_secret=not keep_secret)
     db.audit("activate", actor=body.fingerprint[:12], target=lic["lid"], detail={"app_version": body.app_version})
     return out
 
@@ -304,9 +367,30 @@ class TrialIn(BaseModel):
     app_version: str = ""
 
 
+TRIAL_GENERIC = "If this address can start a trial, you will get an email."
+
+
+def _trial_net(ip: str) -> str:
+    """The /24 (IPv4) or /64 (IPv6) the caller sits in, as text."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip or "?"
+    prefix = 24 if addr.version == 4 else 64
+    return str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False))
+
+
 @router.post("/trial")
 def v1_trial(body: TrialIn, request: Request):
-    """In-app free trial: no portal visit. One trial per email."""
+    """In-app free trial: no portal visit. One trial per email, new accounts only.
+
+    The response never carries the license key: it goes to the inbox, together
+    with the email-confirmation link (which is what funds AI trial credits) and
+    a set-password link. This device is bound on the spot (activation and
+    device secret come back). An address that already has an account, or has
+    had a trial, gets the same 409 so the endpoint is no account oracle."""
+    import sqlite3
     from . import mailer
     from .auth import create_account, valid_email
     from .web import client_ip
@@ -318,31 +402,50 @@ def v1_trial(body: TrialIn, request: Request):
     email = body.email.lower().strip()
     if not valid_email(email):
         raise _err(400, "bad_email", "Enter a valid email address.")
+    ip = client_ip(request)
     limiter = app.state.login_limiter
-    if not (limiter.hit("trial-ip:" + client_ip(request)) and limiter.hit("trial-email:" + email)):
+    if not (limiter.hit("trial-ip:" + ip) and limiter.hit("trial-email:" + email)):
         raise _err(429, "rate_limited", "Too many attempts. Try again in a few minutes.")
-    acct = db.get_account_by_email(email)
-    temp = None
-    if not acct:
-        acct, temp = create_account(app, email, actor="trial")
-    if any(l["plan"] == "trial" for l in db.licenses_for_account(acct["id"])):
-        db.audit("trial.refused", actor=body.fingerprint[:12], target=acct["id"], detail={"email": email})
-        raise _err(409, "trial_used", "This email has already had a free trial.")
-    lic = issue_license(app, acct, plan="trial", days=settings.trial_days, actor="trial")
-    out = _activation_response(app, lic, body.fingerprint, body.app_version, claim=True, new_secret=True)
-    # The key goes to the inbox, so this is the one path that funds AI trial
-    # credits without a verified account (still once per account).
-    db.ensure_wallet(lic["lid"], settings.ai_trial_credits, grant_trial=True)
+    net = _trial_net(ip)
+    total, from_net = db.trial_counts_today(net)
+    if (settings.ai_trial_per_day > 0 and total >= settings.ai_trial_per_day) or \
+            (settings.trial_per_ip_day > 0 and from_net >= settings.trial_per_ip_day):
+        db.audit("trial.budget", actor=body.fingerprint[:12], target=net, detail={"total": total, "net": from_net})
+        raise _err(429, "trial_budget", "Free trials are paused for today. Try again tomorrow.")
+
+    def refuse(aid: str = "") -> HTTPException:
+        db.audit("trial.refused", actor=body.fingerprint[:12], target=aid, detail={"email": email})
+        return _err(409, "trial_used", TRIAL_GENERIC)
+
+    existing = db.get_account_by_email(email)
+    if existing:
+        raise refuse(existing["id"])
+    try:
+        acct, _unused_temp = create_account(app, email, actor="trial")
+    except sqlite3.IntegrityError:
+        raise refuse()
+    try:
+        lic = issue_license(app, acct, plan="trial", days=settings.trial_days, actor="trial")
+        out = _activation_response(app, lic, body.fingerprint, body.app_version, claim=True, new_secret=True)
+        vtoken = db.create_verification(acct["id"])
+        rtoken = db.create_reset(acct["id"])
+        mailer.send_trial(email, settings.product_name, lic["key"], settings.base_url,
+                          verify_url=f"{settings.base_url}/verify/{vtoken}",
+                          set_password_url=f"{settings.base_url}/reset/{rtoken}")
+    except Exception:
+        # Nothing reached the inbox, so nothing must stay bound: drop the
+        # account (cascade) so the user can simply try again.
+        log.exception("trial start failed; rolling back account %s", acct["id"])
+        db.delete_account(acct["id"])
+        raise _err(503, "trial_unavailable", "Could not start the trial right now. Try again in a few minutes.")
+    # No AI credits here: the wallet is funded when the email is confirmed.
+    db.trial_log_add(net, lic["lid"])
     db.audit("trial.start", actor=body.fingerprint[:12], target=lic["lid"], detail={"email": email})
-    if temp:
-        mailer.send_welcome(email, settings.product_name, settings.base_url, temp_password=temp)
-    mailer.send_license_key(email, settings.product_name, "trial", lic["key"], settings.base_url)
-    out["key"] = lic["key"]
     return out
 
 
 @router.post("/heartbeat")
-def v1_heartbeat(body: HeartbeatIn, request: Request):
+def v1_heartbeat(body: HeartbeatIn, request: Request, raw: dict = Depends(raw_json)):
     app = request.app
     db: Database = app.state.db
     lic = _check_license_live(db.get_license(body.lid))
@@ -350,7 +453,8 @@ def v1_heartbeat(body: HeartbeatIn, request: Request):
     if not act or act["revoked"]:
         raise _err(404, "not_activated", "This device is not activated on that license.")
     if act.get("secret_hash"):
-        if not check_proof(act, body.lid, body.fingerprint, body.ts, body.proof, "/v1/heartbeat"):
+        if not check_proof(act, body.lid, body.fingerprint, body.ts, body.proof, "/v1/heartbeat",
+                           nonce=body.nonce, body=raw, db=db):
             db.audit("heartbeat.proof_invalid", actor=body.fingerprint[:12], target=body.lid)
             raise _proof_denied()
         return _activation_response(app, lic, body.fingerprint, body.app_version)
@@ -363,11 +467,12 @@ def v1_heartbeat(body: HeartbeatIn, request: Request):
 
 
 @router.post("/deactivate")
-def v1_deactivate(body: DeactivateIn, request: Request):
+def v1_deactivate(body: DeactivateIn, request: Request, raw: dict = Depends(raw_json)):
     db: Database = request.app.state.db
     act = db.get_activation(body.lid, body.fingerprint)
     if act:
-        authed = check_proof(act, body.lid, body.fingerprint, body.ts, body.proof, "/v1/deactivate") \
+        authed = check_proof(act, body.lid, body.fingerprint, body.ts, body.proof, "/v1/deactivate",
+                             nonce=body.nonce, body=raw, db=db) \
             if act.get("secret_hash") else _key_matches(request.app, body.key, body.lid)
         if not authed:
             raise _proof_denied()

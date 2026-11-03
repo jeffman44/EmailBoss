@@ -2,7 +2,7 @@
   "id": "insurance_agency",
   "label": "Insurance Agency",
   "description": "Quotes through binding and renewal, plus claims reported to carriers.",
-  "icon": "🛡️",
+  "icon": "\ud83d\udee1\ufe0f",
   "entity": {
     "project": "Account",
     "projects": "Accounts",
@@ -105,7 +105,9 @@
       ],
       "searchable": false,
       "group": "Details",
-      "source": "key_details"
+      "source": "key_details",
+      "reminder": true,
+      "reminder_days_before": 30
     },
     {
       "key": "quote_amount",
@@ -268,7 +270,7 @@
       {
         "id": "policy",
         "label": "Quote / Policy",
-        "icon": "🛡️",
+        "icon": "\ud83d\udee1\ufe0f",
         "color": "#f0b429",
         "stages": [
           {
@@ -357,7 +359,7 @@
       {
         "id": "claim",
         "label": "Claim",
-        "icon": "📋",
+        "icon": "\ud83d\udccb",
         "color": "#4fc3f7",
         "stages": [
           {
@@ -407,7 +409,7 @@
       {
         "id": "general",
         "label": "General Task",
-        "icon": "📋",
+        "icon": "\ud83d\udccb",
         "color": "#a0a0a0",
         "stages": [
           {

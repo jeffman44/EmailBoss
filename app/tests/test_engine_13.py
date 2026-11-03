@@ -645,3 +645,54 @@ def test_answer_acts_on_its_own_message_not_the_latest(tmp_path):
     assert r["drafted"] and store.drafts[0]["to"] == ["stranger@elsewhere.test"]
     assert store.drafts[0]["subject"] == "RE: Old ask"
     assert ("add_contact", "proj_a", "other@elsewhere.test") not in store.calls
+
+
+def test_stage_entry_arms_owning_task_without_advance_target(data_root):
+    """events: Booked owns 'Collect the deposit...' but has no advance target;
+    entering it must still arm the task and close the previous stage's task."""
+    from plannerboard import create_app
+    from tests.conftest import make_config
+    app = create_app(config=make_config(data_root, template="events"), testing=True)
+    c = app.test_client()
+    r = c.post("/api/projects", json={"name": "Smith wedding", "work_type": "event"})
+    j = r.json
+    pid = (j.get("project") or j).get("id")
+    c.put(f"/api/projects/{pid}", json={"status": "booked"})
+    subs = c.get(f"/api/projects/{pid}/subtasks").json
+    subs = subs.get("subtasks", subs) if isinstance(subs, dict) else subs
+    texts = [s["text"].lower() for s in subs]
+    assert any("deposit" in t for t in texts), texts
+    p = c.get(f"/api/projects/{pid}").json
+    assert (p.get("project") or p)["status"] == "booked"
+
+
+def test_date_field_keeps_a_deadline_subtask_in_step(data_root):
+    from plannerboard import create_app
+    from tests.conftest import make_config
+    app = create_app(config=make_config(data_root, template="legal"), testing=True)
+    c = app.test_client()
+    r = c.post("/api/projects", json={"name": "Moore v. Moore", "work_type": "matter"})
+    pid = ((r.json.get("project") or r.json)["id"])
+    r = c.put(f"/api/projects/{pid}", json={"key_details": {"hearing_date": "2026-11-24"}})
+    assert r.status_code == 200 and r.json["reminders"][0]["action"] == "created"
+    subs = c.get(f"/api/projects/{pid}/subtasks").json
+    subs = subs.get("subtasks", subs) if isinstance(subs, dict) else subs
+    hearing = [s for s in subs if s["text"] == "Hearing date"]
+    assert hearing and hearing[0]["follow_up_date"] == "2026-11-24" and hearing[0]["date_type"] == "deadline"
+    r = c.put(f"/api/projects/{pid}", json={"key_details": {"hearing_date": "2026-12-01"}})
+    assert r.json["reminders"][0]["action"] == "moved"
+    subs = c.get(f"/api/projects/{pid}/subtasks").json
+    subs = subs.get("subtasks", subs) if isinstance(subs, dict) else subs
+    assert [s for s in subs if s["text"] == "Hearing date"][0]["follow_up_date"] == "2026-12-01"
+    r = c.put(f"/api/projects/{pid}", json={"key_details": {"hearing_date": ""}})
+    assert r.json["reminders"][0]["action"] == "cleared"
+
+
+def test_mail_status_is_honest_without_a_password(data_root):
+    from plannerboard import create_app
+    from tests.conftest import make_config
+    cfg = make_config(data_root, mail={"provider": "imap", "imap": {"host": "imap.example.test", "user": "pat@example.com",
+                                                                     "auth_mode": "password"}})
+    app = create_app(config=cfg, testing=True)
+    j = app.test_client().get("/api/mail/status").json
+    assert j["provider"] == "imap" and j.get("ok") in (False, None) or "password" in (j.get("error") or "").lower()

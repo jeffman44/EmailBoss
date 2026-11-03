@@ -1,6 +1,8 @@
 """The desktop app's LicenseClient against the real server (TestClient as transport)."""
+import re
 from datetime import datetime, timedelta, timezone
 
+from licserver import mailer
 from licserver.auth import hash_password
 from licserver.licenses import issue_license, revoke_license
 from plannerboard.license.client import GRACE_DAYS, LicenseClient
@@ -109,35 +111,57 @@ def test_sign_request_is_accepted_by_the_relay(client, app):
     lc.activate(lic["key"])
     assert len(meta["license.device_secret"]) == 64
     app.state.settings.anthropic_api_key = ""          # relay off: auth passes, then 503
+    path = "/v1/ai/complete"
     body = {"lid": lic["lid"], "fingerprint": machine_fingerprint(), "activation": lc.stored_activation(),
-            "task": "ai.test", "tier": "fast", "user": "hi", **lc.sign_request("/v1/ai/complete")}
-    r = client.post("/v1/ai/complete", json=body)
+            "task": "ai.test", "tier": "fast", "user": "hi"}
+    body.update(lc.sign_request(path, body))
+    r = client.post(path, json=body)
     assert r.status_code == 503, r.text
-    body.update(lc.sign_request("/v1/ai/balance"))
-    assert client.post("/v1/ai/complete", json=body).json()["code"] == "proof_invalid"
-    assert client.post("/v1/ai/balance", json={k: body[k] for k in ("lid", "fingerprint", "activation", "ts", "proof")}).status_code == 200
+    # the same bytes again: nonce replay
+    assert client.post(path, json=body).json()["code"] == "proof_invalid"
+    # a proof for another path, or for a different body, is refused
+    body2 = {**body, **lc.sign_request("/v1/ai/balance", body)}
+    assert client.post(path, json=body2).json()["code"] == "proof_invalid"
+    body3 = {**body, "user": "something else"}
+    body3.update(lc.sign_request(path, body))
+    assert client.post(path, json=body3).json()["code"] == "proof_invalid"
+    # balance: the default identity body is what the client signs
+    ident = {"lid": lic["lid"], "fingerprint": machine_fingerprint(), "activation": lc.stored_activation()}
+    assert client.post("/v1/ai/balance", json={**ident, **lc.sign_request("/v1/ai/balance")}).status_code == 200
     # deactivate is signed too
     assert lc.deactivate()["ok"] is True
     assert app.state.db.get_activation(lic["lid"], machine_fingerprint())["revoked"] == 1
 
 
-def test_legacy_client_upgrades_and_lost_secret_recovers(client, app):
+def test_legacy_client_upgrades_and_lost_secret_needs_the_portal(client, app):
     lic = _lic(app)
     meta, lc = _client_for(app, client)
     lc.activate(lic["key"])
     # simulate a pre-1.3.0 install: no secret on either side
     meta["license.device_secret"] = ""
     app.state.db.set_activation_secret(lic["lid"], machine_fingerprint(), "")
-    signed = lc.sign_request("/v1/ai/complete")          # forces the upgrade heartbeat
+    signed = lc.sign_request("/v1/ai/complete", {"lid": lic["lid"]})   # forces the upgrade heartbeat
     assert signed and len(meta["license.device_secret"]) == 64
-    # lost secret locally while the server still has one: heartbeat re-activates
+    # lost secret locally while the server still has one: the key alone cannot rebind the device
     meta["license.device_secret"] = "f" * 64
-    assert lc.heartbeat(force=True) == {"ok": True, "reactivated": True}
+    hb = lc.heartbeat(force=True)
+    assert hb["ok"] is False and hb["code"] == "device_bound"
+    # the user releases the device in the portal; then activating again works
+    app.state.db.revoke_activation(lic["lid"], machine_fingerprint())
+    lc.activate(lic["key"])
     assert meta["license.device_secret"] != "f" * 64 and lc.status(use_cache=False)["status"] == "ok"
 
 
 def test_start_trial(client, app):
     meta, lc = _client_for(app, client)
     res = lc.start_trial("trial-e2e@example.test")
-    assert res["license"]["plan"] == "trial" and meta["license.device_secret"]
-    assert lc.status(use_cache=False)["status"] == "ok"
+    assert "key" not in res and meta["license.device_secret"] and not meta.get("license.key")
+    st = lc.status(use_cache=False)
+    assert st["status"] == "ok" and st["trial"] is True
+    # the emailed key activates the same device (client sends its proof; secret kept)
+    mail = [m for m in mailer.SENT if m["to"] == "trial-e2e@example.test"][-1]
+    key = re.search(r"\n\n(\S+\.\S+)\n\n", mail["body"]).group(1)
+    secret = meta["license.device_secret"]
+    lc.activate(key)
+    assert meta["license.key"] == key and meta["license.device_secret"] == secret
+    assert lc.heartbeat(force=True) == {"ok": True}

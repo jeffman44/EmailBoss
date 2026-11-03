@@ -401,12 +401,78 @@ def api_update_project(proj_id):
         proj = db.get_project(proj_id)
         if not proj:
             return error_response(404, f"Project {proj_id} not found")
-        return jsonify({"ok": True, "project": proj})
+        reminders = _sync_date_field_reminders(db, before, proj)
+        auto = []
+        if data.get("status") and data["status"] != prior_status and not status_in_request(request):
+            st_ = wfm.get_stage(wfm.get_workflow(doc, wid), data["status"]) or {}
+            auto.append(f"status set to {st_.get('label') or data['status']}")
+        return jsonify({"ok": True, "project": proj, "reminders": reminders, "auto": auto})
     except ValueError as ve:
         return error_response(400, str(ve))
     except Exception as e:  # pragma: no cover - defensive
         import traceback
         return jsonify({"ok": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+def status_in_request(req) -> bool:
+    try:
+        return "status" in (req.get_json(silent=True) or {})
+    except Exception:
+        return False
+
+
+# profession field keys of type date that carry a reminder; the subtask text
+# is the field label so the card reads "Court date" / "Renewal date".
+def _reminder_fields(db) -> list:
+    out = []
+    try:
+        prof = rt().profession() or {}
+    except Exception:
+        return out
+    for f in prof.get("fields") or []:
+        if f.get("type") == "date" and (f.get("reminder") or f.get("key") in
+                                        ("hearing_date", "court_date", "renewal_date", "bid_due", "closing_date", "showing_date")):
+            out.append((f.get("key"), f.get("label") or f.get("key"), int(f.get("reminder_days_before") or 0)))
+    return out
+
+
+def _sync_date_field_reminders(db, before, after) -> list:
+    """A dated field on the project (court date, renewal date, bid due) keeps
+    ONE deadline subtask in step with it: created when set, moved when
+    changed, completed when cleared. Returns the changes made."""
+    changes = []
+    kd_b = (before or {}).get("key_details") or {}
+    kd_a = (after or {}).get("key_details") or {}
+    for key, label, days_before in _reminder_fields(db):
+        old, new = (kd_b.get(key) or "").strip(), (kd_a.get(key) or "").strip()
+        if old == new:
+            continue
+        pid = after["id"]
+        subs = db.get_subtasks(pid)
+        mine = [s for s in subs if ((s.get("metadata") or {}).get("field") == key) if isinstance(s.get("metadata"), dict)] \
+            or [s for s in subs if (s.get("text") or "").strip().lower() == label.lower()]
+        if not new:
+            for s_ in mine:
+                if s_.get("status") == "pending":
+                    db.complete_subtask(pid, s_["id"], completed_by="field_cleared")
+                    changes.append({"field": key, "action": "cleared"})
+            continue
+        due = new
+        if days_before:
+            try:
+                from datetime import date, timedelta
+                due = (date.fromisoformat(new[:10]) - timedelta(days=days_before)).isoformat()
+            except Exception:
+                due = new
+        if mine:
+            db.update_subtask_fields(pid, mine[0]["id"], follow_up_date=due, date_type="deadline", status="pending",
+                                     completed_date=None, completed_by=None)
+            changes.append({"field": key, "action": "moved", "due": due})
+        else:
+            db.add_subtask(pid, label, date_type="deadline", follow_up_date=due, source="system",
+                           metadata={"auto": "date_field", "field": key})
+            changes.append({"field": key, "action": "created", "due": due})
+    return changes
 
 
 @bp.route("/api/projects/<proj_id>", methods=["DELETE"])

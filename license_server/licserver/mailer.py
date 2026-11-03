@@ -55,3 +55,16 @@ def send_welcome(to: str, product: str, portal_url: str, temp_password: str | No
 def send_verification(to: str, product: str, verify_url: str) -> None:
     send(to, f"Confirm your {product} email",
          f"Confirm this address by opening:\n\n{verify_url}\n\nIf you did not sign up, ignore this.\n")
+
+
+def send_trial(to: str, product: str, key: str, portal_url: str, *, verify_url: str, set_password_url: str) -> None:
+    """The one mail a new trial gets: key, email confirmation (funds the AI
+    trial credits) and a set-password link. No password is ever mailed."""
+    body = (
+        f"Your {product} free trial license key:\n\n{key}\n\n"
+        f"The app on the computer you started the trial from is already activated.\n\n"
+        f"1. Confirm this address (this also adds your free AI trial credits):\n{verify_url}\n\n"
+        f"2. Set a password for your account at {portal_url} (link valid for two hours):\n{set_password_url}\n\n"
+        f"If you did not ask for this, ignore it.\n"
+    )
+    send(to, f"Your {product} free trial", body)

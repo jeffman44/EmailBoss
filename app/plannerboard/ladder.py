@@ -246,6 +246,49 @@ def rearm_on_status_change(store, pid, proj_before, new_status):
     qstage, _ = wfm.quote_task_for(doc, wf_id_for(store, proj_before, doc))
     if qstage and new_status == qstage and (proj_before or {}).get("status") != qstage:
         ensure_quote_task(store, pid, reset_clock=True)
+    arm_entry_task(store, pid, proj_before, new_status, doc)
+
+
+def arm_entry_task(store, pid, proj_before, new_status, doc=None):
+    """1.3.0: a stage that owns a task but is not a ladder rung (no
+    advance_on_task_complete target, e.g. events "Booked" -> "Collect the
+    deposit") still arms that task when the project enters the stage, and the
+    previous stage's entry task is completed. auto_arm: false opts out."""
+    doc = doc or store.wf_doc()
+    wid = wf_id_for(store, proj_before, doc)
+    wf = wfm.get_workflow(doc, wid) or {}
+    stages = {st.get("id"): st for st in wf.get("stages") or []}
+    st = stages.get(new_status) or {}
+    ot = st.get("owning_task") or {}
+    if not ot or ot.get("auto_arm") is False or wfm.is_quote_owning_task(ot):
+        return None
+    if st.get("advance_on_task_complete"):
+        return None  # a real rung; ensure_ladder_task handled it
+    text = (ot.get("text") or "").strip()
+    if not text:
+        return None
+    # close the entry task of the stage we left
+    prev = stages.get((proj_before or {}).get("status") or "") or {}
+    prev_text = ((prev.get("owning_task") or {}).get("text") or "").strip().lower()
+    for s in store.get_subtasks(pid, status="pending"):
+        t = (s.get("text") or "").strip().lower()
+        if prev_text and t == prev_text and t != text.lower():
+            store.complete_subtask(pid, s["id"], completed_by="stage_change")
+    if any((s.get("text") or "").strip().lower() == text.lower() for s in store.get_subtasks(pid, status="pending")):
+        return None
+    dt = ot.get("date_type") or "follow_up"
+    hours = ot.get("sla_hours") if dt == "sla" else None
+    days = ot.get("days") if dt in ("follow_up", "deadline") else None
+    now_iso = store.hours.now_local_naive().isoformat(timespec="seconds")
+    fu_date = store.hours.add_biz_days(store.hours.today(), days) if days else None
+    st_id = store.add_subtask(
+        pid, text, date_type="sla" if hours else dt, follow_up_date=fu_date, sla_hours=hours,
+        source="system", category=ot.get("category") or "",
+        sla_type="response" if hours else None, sla_created=now_iso if hours else None,
+        metadata={"auto": "stage_entry", "stage": new_status})
+    if st_id:
+        store.append_note(pid, f"Armed '{text}' on entering {new_status}", store._note_time("auto"))
+    return st_id
 
 
 def spawn_response_subtask(store, email_card, pid, from_is_user):

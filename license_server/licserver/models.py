@@ -116,6 +116,20 @@ CREATE TABLE IF NOT EXISTS ai_ledger (
     error       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_ai_ledger_lid_ts ON ai_ledger(lid, ts);
+CREATE TABLE IF NOT EXISTS proof_nonces (
+    lid    TEXT NOT NULL,
+    nonce  TEXT NOT NULL,
+    ts     INTEGER NOT NULL,
+    PRIMARY KEY (lid, nonce)
+);
+CREATE INDEX IF NOT EXISTS ix_proof_nonces_ts ON proof_nonces(ts);
+CREATE TABLE IF NOT EXISTS trial_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    net     TEXT NOT NULL DEFAULT '',
+    lid     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_trial_log_ts ON trial_log(ts);
 CREATE TABLE IF NOT EXISTS ai_purchases (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     lid            TEXT NOT NULL,
@@ -438,6 +452,34 @@ class Database:
         self._exec("UPDATE activations SET secret_hash = ? WHERE lid = ? AND fingerprint = ?",
                    (secret_hash, lid, fingerprint))
 
+    NONCE_TTL_S = 600
+
+    def claim_nonce(self, lid: str, nonce: str, now_ts: int | None = None) -> bool:
+        """Remember a device-proof nonce for NONCE_TTL_S. True the first time
+        it is seen for this license, False on a replay. Old rows are pruned."""
+        now_ts = int(time.time() if now_ts is None else now_ts)
+        with self._lock, self.connect() as c:
+            c.execute("DELETE FROM proof_nonces WHERE ts < ?", (now_ts - self.NONCE_TTL_S,))
+            try:
+                c.execute("INSERT INTO proof_nonces(lid, nonce, ts) VALUES (?,?,?)", (lid, nonce, now_ts))
+            except sqlite3.IntegrityError:
+                return False
+        return True
+
+    def trial_log_add(self, net: str, lid: str) -> None:
+        self._exec("INSERT INTO trial_log(ts, net, lid) VALUES (?,?,?)", (iso(utcnow()), net, lid))
+
+    def trial_counts_today(self, net: str) -> tuple[int, int]:
+        """(all trials started since 00:00 UTC, those from this network)."""
+        day = utcnow().strftime("%Y-%m-%dT00:00:00Z")
+        a = self._one("SELECT COUNT(*) AS n FROM trial_log WHERE ts >= ?", (day,))
+        b = self._one("SELECT COUNT(*) AS n FROM trial_log WHERE ts >= ? AND net = ?", (day, net))
+        return int(a["n"]), int(b["n"])
+
+    def delete_account(self, aid: str) -> None:
+        """Remove an account and (by cascade) its licenses, activations and tokens."""
+        self._exec("DELETE FROM accounts WHERE id = ?", (aid,))
+
     def claim_webhook_event(self, event_id: str, etype: str = "") -> bool:
         """True the first time an event id is seen, False on a replay."""
         if not event_id:
@@ -503,6 +545,11 @@ class Database:
         if granted:
             self.audit("ai.trial_grant", actor="system", target=lid, detail={"credits": granted})
         return self.get_wallet(lid)  # type: ignore[return-value]
+
+    def release_webhook_event(self, event_id: str) -> None:
+        """Forget a claimed event so Stripe's retry is processed again."""
+        if event_id:
+            self._exec("DELETE FROM webhook_events WHERE event_id = ?", (event_id,))
 
     def refund(self, lid: str, credits: int) -> int:
         """Return held credits to the wallet. Returns the new balance."""

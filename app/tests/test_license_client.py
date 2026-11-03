@@ -210,10 +210,19 @@ def test_activate_heartbeat_deactivate_with_fake_transport(issuer, meta, clock):
     fp = machine_fingerprint()
     calls = []
 
+    nonces = set()
+
     def _check_proof(body, path):
         assert "key" not in body and abs(body["ts"] - _time.time()) < 5
+        assert len(body["nonce"]) >= 8 and body["nonce"] not in nonces
+        nonces.add(body["nonce"])
         device_key = hashlib.sha256(("5e" * 32).encode()).hexdigest().encode()
-        msg = f"lic_test1|{fp}|{body['ts']}|{path}".encode()
+        digest = LicenseClient.body_digest(body)
+        want_digest = hashlib.sha256(json.dumps(
+            {k: v for k, v in body.items() if k not in ("ts", "nonce", "proof")},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        assert digest == want_digest
+        msg = f"lic_test1|{fp}|{body['ts']}|{path}|{body['nonce']}|{digest}".encode()
         assert body["proof"] == hmac.new(device_key, msg, hashlib.sha256).hexdigest()
 
     def transport(url, body, timeout):
@@ -289,12 +298,26 @@ def test_sign_request_shape_and_legacy_upgrade(issuer, meta, clock):
     c = make_client(meta, clock, transport=transport)
     meta.set("license.key", issuer.key())
     meta.set("license.activation", issuer.activation(fp, clock() + timedelta(days=30)))
-    out = c.sign_request("/v1/ai/complete")
+    sent_body = {"lid": "lic_test1", "fingerprint": fp, "activation": meta.get("license.activation"),
+                 "user": "hello \u4e2d", "temperature": 0.2}
+    out = c.sign_request("/v1/ai/complete", sent_body)
+    assert set(out) == {"ts", "nonce", "proof"}
     assert len(sent) == 1 and meta.get("license.device_secret") == "ab" * 32
     key = hashlib.sha256(("ab" * 32).encode()).hexdigest().encode()
-    assert out["proof"] == hmac.new(key, f"lic_test1|{fp}|{out['ts']}|/v1/ai/complete".encode(),
+    digest = hashlib.sha256(json.dumps(sent_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert out["proof"] == hmac.new(key, f"lic_test1|{fp}|{out['ts']}|/v1/ai/complete|{out['nonce']}|{digest}".encode(),
                                     hashlib.sha256).hexdigest()
-    c.sign_request("/v1/ai/balance")
+    # the proof changes with the body and with every call (fresh nonce)
+    again = c.sign_request("/v1/ai/complete", sent_body)
+    assert again["nonce"] != out["nonce"] and again["proof"] != out["proof"]
+    other = c.sign_request("/v1/ai/complete", {**sent_body, "user": "different"})
+    assert other["proof"] != out["proof"]
+    # no body: the identity body {lid, fingerprint, activation} (what /v1/ai/balance sends)
+    bal = c.sign_request("/v1/ai/balance")
+    idb = {"lid": "lic_test1", "fingerprint": fp, "activation": meta.get("license.activation")}
+    assert bal["proof"] == hmac.new(
+        key, f"lic_test1|{fp}|{bal['ts']}|/v1/ai/balance|{bal['nonce']}|{c.body_digest(idb)}".encode(),
+        hashlib.sha256).hexdigest()
     assert len(sent) == 1                                              # no second upgrade
 
 
@@ -429,22 +452,62 @@ def test_release_channel_rejects_dev_signed_keys(monkeypatch):
         lc.verify_token(token, lc.load_public_key(lc.DEFAULT_PUBLIC_KEY_PEM))
 
 
-def test_start_trial_stores_key_and_activation(issuer, meta, clock):
+def test_start_trial_stores_activation_and_secret_but_no_key(issuer, meta, clock):
     fp = machine_fingerprint()
-    key = issuer.key(plan="trial", seats=1, expires=_iso(T0 + timedelta(days=14)))
 
     def transport(url, body, timeout):
         assert url.endswith("/v1/trial")
         assert body == {"email": "sam@example.test", "fingerprint": fp, "app_version": "1.2.3"}
-        return 200, {"ok": True, "key": key,
-                     "activation": issuer.activation(fp, clock() + timedelta(days=30), plan="trial")}
+        return 200, {"ok": True, "device_secret": "cd" * 32,
+                     "activation": issuer.activation(fp, clock() + timedelta(days=30), plan="trial",
+                                                     expires=_iso(T0 + timedelta(days=14))),
+                     "license": {"lid": "lic_test1", "plan": "trial"}}
 
     c = make_client(meta, clock, transport=transport)
     res = c.start_trial("sam@example.test")
-    assert res["key"] == key and res["activation"]["fingerprint"] == fp
-    assert meta.get("license.key") == key and meta.get("license.activation")
+    assert "key" not in res and res["activation"]["fingerprint"] == fp
+    assert not meta.get("license.key") and meta.get("license.activation")
+    assert meta.get("license.device_secret") == "cd" * 32
     st = c.status(use_cache=False)
-    assert st["status"] == "ok" and st["trial"] is True and st["days_left"] == 14
+    assert st["status"] == "ok" and st["trial"] is True and st["days_left"] == 14 and st["lid"] == "lic_test1"
+
+    # the daily heartbeat works from the activation alone, with a proof
+    seen = []
+
+    def hb(url, body, timeout):
+        seen.append(body)
+        assert url.endswith("/v1/heartbeat") and "key" not in body and body["proof"] and body["nonce"]
+        return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30), plan="trial",
+                                                                 expires=_iso(T0 + timedelta(days=14)))}
+
+    c._transport = hb
+    assert c.heartbeat(force=True) == {"ok": True} and len(seen) == 1
+
+
+def test_activate_after_trial_carries_proof_and_device_bound_surfaces(issuer, meta, clock):
+    fp = machine_fingerprint()
+    meta.set("license.device_secret", "cd" * 32)
+    meta.set("license.activation", issuer.activation(fp, clock() + timedelta(days=30), plan="trial"))
+
+    def transport(url, body, timeout):
+        assert url.endswith("/v1/activate") and body["proof"] and body["nonce"] and body["ts"]
+        return 200, {"ok": True, "activation": issuer.activation(fp, clock() + timedelta(days=30))}
+
+    c = make_client(meta, clock, transport=transport)
+    c.activate(issuer.key())
+    assert meta.get("license.device_secret") == "cd" * 32            # kept: the server did not rotate it
+
+    # lost secret: heartbeat's proof is refused, the key alone is refused, the error says why
+    def refusing(url, body, timeout):
+        if url.endswith("/v1/heartbeat"):
+            return 403, {"detail": {"code": "proof_invalid", "message": "bad proof"}}
+        assert "proof" not in body                                     # recovery attempt carries none
+        return 409, {"detail": {"code": "device_bound", "message": "Release it in the portal."}}
+
+    c._transport = refusing
+    hb = c.heartbeat(force=True)
+    assert hb["ok"] is False and hb["code"] == "device_bound"
+    assert "device_bound" in meta.get("license.revoked")
 
 
 def test_start_trial_server_error_surfaces(issuer, meta, clock):

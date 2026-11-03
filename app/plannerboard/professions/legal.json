@@ -2,7 +2,7 @@
   "id": "legal",
   "label": "Law Practice",
   "description": "Matters from intake through engagement, with client and court waiting states and filing deadlines.",
-  "icon": "⚖️",
+  "icon": "\u2696\ufe0f",
   "entity": {
     "project": "Matter",
     "projects": "Matters",
@@ -64,7 +64,8 @@
       ],
       "searchable": false,
       "group": "Details",
-      "source": "key_details"
+      "source": "key_details",
+      "reminder": true
     },
     {
       "key": "opposing_counsel",
@@ -255,7 +256,7 @@
       {
         "id": "matter",
         "label": "Matter",
-        "icon": "⚖️",
+        "icon": "\u2696\ufe0f",
         "color": "#f0b429",
         "stages": [
           {
@@ -338,7 +339,7 @@
       {
         "id": "general",
         "label": "General Task",
-        "icon": "📋",
+        "icon": "\ud83d\udccb",
         "color": "#a0a0a0",
         "stages": [
           {

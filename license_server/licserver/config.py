@@ -26,6 +26,8 @@ class Settings:
     secure_cookies: bool = field(default_factory=lambda: _env_bool("LIC_SECURE_COOKIES", False))
     trial_enabled: bool = field(default_factory=lambda: _env_bool("TRIAL_ENABLED", False))
     trial_days: int = field(default_factory=lambda: int(os.environ.get("TRIAL_DAYS", "14")))
+    ai_trial_per_day: int = field(default_factory=lambda: int(os.environ.get("AI_TRIAL_PER_DAY", "200")))
+    trial_per_ip_day: int = field(default_factory=lambda: int(os.environ.get("TRIAL_PER_IP_DAY", "5")))
     admin_emails: tuple[str, ...] = field(default_factory=lambda: tuple(
         e.strip().lower() for e in os.environ.get("LIC_ADMIN_EMAILS", "").split(",") if e.strip()))
     stripe_webhook_secret: str = field(default_factory=lambda: os.environ.get("STRIPE_WEBHOOK_SECRET", ""))
