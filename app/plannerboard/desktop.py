@@ -149,12 +149,20 @@ def remember_port(data_root, port):
         pass
 
 
+def _port_in_use(host, port) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, int(port))) == 0
+
+
 def serve_stable(app, host, data_root):
     """Serve on the previous launch's port when it is free, else a new free
     one. A stable origin matters: the board keeps its settings in the window's
     localStorage, which is per origin including the port."""
     srv = None
     port = preferred_port(data_root)
+    if port and _port_in_use(host, port):
+        port = None  # Windows lets a second process bind a busy port; probe first
     if port:
         try:
             srv = serve_engine(app, host, port)
