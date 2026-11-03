@@ -76,6 +76,7 @@ to `127.0.0.1` unless configured otherwise.
 | `api/*.py` | one blueprint per area; `_common.py` holds the shared helpers (`rt()`, `store()`, `body()`, `error_response()`) |
 | `mail/message.py` | `Message` / `Attachment`, `to_pa_record()` / `from_pa_record()`, `validate_record()`, atomic `write_pa_record()` |
 | `mail/base.py`, `pa_folder.py`, `imap.py`, `gmail.py`, `graph.py`, `oauth.py`, `runner.py`, `secrets.py` | provider protocol, the four providers, PKCE helpers, capture threads, keyring wrapper |
+| `mail/syncdb.py`, `mail/retry_queue.py`, `mail/reconcile.py` | sync truth: the per-cache ledger of captured server ids (removals, labels, flags), the failed-fetch retry queue with backoff, and the server-count reconcile pass; all in `mail_cache/sync.sqlite` |
 | `mail/compose.py`, `mail/smtp.py` | outbound message assembly (quoting, threading headers, text alternative, attachments) and SMTP submission for the IMAP provider |
 | `api/mail_client_api.py`, `static/mail.js`, `static/mail.css` | the mail client: `/api/mail/client/*` (folders, list, read, attachment, flags, move, delete, compose, draft, send, stage, file) and the MAIL view that drives it |
 | `triage/*.py` | normalize, text cleanup, match, signals, attachment text extraction, classify, `pipeline.run_cycle` |
@@ -147,6 +148,8 @@ answer 402). Details: `LICENSING.md`.
   plannerboard.db (+ -wal, -shm)  the database
   workflows.json                  stage roster after first run (Settings editor writes it)
   mail_cache/inbox|sent|attachments|processed
+  mail_cache/sync.sqlite          sync ledger, retry queue, reconcile counts (no bodies)
+  mail_cache/state_<provider>.json cursors (Gmail historyId + queued ids, Graph deltaLinks, IMAP UIDs)
   project_files/<project>/attachments|emails|intake
   backups/                        daily db snapshots, workflow backups
   logs/server.log, assistant_*.jsonl

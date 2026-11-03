@@ -13,6 +13,11 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
   drafts, questions, notes, AI usage ledger, assistant log.
 - `mail_cache/`: raw mail records and attachment bytes as captured, then
   moved to `processed/` and purged after 90 days.
+- `mail_cache/sync.sqlite`: the sync ledger. For each captured message it
+  holds the provider's message id, folder, labels, read and flag state and
+  the Message-ID header; plus failed fetches waiting for a retry and the
+  last server-versus-local message counts. No subjects, addresses or body
+  text. Plaintext, with SQLite `secure_delete` on.
 - `project_files/`: attachments and intake files copied onto projects.
 - `backups/`, `logs/`, `workflows.json`, `plannerboard.json`.
 

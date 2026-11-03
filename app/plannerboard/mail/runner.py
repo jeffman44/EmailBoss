@@ -15,7 +15,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .base import ProviderState
+from . import reconcile
+from .base import BaseProvider, ProviderState
 from .message import write_record
 from .pa_folder import PAFolderProvider
 from .imap import ImapProvider
@@ -88,6 +89,7 @@ class ProviderThread:
         summary = {"provider": self.provider.id, "fetched": 0, "written": 0,
                    "errors": [], "triage": None,
                    "at": datetime.now().isoformat(timespec="seconds")}
+        sync = getattr(self.provider, "sync", None)
         try:
             for msg in self.provider.fetch_new(self.state):
                 summary["fetched"] += 1
@@ -96,8 +98,12 @@ class ProviderThread:
                     summary["written"] += 1
                 except Exception as e:
                     summary["errors"].append(f"write {msg.id[:30]}: {type(e).__name__}: {e}")
+                    self._requeue(msg, e)
+                    continue
+                self._ledger(sync, msg)
         except Exception as e:
             summary["errors"].append(f"fetch: {type(e).__name__}: {e}")
+        summary["reconcile"] = self._maybe_reconcile(sync)
         if self.run_triage:
             try:
                 from ..triage.pipeline import run_cycle
@@ -114,6 +120,49 @@ class ProviderThread:
             except Exception:
                 pass
         return summary
+
+    def _ledger(self, sync, msg) -> None:
+        """Captured: record identity and state in the sync ledger."""
+        if sync is None:
+            return
+        sid = getattr(msg, "sync_id", "") or msg.provider_ref
+        if not sid:
+            return
+        try:
+            sync.upsert(self.provider.id, sid,
+                        folder=getattr(msg, "sync_folder", "") or msg.folder,
+                        labels=getattr(msg, "sync_labels", None) or getattr(msg, "labels", None),
+                        flags=getattr(msg, "sync_flags", None),
+                        message_id=msg.internet_message_id)
+            retry = getattr(self.provider, "retry", None)
+            if retry is not None:
+                retry.done(sid)
+        except Exception as e:  # noqa: BLE001
+            note = getattr(self.provider, "note_warning", None)
+            if callable(note):
+                note(f"sync ledger write failed ({type(e).__name__})")
+
+    def _requeue(self, msg, err) -> None:
+        """The provider handed us the message but it could not be written:
+        the provider's cursor has moved, so queue a re-fetch."""
+        sid = getattr(msg, "sync_id", "") or msg.provider_ref
+        can_refetch = type(self.provider).fetch_item is not BaseProvider.fetch_item \
+            if isinstance(self.provider, BaseProvider) else False
+        if sid and can_refetch:
+            self.provider.fetch_failed(sid, getattr(msg, "sync_folder", "") or msg.folder, err)
+
+    def _maybe_reconcile(self, sync):
+        if sync is None or not isinstance(self.provider, BaseProvider) or \
+                type(self.provider).server_counts is BaseProvider.server_counts:
+            return None
+        interval = int(((self.cfg or {}).get("mail") or {}).get("reconcile_seconds")
+                       or reconcile.DEFAULT_INTERVAL_S)
+        try:
+            if not reconcile.is_due(sync, self.provider.id, interval):
+                return None
+            return reconcile.run(self.provider, sync)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
 
     def _loop(self):
         time.sleep(5)
@@ -149,7 +198,12 @@ class ProviderThread:
             "cycles": self.cycles,
             "last_cycle": self.last_cycle,
             "state_warnings": list(self.state.warnings),
+            "queued_ids": len(self.state.get("pending_ids") or []),
         })
+        try:
+            h["sync"] = self.provider.sync_status() if hasattr(self.provider, "sync_status") else {}
+        except Exception as e:  # noqa: BLE001
+            h["sync"] = {"error": str(e)}
         return h
 
 

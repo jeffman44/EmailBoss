@@ -7,12 +7,13 @@
   .\tasks.ps1 run             # start the app from source on :8080 with a dev license
   .\tasks.ps1 serve-license   # license server on :8600 (dev key, trials on)
   .\tasks.ps1 build           # wheel + PyInstaller onedir bundle
-  .\tasks.ps1 check           # compileall + banned-literal / em-dash scan
+  .\tasks.ps1 check           # compileall + banned-literal / em-dash scan + both pytest suites
+  .\tasks.ps1 bench           # 50k-message benchmark (writes app\bench.json)
   .\tasks.ps1 clean
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("help", "install-dev", "test", "test-app", "test-license", "run", "serve-license", "build", "wheel", "check", "clean")]
+    [ValidateSet("help", "install-dev", "test", "test-app", "test-license", "run", "serve-license", "build", "wheel", "check", "bench", "clean")]
     [string]$Task = "help",
     [string]$Python = "python",
     [int]$Port = 8080,
@@ -61,7 +62,14 @@ switch ($Task) {
         $em  = $files | Select-String -Pattern ([string][char]0x2014)
         if ($bad) { $bad | ForEach-Object { Write-Host $_ }; throw "banned literal found" }
         if ($em)  { $em  | ForEach-Object { Write-Host $_ }; throw "em dash found" }
+        Invoke-In $App { & $Python -m pytest -q }
+        Invoke-In $Lic { & $Python -m pytest -q }
         Write-Host "check ok"
+    }
+    "bench" {
+        $env:EB_BENCH = "1"
+        try { Invoke-In $App { & $Python -m pytest -q tests\bench } }
+        finally { Remove-Item Env:EB_BENCH -ErrorAction SilentlyContinue }
     }
     "clean" {
         foreach ($d in "$App\build", "$App\dist", "$Lic\build", "$Lic\dist") {

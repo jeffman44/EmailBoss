@@ -192,6 +192,12 @@ class MailProvider(Protocol):
                      reply_to: Message | None = None) -> dict: ...
 
 
+class SkipItem(Exception):
+    """fetch_item: the item exists but is not something the capture path
+    keeps (for example a Gmail message that left INBOX and SENT). The retry
+    is dropped without marking the item removed."""
+
+
 class BaseProvider:
     """Shared plumbing: a status dict every provider reports through health()."""
     id = "base"
@@ -204,6 +210,92 @@ class BaseProvider:
         self._last_error: str | None = None
         self._fetched_total = 0
         self._warnings: list[str] = []
+        self._sync = None
+        self._retry = None
+        self.clock = None          # tests inject a fake clock for the retry queue
+
+    # ── sync truth (Phase 0): ledger + retry queue in <mail_cache>/sync.sqlite ──
+    @property
+    def sync(self):
+        """The SyncDB for this provider's mail cache, or None without one."""
+        if self._sync is None:
+            cache = getattr(self, "cache_dir", None)
+            if cache:
+                from .syncdb import open_sync
+                self._sync = open_sync(cache)
+        return self._sync
+
+    @sync.setter
+    def sync(self, value):
+        self._sync = value
+        self._retry = None
+
+    @property
+    def retry(self):
+        if self._retry is None and self.sync is not None:
+            import time as _time
+            from .retry_queue import RetryQueue
+            self._retry = RetryQueue(self.sync, self.id, clock=self.clock or _time.time)
+        return self._retry
+
+    def fetch_failed(self, item_id: str, folder: str, err: Exception | str) -> None:
+        """One fetch failed: queue it for retry (or warn when there is no queue)."""
+        text = err if isinstance(err, str) else f"{type(err).__name__}: {err}"
+        if self.retry is not None:
+            row = self.retry.enqueue(item_id, folder, text)
+            if row["gave_up"]:
+                self.note_warning(f"{item_id}: gave up after {row['attempts']} attempts ({text[:80]})")
+        else:
+            self.note_warning(f"{item_id} failed ({text[:80]}); no retry queue, skipped")
+
+    def fetch_item(self, item_id: str, folder: str = "") -> Message | None:
+        """Fetch one server item by its sync id (the retry path). Return None
+        when the server says it no longer exists; raise on any other failure."""
+        raise NotImplementedError(f"{self.id} cannot fetch one item by id")
+
+    def server_counts(self) -> dict:
+        """{folder_kind: total} as the server reports it (reconcile.py)."""
+        raise NotImplementedError(f"{self.id} cannot count server messages")
+
+    def _drain_retries(self, limit: int = 50) -> Iterator[Message]:
+        """Yield every due retry that now succeeds. Gone items are marked
+        removed in the ledger; failures are re-enqueued with backoff."""
+        if self.retry is None:
+            return
+        for row in self.retry.due(limit):
+            iid, folder = row["item_id"], row.get("folder") or ""
+            if self.sync.has(self.id, iid):
+                self.retry.done(iid)          # captured meanwhile by the normal path
+                continue
+            try:
+                msg = self.fetch_item(iid, folder)
+            except NotImplementedError:
+                return
+            except SkipItem:
+                self.retry.done(iid)
+                continue
+            except Exception as e:
+                self.fetch_failed(iid, folder, e)
+                continue
+            if msg is None:
+                self.retry.done(iid)
+                self.sync.mark_removed(self.id, iid, "gone on retry")
+                continue
+            # The row is cleared only after the consumer took the message (the
+            # runner clears it on a successful write); a closed generator or a
+            # crash here leaves it queued.
+            yield msg
+            self.retry.done(iid)
+
+    def sync_status(self) -> dict:
+        """Retry queue and last reconcile, for health."""
+        if self.sync is None:
+            return {}
+        from . import reconcile as _rec
+        try:
+            return {"retry": self.retry.stats(), "reconcile": _rec.latest(self.sync, self.id)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
 
     # ── mail client defaults: not supported ──
     def capabilities(self) -> dict:

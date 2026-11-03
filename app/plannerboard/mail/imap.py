@@ -396,12 +396,17 @@ def _select(conn, folder):
 
 
 _FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
+FLAG_WINDOW = 2000
 
 
 def _fetch_one(conn, uid):
     """(raw_bytes, flags) for one UID. BODY.PEEK never marks a message read."""
     typ, data = conn.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[])")
-    if typ != "OK" or not data:
+    if typ != "OK":
+        # A NO / BAD is a failed fetch (retried), never "no such message".
+        raise RuntimeError(f"UID FETCH {uid} -> {typ}: "
+                           f"{(data[0] if data else b'')!r}"[:200])
+    if not data:
         return None, []
     raw, flags = None, []
     for item in data:
@@ -544,46 +549,140 @@ class _ImapCapture(BaseProvider):
             _close(conn)
 
     def _folder_pass(self, conn, folder_kind, folder_name, state: ProviderState, limit):
-        """Fetch one folder. Yields (record, note)."""
+        """Fetch one folder, then reconcile it. Yields Message."""
         prior = state.folder(folder_kind)
         uidvalidity = _select(conn, folder_name)
         last_uid = int(prior.get("last_uid") or 0)
         if prior.get("uidvalidity") and int(prior["uidvalidity"]) != uidvalidity:
             self.note_warning(f"UIDVALIDITY changed {prior['uidvalidity']} -> {uidvalidity} "
-                              f"on {folder_name}; watermark reset")
+                              f"on {folder_name}; watermark reset, folder re-indexed")
             last_uid = 0
+            self._retire_epoch(folder_kind, uidvalidity)
         if prior.get("folder") and prior["folder"] != folder_name:
             self.note_warning(f"folder renamed {prior['folder']!r} -> {folder_name!r}; watermark reset")
             last_uid = 0
+            # Sync ids carry no mailbox name: the new mailbox's UIDs must not
+            # match the old one's rows, even when UIDVALIDITY is the same.
+            self._retire_epoch(folder_kind, None)
         uids = _search_uids(conn, last_uid, self.settings["initial_days"])
         cap = max(1, min(int(limit or 0) or self.settings["max_per_cycle"], self.settings["max_per_cycle"]))
         more = len(uids) > cap
         uids = uids[:cap]
         highest = last_uid
+        sync = self.sync
         for uid in uids:
+            sid = f"{folder_kind}:{uidvalidity}:{uid}"
+            highest = max(highest, uid)
+            if sync is not None and sync.has(self.id, sid):
+                continue
             try:
-                raw, flags = _fetch_one(conn, uid)
-                highest = max(highest, uid)
-                if not raw:
-                    continue
-                record = message_to_record(raw, folder_kind=folder_kind,
-                                           uidvalidity=uidvalidity, uid=uid, flags=flags)
-                problems = validate_record(record)
-                if problems:
-                    self.note_warning(f"record shape warning uid={uid}: {problems[:2]}")
-                msg = Message.from_pa_record(record, folder_kind)
-                msg.provider, msg.provider_ref = self.id, f"{folder_kind}:{uidvalidity}:{uid}"
-                yield msg
+                msg = self._uid_to_message(conn, folder_kind, uidvalidity, uid)
             except Exception as e:
-                # ONE bad message never strands the folder behind it.
-                self.note_warning(f"uid {uid} in {folder_name} failed ({type(e).__name__}); skipped")
-                highest = max(highest, uid)
+                # ONE bad message never strands the folder behind it, and it is
+                # retried later instead of being skipped forever.
+                self.fetch_failed(sid, folder_kind, e)
+                continue
+            if msg is not None:
+                yield msg
         state.data.setdefault("folders", {})[folder_kind] = {
             "folder": folder_name, "uidvalidity": uidvalidity,
             "last_uid": highest, "updated_at": now_local_iso(),
         }
         if more:
             self.note_warning(f"{folder_name}: more than {cap} new messages, continuing next cycle")
+        try:
+            self._reconcile_folder(conn, folder_kind, uidvalidity)
+        except Exception as e:
+            self.note_warning(f"{folder_name}: change check failed ({type(e).__name__})")
+
+    def _uid_to_message(self, conn, folder_kind, uidvalidity, uid):
+        raw, flags = _fetch_one(conn, uid)
+        if not raw:
+            return None
+        record = message_to_record(raw, folder_kind=folder_kind,
+                                   uidvalidity=uidvalidity, uid=uid, flags=flags)
+        problems = validate_record(record)
+        if problems:
+            self.note_warning(f"record shape warning uid={uid}: {problems[:2]}")
+        msg = Message.from_pa_record(record, folder_kind)
+        msg.provider, msg.provider_ref = self.id, f"{folder_kind}:{uidvalidity}:{uid}"
+        msg.sync_id, msg.sync_folder, msg.sync_flags = msg.provider_ref, folder_kind, list(flags or [])
+        return msg
+
+    def _retire_epoch(self, folder_kind: str, uidvalidity: int | None) -> int:
+        """UIDVALIDITY changed: every UID of the old epoch is meaningless now.
+        Mark those ledger rows removed and drop their queued retries, so the
+        re-index that follows is the only copy the store counts."""
+        sync = self.sync
+        if sync is None:
+            return 0
+        keep = f"{folder_kind}:{int(uidvalidity)}:" if uidvalidity is not None else None
+        n = 0
+        for sid in sync.live_ids(self.id, prefix=f"{folder_kind}:"):
+            if keep is None or not sid.startswith(keep):
+                sync.mark_removed(self.id, sid, "uidvalidity reset" if keep else "folder changed")
+                n += 1
+        if self.retry is not None:
+            for sid in self.retry.pending_ids():
+                if sid.startswith(f"{folder_kind}:") and (keep is None or not sid.startswith(keep)):
+                    self.retry.done(sid)
+        return n
+
+    def _reconcile_folder(self, conn, folder_kind: str, uidvalidity: int) -> dict:
+        """Deletion and flag propagation without CONDSTORE: compare the
+        ledger's live UIDs for this epoch with ``UID SEARCH ALL`` (expunged on
+        the server = removed here) and refresh FLAGS for the most recent
+        ``FLAG_WINDOW`` of them."""
+        sync = self.sync
+        out = {"removed": 0, "flags_changed": 0}
+        if sync is None:
+            return out
+        prefix = f"{folder_kind}:{int(uidvalidity)}:"
+        live = {}
+        for sid in sync.live_ids(self.id, prefix=prefix):
+            try:
+                live[int(sid.rsplit(":", 1)[1])] = sid
+            except ValueError:
+                continue
+        if not live:
+            return out
+        typ, data = conn.uid("SEARCH", None, "ALL")
+        if typ != "OK":
+            raise RuntimeError("UID SEARCH ALL failed")
+        on_server = set()
+        for tok in (data[0] or b"").split() if data else []:
+            try:
+                on_server.add(int(tok))
+            except ValueError:
+                continue
+        for uid, sid in live.items():
+            if uid not in on_server:
+                sync.mark_removed(self.id, sid, "expunged on server")
+                out["removed"] += 1
+        window = sorted(u for u in live if u in on_server)[-FLAG_WINDOW:]
+        for i in range(0, len(window), 500):
+            chunk = window[i:i + 500]
+            typ, data = conn.uid("FETCH", ",".join(str(u) for u in chunk), "(FLAGS)")
+            if typ != "OK":
+                continue
+            for item in data or []:
+                head = item[0] if isinstance(item, tuple) else item
+                if not isinstance(head, (bytes, bytearray)):
+                    continue
+                m_uid = _UID_RE.search(bytes(head))
+                m_fl = _FLAGS_RE.search(bytes(head))
+                if not m_uid or not m_fl:
+                    continue
+                uid = int(m_uid.group(1))
+                sid = live.get(uid)
+                if not sid:
+                    continue
+                flags = sorted(m_fl.group(1).decode("ascii", "replace").split())
+                row = sync.get(self.id, sid)
+                if row is not None and sorted(row["flags"]) != flags:
+                    sync.set_flags(self.id, sid, flags)
+                    out["flags_changed"] += 1
+        return out
 
     def fetch_new(self, state: ProviderState, limit: int = 200) -> Iterator[Message]:
         """One capture cycle. Never raises; errors land in health()."""
@@ -595,6 +694,10 @@ class _ImapCapture(BaseProvider):
             if not s.get("user") or not s.get("host"):
                 raise ValueError("IMAP is enabled but no host/user is configured")
             conn = self._connect()
+            self._cycle_conn = conn
+            for msg in self._drain_retries():
+                n += 1
+                yield msg
             for kind, folder in (("inbox", s["inbox_folder"]), ("sent", s["sent_folder"])):
                 if not folder:
                     continue
@@ -610,8 +713,52 @@ class _ImapCapture(BaseProvider):
         except Exception as e:
             self._record_fetch(n, f"{type(e).__name__}: {e}")
         finally:
+            self._cycle_conn = None
             _close(conn)
         self.last_summary = {"fetched": n, "errors": errors}
+
+    def _folder_for_kind(self, kind: str) -> str | None:
+        return {"inbox": self.settings.get("inbox_folder"),
+                "sent": self.settings.get("sent_folder")}.get(kind)
+
+    def fetch_item(self, item_id: str, folder: str = "") -> Message | None:
+        """Retry one ``kind:uidvalidity:uid``. A different epoch means the UID
+        no longer names that message: report it gone."""
+        try:
+            kind, uv, uid = item_id.split(":", 2)
+            uv, uid = int(uv), int(uid)
+        except ValueError:
+            return None
+        name = self._folder_for_kind(kind)
+        if not name:
+            return None
+        conn = getattr(self, "_cycle_conn", None)
+        own = conn is None
+        if own:
+            conn = self._connect()
+        try:
+            if _select(conn, name) != uv:
+                return None
+            return self._uid_to_message(conn, kind, uv, uid)
+        finally:
+            if own:
+                _close(conn)
+
+    def server_counts(self) -> dict:
+        out = {}
+        conn = self._connect(timeout=25)
+        try:
+            for kind in ("inbox", "sent"):
+                name = self._folder_for_kind(kind)
+                if not name:
+                    continue
+                typ, data = conn.status(_quote_folder(name), "(MESSAGES)")
+                m = re.search(rb"MESSAGES (\d+)", (data[0] if data else b"") or b"")
+                if typ == "OK" and m:
+                    out[kind] = int(m.group(1))
+        finally:
+            _close(conn)
+        return out
 
     def health(self) -> dict:
         h = self.base_health()

@@ -4,7 +4,8 @@
 #   make run             start the app from source on :8080 with a dev license
 #   make serve-license   start the license server on :8600 (dev key, trials on)
 #   make build           wheel + PyInstaller onedir bundle (app/dist/)
-#   make check           compileall + the banned-literal / em-dash grep
+#   make check           compileall + the banned-literal / em-dash grep + both pytest suites
+#   make bench           the 50k-message benchmark (writes app/bench.json)
 #   make clean
 
 PY       ?= python3
@@ -20,7 +21,7 @@ GREP_FILES := --include='*.md' --include='*.py' --include='*.html' --include='*.
               --exclude-dir=__pycache__ --exclude-dir=dist --exclude-dir=build \
               --exclude=tasks.ps1 --exclude=Makefile
 
-.PHONY: help test test-app test-license run serve-license build wheel check clean install-dev
+.PHONY: help test test-app test-license run serve-license build wheel check bench clean install-dev
 
 help:
 	@grep -E '^#   make' Makefile | sed 's/^#   //'
@@ -53,7 +54,12 @@ check:
 	cd $(APP) && $(PY) -m compileall -q plannerboard
 	@! grep -rInE $(GREP_FILES) 'amsofusa|\bAMS\b|JDeuel|QRF|SAMPro|Tucson|C:\\Workspace' . || (echo "banned literal found" && exit 1)
 	@! grep -rIn $(GREP_FILES) "$$(printf '\342\200\224')" . || (echo "em dash found" && exit 1)
+	cd $(APP) && $(PY) -m pytest -q
+	cd $(LIC) && $(PY) -m pytest -q
 	@echo "check ok"
+
+bench:
+	cd $(APP) && EB_BENCH=1 $(PY) -m pytest -q tests/bench
 
 clean:
 	rm -rf $(APP)/build $(APP)/dist $(APP)/*.egg-info $(LIC)/build $(LIC)/dist $(LIC)/*.egg-info
