@@ -142,8 +142,10 @@ class FakeGmail:
         if path == "/messages":
             if "q" in q:          # the capture path's dated window: inbox and sent only
                 ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
-            else:                 # no query: the whole mailbox (backfill, list views)
+            else:                 # no query: the whole mailbox (backfill), or one label (list views)
                 ids = list(self.msgs)
+            if q.get("labelIds"):
+                ids = [g for g in ids if set(q["labelIds"]) <= self.msgs[g]["labels"]]
             ids.reverse()   # newest first, like the API
             page_size = int(q.get("maxResults", ["100"])[0])
             offset = int(q.get("pageToken", ["0"])[0])

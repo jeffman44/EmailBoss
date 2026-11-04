@@ -170,44 +170,61 @@
   // 2.0: the list reads from the store on this computer. The server is asked
   // only when the store cannot answer for this folder, for a server search
   // (the fallback row) and when the person presses Refresh.
-  async function loadStore(reset) {
+  // mode: 'reset' (new folder or query), 'more' (next page) or 'fresh' (the
+  // periodic refresh: re-read from the top so new mail shows, keeping what is
+  // loaded, the cursor and the open message).
+  async function loadStore(mode, seq) {
     const f = S.folders.find(x => x.id === S.folder) || {};
-    const offset = reset ? 0 : S.rows.length;
-    const q = new URLSearchParams({ folder_id: S.folder, folder_kind: f.kind || 'other', offset: String(offset), limit: '200' });
+    const offset = mode === 'more' ? S.rows.length : 0;
+    const limit = mode === 'fresh' ? Math.max(S.rows.length, 200) : 200;
+    const q = new URLSearchParams({ folder_id: S.folder, folder_kind: f.kind || 'other', offset: String(offset), limit: String(limit) });
     const r = await api('/api/mail/store/list?' + q.toString());
+    if (seq !== S.loadSeq) return 'stale';
     if (!r.covered) return false;
     S.source = 'store';
-    S.rows = reset ? (r.messages || []) : S.rows.concat(r.messages || []);
+    S.rows = mode === 'more' ? S.rows.concat(r.messages || []) : (r.messages || []);
     S.total = r.total || S.rows.length;
     S.cursor = S.rows.length < S.total ? 'store' : null;
     return true;
   }
+  // Every load carries a sequence number: a folder switch or a new query
+  // starts a new one at once (never blocked by a page still loading) and a
+  // reply for an older one is dropped instead of painting the old folder.
   async function loadList(reset, quiet) {
-    if (!S.folder || S.loading) return;
+    if (!S.folder) return;
+    if (!reset && S.loading) return;
+    const mode = reset ? 'reset' : (quiet ? 'fresh' : 'more');
+    const seq = S.loadSeq = (S.loadSeq || 0) + 1;
     S.loading = true;
     if (reset && !quiet) { S.rows = []; $('mail-rows').innerHTML = '<div class="mail-empty">Loading...</div>'; }
     try {
-      if (!S.query && (reset || S.source === 'store') && await loadStore(reset)) {
+      const fromStore = !S.query && (reset || S.source === 'store') ? await loadStore(mode, seq) : false;
+      if (fromStore === 'stale') return;
+      if (fromStore) {
         S.lastList = Date.now();
-        if (reset || quiet) await loadLocalDrafts();
+        if (mode !== 'more') await loadLocalDrafts();
+        if (seq !== S.loadSeq) return;
         renderRows();
         return;
       }
       S.source = 'server';
       const q = new URLSearchParams({ folder: S.folder, limit: '50' });
       if (S.query) q.set('q', S.query);
-      if (!reset && S.cursor) q.set('cursor', S.cursor);
+      if (mode === 'more' && S.cursor) q.set('cursor', S.cursor);
       const r = await api('/api/mail/client/messages?' + q.toString());
-      S.rows = (reset || !S.cursor) ? (r.messages || []) : S.rows.concat(r.messages || []);
+      if (seq !== S.loadSeq) return;
+      S.rows = (mode === 'more' && S.cursor) ? S.rows.concat(r.messages || []) : (r.messages || []);
       S.cursor = r.next_cursor || null;
       S.lastList = Date.now();
-      if (reset || quiet) await loadLocalDrafts();
+      if (mode !== 'more') await loadLocalDrafts();
+      if (seq !== S.loadSeq) return;
       renderRows();
     } catch (e) {
+      if (seq !== S.loadSeq) return;
       // The board outbox still shows in Drafts even when the mailbox is unreachable.
       if (folderKind() === 'drafts') { await loadLocalDrafts(); S.rows = []; renderRows(e.message); }
       else emptyWith(e.message);
-    } finally { S.loading = false; }
+    } finally { if (seq === S.loadSeq) S.loading = false; }
   }
 
   // -- the list: virtualized, fixed row height per density
@@ -275,7 +292,7 @@
       spacer.appendChild(row);
     });
     // Near the end of what is loaded: fetch the next store page.
-    if (S.source === 'store' && S.cursor && !S.loading && first + count >= S.rows.length - 20) loadList(false, true);
+    if (S.source === 'store' && S.cursor && !S.loading && first + count >= S.rows.length - 20) loadList(false);
   }
   // Cursor, selection, read and star changes touch only the rows already on
   // screen (no rebuild, no layout read): this is what keeps j / k cheap on a

@@ -172,6 +172,12 @@ def _mail_store_for(prov):
         return None
 
 
+def _sid(prov, ref):
+    """A client ref as the store's id (IMAP refs differ; the rest are the same)."""
+    f = getattr(prov, "store_id", None)
+    return f(ref) if callable(f) else ref
+
+
 def _store_after(prov, fn, *args, **kw):
     """Apply a write to the store; a store problem never fails the write."""
     st = _mail_store_for(prov)
@@ -397,15 +403,15 @@ def api_flags():
     try:
         prior = None
         st = _mail_store_for(prov)
-        row = st.get(getattr(prov, "account_id", prov.id), ref) if st is not None else None
+        row = st.get(getattr(prov, "account_id", prov.id), _sid(prov, ref)) if st is not None else None
         if row is not None:
             prior = {"read": bool(row.get("is_read")), "flagged": bool(row.get("is_starred"))}
         ok = prov.set_flags(ref, read=data.get("read"), flagged=data.get("flagged"))
-        _store_after(prov, terminal.apply_flags, ref, read=data.get("read"), flagged=data.get("flagged"))
+        _store_after(prov, terminal.apply_flags, _sid(prov, ref), read=data.get("read"), flagged=data.get("flagged"))
         out = {"ok": bool(ok), "ref": ref}
         if data.get("undoable") and prior is not None:
             inverse = {k: prior[k] for k in ("read", "flagged") if data.get(k) is not None}
-            out["action_id"] = _store_after(prov, terminal.record, "flags", ref, inverse,
+            out["action_id"] = _store_after(prov, terminal.record, "flags", _sid(prov, ref), inverse,
                                             data.get("label") or "Change flags")
         return jsonify(out)
     except Exception as e:
@@ -424,15 +430,22 @@ def api_move():
         return error_response(400, "Pick a message and a folder first.")
     from ..mail import terminal
     try:
-        st = _mail_store_for(prov)
-        row = st.get(getattr(prov, "account_id", prov.id), ref) if st is not None else None
+        sref = _sid(prov, ref)
+        undo_data = _store_after(prov, terminal.undo_data, sref, prov) if data.get("undoable") else None
         new_ref = prov.move_message(ref, folder)
-        _store_after(prov, terminal.apply_move, ref, folder, new_ref)
+        sid = _store_after(prov, terminal.apply_move, sref, folder, new_ref, prov)
         out = {"ok": True, "ref": ref, "new_ref": new_ref, "folder": folder}
-        if data.get("undoable"):
-            out["action_id"] = _store_after(prov, terminal.record, "move", ref, {
-                "new_ref": new_ref or ref, "from_folder": data.get("from") or (row or {}).get("folder") or "inbox",
-                "from_kind": (row or {}).get("folder") or "inbox"}, data.get("label") or f"Move to {folder}")
+        # A provider that hands the message a new id without saying which (IMAP
+        # without COPYUID), or a folder the store only knows as "other" on
+        # Graph, leaves nothing to undo against.
+        lost = (new_ref is None and prov.id == "imap") or (
+            prov.id == "graph" and (undo_data or {}).get("from_folder") == "other")
+        if undo_data is not None and not lost:
+            undo_data["new_ref"] = sid or new_ref or ref
+            if not callable(getattr(prov, "restore_labels", None)):
+                undo_data.pop("prior_labels", None)
+            out["action_id"] = _store_after(prov, terminal.record, "move", sid or sref, undo_data,
+                                            data.get("label") or f"Move to {folder}")
         return jsonify(out)
     except Exception as e:
         return _fail(e)
@@ -450,7 +463,7 @@ def api_delete():
     from ..mail import terminal
     try:
         ok = bool(prov.delete_message(ref))
-        _store_after(prov, terminal.apply_move, ref, "trash", None)
+        _store_after(prov, terminal.apply_move, _sid(prov, ref), "trash", None, prov)
         return jsonify({"ok": ok, "ref": ref})
     except Exception as e:
         return _fail(e)

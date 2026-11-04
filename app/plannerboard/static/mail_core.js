@@ -207,6 +207,20 @@
     if (!ref) return;
     if (S.sel.has(ref)) S.sel.delete(ref); else S.sel.add(ref);
     if (M.updateRowStates) M.updateRowStates();
+    if (searchShowing()) PBMailSearch.refreshStates();
+  }
+
+  // Rows the person is looking at: search results while they show, else the folder.
+  function viewRows() {
+    const r = window.PBMailSearch && PBMailSearch.rows && PBMailSearch.rows();
+    return r || S.rows;
+  }
+  function searchShowing() { return !!(window.PBMailSearch && PBMailSearch.rows && PBMailSearch.rows()); }
+  // A dialog on top of the mail view (Settings, Decisions, AI, CSV import,
+  // the board's key sheet, the palette): mail keys stay out of its way.
+  function overlayOpen() {
+    return !!document.querySelector('#set-overlay.open, #dec-overlay.open, #ai-overlay.open, #csv-overlay.open,'
+      + ' #kbd-overlay.open, #eb-palette.open, .eb-modal.open');
   }
 
   // -- timing hook: the bench reads window.__eb_timing on the Windows runner
@@ -216,5 +230,5 @@
     if (Array.isArray(t[kind])) { t[kind].push(Math.round(ms * 10) / 10); if (t[kind].length > 200) t[kind].shift(); }
   }
 
-  Object.assign(M, { density, rowHeight, applyDensity, cycleDensity, toggleSelect, timed, $, AUTOSAVE_MS, BAD_CSS, C, DROP_TAGS, IMG_KEY, IMG_PROXY, MAX_PROXY_BYTES, MAX_PROXY_IMAGES, OK_TAGS, PLACEHOLDER, PTR_KEY, S, UNDO_SEND_MS, api, cleanUrl, del_, el, esc, escA, fetchProxied, fmtDate, fmtSize, htmlToText, isRemote, looksHtml, normRemote, openSettingsTab, post, projectOptions, proxyImages, put, restoreRemote, sanitizeClient, sanitizeNode, say, senderKey, senderTrusted, textToHtml, toastAction, trustSender, viewVisible });
+  Object.assign(M, { viewRows, searchShowing, overlayOpen, density, rowHeight, applyDensity, cycleDensity, toggleSelect, timed, $, AUTOSAVE_MS, BAD_CSS, C, DROP_TAGS, IMG_KEY, IMG_PROXY, MAX_PROXY_BYTES, MAX_PROXY_IMAGES, OK_TAGS, PLACEHOLDER, PTR_KEY, S, UNDO_SEND_MS, api, cleanUrl, del_, el, esc, escA, fetchProxied, fmtDate, fmtSize, htmlToText, isRemote, looksHtml, normRemote, openSettingsTab, post, projectOptions, proxyImages, put, restoreRemote, sanitizeClient, sanitizeNode, say, senderKey, senderTrusted, textToHtml, toastAction, trustSender, viewVisible });
 })();

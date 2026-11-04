@@ -107,7 +107,9 @@ window.PBMailSearch = (() => {
     if ((r.messages || []).length) {
       host.appendChild(el('div', { class: 'mail-group', text: `Messages (${r.total}${r.truncated ? '+' : ''})` }));
       r.messages.forEach((m) => {
-        const row = el('div', { class: `mail-row ms-row ${m.is_read ? '' : 'unread'}`, dataset: { ref: m.ref, account: m.account } }, [
+        const core = window.EBMailCore && EBMailCore.S;
+        const extra = core ? `${m.ref === core.cursorRef ? ' cursor' : ''}${core.sel.has(m.ref) ? ' selected' : ''}` : '';
+        const row = el('div', { class: `mail-row ms-row ${m.is_read ? '' : 'unread'}${extra}`, dataset: { ref: m.ref, account: m.account } }, [
           el('div', { class: 'mr-from', text: m.folder === 'sent' ? ('To: ' + (m.to || '')) : (m.from || m.from_email || '') }),
           el('div', { class: 'mr-date', text: fmtDate(m.date) }),
           el('div', { class: 'mr-subj', text: m.subject || '(no subject)' }),
@@ -187,5 +189,33 @@ window.PBMailSearch = (() => {
     }
   }, true);
 
-  return { onInput, run, leave, active: () => S.active, state: S };
+  // The keyboard and the list actions work on what is on screen: while
+  // results show, that is these rows, not the folder behind them.
+  function rows() {
+    return S.active && S.res ? (S.res.messages || []).map(m => Object.assign(m, { flagged: !!m.starred })) : null;
+  }
+  function drop(refs) {
+    if (!S.res) return;
+    const gone = new Set(refs);
+    S.res.messages = (S.res.messages || []).filter(m => !gone.has(m.ref));
+    S.res.total = Math.max(0, (S.res.total || 0) - refs.length);
+    render();
+  }
+  function update(ref, patch) {
+    const m = S.res && (S.res.messages || []).find(x => x.ref === ref);
+    if (!m) return;
+    Object.assign(m, patch);
+    if ('flagged' in patch) m.starred = patch.flagged;
+  }
+  function refreshStates() {
+    const core = window.EBMailCore && EBMailCore.S;
+    if (!core) return;
+    document.querySelectorAll('#mail-rows .ms-row').forEach((n) => {
+      n.classList.toggle('cursor', n.dataset.ref === core.cursorRef);
+      n.classList.toggle('selected', core.sel.has(n.dataset.ref));
+      if (n.dataset.ref === core.cursorRef && n.scrollIntoView) n.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  return { onInput, run, leave, active: () => S.active, state: S, rows, drop, update, render, refreshStates };
 })();

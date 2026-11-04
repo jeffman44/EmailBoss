@@ -51,7 +51,7 @@ window.PBPalette = (() => {
     const input = $('eb-pal-input');
     input.addEventListener('input', () => { clearTimeout(P.timer); P.timer = setTimeout(() => refresh(input.value), 120); });
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); return; }
       if (e.key === 'ArrowDown') { e.preventDefault(); move(1); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); return; }
       if (e.key === 'Enter') { e.preventDefault(); runIdx(P.idx); }
@@ -177,6 +177,11 @@ window.PBPalette = (() => {
   // Ctrl+K / Cmd+K anywhere opens it (capture phase: before the board's keys).
   window.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+      // Leave Ctrl+K to rich-text editors and to the composer (insert link).
+      const t = e.target;
+      if (!P.open && t && t.isContentEditable) return;
+      const mc = document.getElementById('mail-compose-overlay');
+      if (!P.open && mc && mc.classList.contains('open')) return;
       e.preventDefault(); e.stopPropagation();
       if (P.open) close(); else open();
     }

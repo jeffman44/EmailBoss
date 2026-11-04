@@ -137,10 +137,12 @@ def test_csp_no_inline_handlers():
         for rx in (handler, js_url):
             bad += [f"{p.name}: {m.group(0)}" for m in rx.finditer(text)]
     assert not bad, bad[:10]
-    page = (STATIC / "board.html").read_text(encoding="utf-8")
-    csp = re.search(r'Content-Security-Policy" content="([^"]+)"', page).group(1)
-    assert "unsafe-inline" not in re.search(r"script-src ([^;]+)", csp).group(1)
-    assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", page), "inline <script> block"
+    for name in ("board.html", "setup.html"):
+        page = (STATIC / name).read_text(encoding="utf-8")
+        csp = re.search(r'Content-Security-Policy" content="([^"]+)"', page).group(1)
+        assert "'self'" in re.search(r"script-src ([^;]+)", csp).group(1), name
+        assert "unsafe-inline" not in re.search(r"script-src ([^;]+)", csp).group(1), name
+        assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", page), f"inline <script> block in {name}"
     for name in ("eval(", "new Function("):
         for p in _static_files():
             if p.suffix == ".js":
@@ -149,7 +151,7 @@ def test_csp_no_inline_handlers():
 
 # 1.x files that predate the rule. They may not grow (plan section 2, rule 9:
 # no NEW file over 1,500 lines; board.js changes only through Phase 4 hooks).
-LEGACY_CEILINGS = {"board.js": 10191, "board.html": 3700}
+LEGACY_CEILINGS = {"board.js": 10191, "board.html": 3693}   # their size at Phase 2; they only shrink
 
 
 def test_no_static_file_over_1500_lines():

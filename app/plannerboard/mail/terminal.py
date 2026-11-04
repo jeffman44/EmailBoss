@@ -50,9 +50,19 @@ def folder_filter(folder: dict) -> tuple[str, list] | None:
     return None
 
 
+def covered(store, account_id: str, folder: dict) -> bool:
+    """The store answers for inbox and sent (the capture path keeps them) and,
+    once the backfill has walked the whole mailbox, for every folder."""
+    kind = (folder.get("kind") or "other").lower()
+    if kind in ("inbox", "sent") and not str(folder.get("id") or "").startswith("Label_"):
+        return True
+    from .sync import state
+    return bool(state(store, account_id).get("done"))
+
+
 def list_rows(store, account_id: str, folder: dict, offset: int = 0, limit: int = 100) -> dict | None:
     f = folder_filter(folder)
-    if f is None:
+    if f is None or not covered(store, account_id, folder):
         return None
     cond, args = f
     limit = max(1, min(int(limit or 100), ROW_LIMIT))
@@ -131,20 +141,64 @@ def apply_flags(store, account_id: str, ref: str, read=None, flagged=None) -> No
     store.set_flags(account_id, ref, flags)
 
 
-def apply_move(store, account_id: str, ref: str, dest_kind: str, new_ref: str | None) -> None:
-    """The message left its folder. Same id (Gmail, Graph): the folder changes.
-    New id (IMAP MOVE/COPY): the old row is gone; the new one arrives with the
-    next backfill or capture."""
+def apply_move(store, account_id: str, ref: str, dest_kind: str, new_ref: str | None, provider=None) -> str | None:
+    """The message left its folder; keep the row in step with the server.
+
+    - Gmail: re-read the labels (a move adds and drops several, user labels
+      included) and derive the folder from them.
+    - Graph and IMAP give the message a new id on move: the row takes the new
+      id, so it stays listed and an undo can find it.
+    Returns the message's id in the store after the move."""
     row = store.get(account_id, ref)
     if not row:
-        return
+        return None
     kind = dest_kind if dest_kind in STANDARD_KINDS else "other"
-    if new_ref and new_ref != ref:
-        store.mark_removed(account_id, ref, f"moved to {kind}")
-        return
+    if provider is not None and callable(getattr(provider, "labels_of", None)):
+        try:
+            labels = provider.labels_of(ref)
+        except Exception:
+            labels = None
+        if labels is not None:
+            from .gmail import folder_for_labels
+            set_labels(store, account_id, ref, labels, folder_for_labels(labels))
+            return ref
+    sid = new_ref
+    if provider is not None and callable(getattr(provider, "store_id", None)):
+        sid = provider.store_id(new_ref)
+    if sid and sid != ref:
+        if store.has(account_id, sid, live_only=False):
+            store.mark_removed(account_id, ref, f"moved to {kind}")
+            return sid
+        with store._conn() as c:
+            c.execute("UPDATE mail_messages SET provider_id=?, folder=?, updated_at=? WHERE account_id=? AND provider_id=?",
+                      (sid, kind, time.time(), account_id, ref))
+        return sid
     with store._conn() as c:
         c.execute("UPDATE mail_messages SET folder=?, updated_at=? WHERE account_id=? AND provider_id=?",
                   (kind, time.time(), account_id, ref))
+    return ref
+
+
+def set_labels(store, account_id: str, ref: str, labels, folder: str) -> None:
+    row = store.get(account_id, ref)
+    if not row:
+        return
+    new = set(labels or ())
+    old = set(row["labels"])
+    store.apply_labels(account_id, ref, added=new - old, removed=old - new, folder_fn=lambda _l: folder)
+
+
+def undo_data(store, account_id: str, ref: str, provider) -> dict | None:
+    """What a move needs to be reversed, taken from the message's own row (not
+    from the folder on screen: a message opened from search, the palette or
+    the timeline does not live there)."""
+    row = store.get(account_id, ref)
+    if not row:
+        return None
+    back = row.get("folder") or "inbox"
+    if callable(getattr(provider, "undo_folder", None)):
+        back = provider.undo_folder(row)
+    return {"from_kind": row.get("folder") or "inbox", "from_folder": back, "prior_labels": row.get("labels") or []}
 
 
 # ── undo ─────────────────────────────────────────────────────────────────────
@@ -174,10 +228,16 @@ def undo(store, provider, account_id: str, action_id: str) -> dict:
         out = {"ref": a["ref"]}
     elif a["kind"] == "move":
         at = data.get("new_ref") or a["ref"]
-        back = data.get("from_folder") or "inbox"
-        nr = provider.move_message(at, back)
-        apply_move(store, account_id, at, data.get("from_kind") or back, nr)
-        out = {"ref": nr or at}
+        if data.get("prior_labels") and callable(getattr(provider, "restore_labels", None)):
+            labels = provider.restore_labels(at, data["prior_labels"])
+            from .gmail import folder_for_labels
+            set_labels(store, account_id, at, labels, folder_for_labels(labels))
+            out = {"ref": at}
+        else:
+            back = data.get("from_folder") or "inbox"
+            nr = provider.move_message(at, back)
+            sid = apply_move(store, account_id, at, data.get("from_kind") or back, nr, provider)
+            out = {"ref": sid or nr or at}
     else:
         raise LookupError(f"Email Boss cannot undo a {a['kind']} action.")
     with store._conn() as c:

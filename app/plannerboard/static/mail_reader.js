@@ -42,15 +42,22 @@
         ? await api('/api/mail/store/message?ref=' + encodeURIComponent(ref))
         : await api('/api/mail/client/message?ref=' + encodeURIComponent(ref) + '&mark_read=1');
     } catch (e) {
+      if (S.openRef !== ref) return;
+      S.open = null;                                  // nothing stale left to reply to
       pane.innerHTML = '';
       pane.appendChild(el('div', { class: 'mail-read-empty', text: e.message }));
       return;
     }
     if (S.openRef !== ref) return;                    // a newer j / k won
     const row = S.rows.find(r => r.ref === ref);
+    if (fromStore && S.open && !S.open.is_read) {
+      // Opened from the list, search, the palette or the timeline: read on the server too.
+      post('/api/mail/client/flags', { ref, read: true }).catch(() => {});
+      S.open.is_read = true;
+      if (window.PBMailSearch && PBMailSearch.update) PBMailSearch.update(ref, { is_read: true });
+    }
     if (row && !row.is_read) {
       row.is_read = true; bumpUnread(-1); if (M.updateRowStates) M.updateRowStates();
-      if (fromStore) post('/api/mail/client/flags', { ref, read: true }).catch(() => {});
     }
     S.open._loadImages = senderTrusted(S.open);
     renderOpen();

@@ -34,18 +34,20 @@
     }
   }
 
-  function cursorIndex() {
+  function cursorIndex(rows) {
     const ref = S.cursorRef || S.openRef;
-    return S.rows.findIndex(r => r.ref === ref);
+    return rows.findIndex(r => r.ref === ref);
   }
   function moveCursor(dir, open) {
-    if (!S.rows.length) return;
-    const i = cursorIndex();
-    const n = i < 0 ? (dir > 0 ? 0 : S.rows.length - 1) : Math.min(S.rows.length - 1, Math.max(0, i + dir));
-    const row = S.rows[n];
+    const rows = M.viewRows();
+    if (!rows.length) return;
+    const i = cursorIndex(rows);
+    const n = i < 0 ? (dir > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, i + dir));
+    const row = rows[n];
     if (!row) return;
     S.cursorRef = row.ref;
     if (open) M.openMessage(row.ref);
+    else if (M.searchShowing()) PBMailSearch.refreshStates();
     else if (M.scrollToRef) M.scrollToRef(row.ref);
   }
   // j / k: when a message is open, the next one opens (reading flow);
@@ -57,6 +59,9 @@
     const ref = S.openRef || S.cursorRef;
     return ref ? [ref] : [];
   }
+  // The open message only when it is the one the pane shows (a failed or
+  // still-loading open must not leave a reply aimed at the previous one).
+  function openMsg() { return S.open && S.open.ref === S.openRef ? S.open : null; }
   function backToList() {
     S.open = null; S.openRef = null;
     if (M.renderOpen) M.renderOpen();
@@ -74,9 +79,12 @@
   }
 
   function onKey(e) {
-    if (!M.viewVisible()) return;
+    if (!M.viewVisible() || M.overlayOpen()) return;
     const keysOpen = $('mail-keys') && $('mail-keys').classList.contains('open');
+    const t0 = e.target;
+    const inField = t0 && (/^(INPUT|TEXTAREA|SELECT)$/.test(t0.tagName) || t0.isContentEditable);
     if (e.key === 'Escape') {
+      if (inField && !C.open && !keysOpen) return;       // a field's own Escape (search box, settings)
       if (keysOpen) { toggleKeys(false); e.preventDefault(); return; }
       if (C.open) { M.closeCompose(); e.preventDefault(); return; }
       if (S.sel.size) { S.sel.clear(); if (M.updateRowStates) M.updateRowStates(); return; }
@@ -93,7 +101,7 @@
     if (pending) {
       const p = pending; pending = null; clearTimeout(pendingTimer);
       if (p === 'g' && 'itbp'.includes(e.key)) { go(e.key); e.preventDefault(); return; }
-      if (p === '*' && e.key === 'a') { S.rows.forEach(r => S.sel.add(r.ref)); if (M.updateRowStates) M.updateRowStates(); M.say(`${S.sel.size} selected`); e.preventDefault(); return; }
+      if (p === '*' && e.key === 'a') { M.viewRows().forEach(r => S.sel.add(r.ref)); if (M.updateRowStates) M.updateRowStates(); M.say(`${S.sel.size} selected`); e.preventDefault(); return; }
     }
     switch (e.key) {
       case '?': toggleKeys(); break;
@@ -106,14 +114,14 @@
       case '#': if (c.move || c.delete) M.listAction('trash', targets()); break;
       case 's': if (c.flags) {
         const refs = targets();
-        const first = S.rows.find(r => r.ref === refs[0]) || S.open || {};
+        const first = M.viewRows().find(r => r.ref === refs[0]) || openMsg() || {};
         M.listAction('star', refs, { on: !first.flagged });
       } break;
-      case 'r': if (S.open && canWrite) M.reply('reply'); break;
-      case 'a': if (S.open && canWrite) M.reply('reply_all'); break;
-      case 'f': if (S.open && canWrite) M.reply('forward'); break;
+      case 'r': if (openMsg() && canWrite) M.reply('reply'); break;
+      case 'a': if (openMsg() && canWrite) M.reply('reply_all'); break;
+      case 'f': if (openMsg() && canWrite) M.reply('forward'); break;
       case 'c': if (canWrite) M.compose(); break;
-      case ']': if (S.open && M.toggleContext) M.toggleContext(); break;
+      case ']': if (openMsg() && M.toggleContext) M.toggleContext(); break;
       case 'g': case '*':
         pending = e.key; clearTimeout(pendingTimer); pendingTimer = setTimeout(() => { pending = null; }, 1500);
         break;
