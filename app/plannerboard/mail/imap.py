@@ -573,7 +573,7 @@ class _ImapCapture(BaseProvider):
         for uid in uids:
             sid = f"{folder_kind}:{uidvalidity}:{uid}"
             highest = max(highest, uid)
-            if sync is not None and sync.has(self.id, sid):
+            if sync is not None and sync.captured(self.account_id, sid, live_only=True):
                 continue
             try:
                 msg = self._uid_to_message(conn, folder_kind, uidvalidity, uid)
@@ -618,9 +618,9 @@ class _ImapCapture(BaseProvider):
             return 0
         keep = f"{folder_kind}:{int(uidvalidity)}:" if uidvalidity is not None else None
         n = 0
-        for sid in sync.live_ids(self.id, prefix=f"{folder_kind}:"):
+        for sid in sync.live_ids(self.account_id, prefix=f"{folder_kind}:"):
             if keep is None or not sid.startswith(keep):
-                sync.mark_removed(self.id, sid, "uidvalidity reset" if keep else "folder changed")
+                sync.mark_removed(self.account_id, sid, "uidvalidity reset" if keep else "folder changed")
                 n += 1
         if self.retry is not None:
             for sid in self.retry.pending_ids():
@@ -639,7 +639,7 @@ class _ImapCapture(BaseProvider):
             return out
         prefix = f"{folder_kind}:{int(uidvalidity)}:"
         live = {}
-        for sid in sync.live_ids(self.id, prefix=prefix):
+        for sid in sync.live_ids(self.account_id, prefix=prefix):
             try:
                 live[int(sid.rsplit(":", 1)[1])] = sid
             except ValueError:
@@ -657,7 +657,7 @@ class _ImapCapture(BaseProvider):
                 continue
         for uid, sid in live.items():
             if uid not in on_server:
-                sync.mark_removed(self.id, sid, "expunged on server")
+                sync.mark_removed(self.account_id, sid, "expunged on server")
                 out["removed"] += 1
         window = sorted(u for u in live if u in on_server)[-FLAG_WINDOW:]
         for i in range(0, len(window), 500):
@@ -678,9 +678,9 @@ class _ImapCapture(BaseProvider):
                 if not sid:
                     continue
                 flags = sorted(m_fl.group(1).decode("ascii", "replace").split())
-                row = sync.get(self.id, sid)
+                row = sync.get(self.account_id, sid)
                 if row is not None and sorted(row["flags"]) != flags:
-                    sync.set_flags(self.id, sid, flags)
+                    sync.set_flags(self.account_id, sid, flags)
                     out["flags_changed"] += 1
         return out
 
@@ -743,6 +743,79 @@ class _ImapCapture(BaseProvider):
         finally:
             if own:
                 _close(conn)
+
+    def backfill_page(self, cursor, limit: int = 200, body_since_ts: float | None = None):
+        """One page of the full mailbox: every selectable folder, newest UIDs
+        first, headers only (BODY.PEEK, never sets \\Seen) except inside the
+        body window. Inbox and sent use the capture ids (``kind:uv:uid``) so
+        the two paths dedupe; other folders use ``x:<folder>:uv:uid``."""
+        import json as _json
+        st = _json.loads(cursor) if cursor else None
+        if st is None:
+            folders = []
+            for f in self.list_folders():
+                if f.get("noselect"):
+                    continue
+                folders.append({"id": f["id"], "kind": f.get("kind") or "other"})
+            st = {"folders": folders, "fi": 0, "below": None}
+        out = []
+        while st["fi"] < len(st["folders"]) and not out:
+            f = st["folders"][st["fi"]]
+            name, kind = f["id"], f["kind"]
+            capture_kind = {self.settings.get("inbox_folder"): "inbox",
+                            self.settings.get("sent_folder"): "sent"}.get(name)
+            with self._client() as conn:
+                uv = self._open(conn, name, readonly=True)
+                typ, data = conn.uid("SEARCH", None, "ALL")
+                uids = sorted((int(t) for t in ((data or [b""])[0] or b"").split() if t.isdigit()), reverse=True)
+                if st["below"] is not None:
+                    uids = [u for u in uids if u < st["below"]]
+                batch = uids[:max(1, int(limit or 100))]
+                for uid in batch:
+                    sid = f"{capture_kind}:{uv}:{uid}" if capture_kind else f"x:{name}:{uv}:{uid}"
+                    if self.sync is not None and self.sync.has(self.account_id, sid, live_only=False):
+                        continue
+                    try:
+                        msg = self._backfill_one(conn, uid, uv, sid, capture_kind or kind, body_since_ts)
+                    except Exception as e:  # noqa: BLE001
+                        self.note_warning(f"backfill: {name} uid {uid} skipped ({type(e).__name__})")
+                        continue
+                    if msg is not None:
+                        out.append(msg)
+                if len(uids) > len(batch):
+                    st["below"] = batch[-1]
+                else:
+                    st["fi"] += 1
+                    st["below"] = None
+        done = st["fi"] >= len(st["folders"])
+        return out, (None if done else _json.dumps(st)), done
+
+    def _backfill_one(self, conn, uid, uv, sid, kind, body_since_ts):
+        typ, data = conn.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[HEADER])")
+        if typ != "OK":
+            raise RuntimeError(f"UID FETCH {uid} -> {typ}")
+        raw, flags = None, []
+        for item in data or []:
+            if isinstance(item, tuple) and len(item) >= 2:
+                raw = bytes(item[1]) if isinstance(item[1], (bytes, bytearray)) else raw
+                m = _FLAGS_RE.search(item[0] if isinstance(item[0], bytes) else b"")
+                if m:
+                    flags = m.group(1).decode("ascii", "replace").split()
+        if not raw:
+            return None
+        rec = message_to_record(raw, folder_kind=kind if kind in ("inbox", "sent") else "inbox",
+                                uidvalidity=uv, uid=uid, flags=flags)
+        msg = Message.from_pa_record(rec, kind if kind in ("inbox", "sent") else "inbox")
+        ts = msg.received_at.timestamp() if msg.received_at else 0
+        if body_since_ts is None or ts >= body_since_ts:
+            full, flags2 = _fetch_one(conn, uid)
+            if full:
+                rec = message_to_record(full, folder_kind=kind if kind in ("inbox", "sent") else "inbox",
+                                        uidvalidity=uv, uid=uid, flags=flags2 or flags)
+                msg = Message.from_pa_record(rec, kind if kind in ("inbox", "sent") else "inbox")
+        msg.provider, msg.provider_ref = self.id, sid
+        msg.sync_id, msg.sync_folder, msg.sync_flags = sid, kind, list(flags or [])
+        return msg
 
     def server_counts(self) -> dict:
         out = {}

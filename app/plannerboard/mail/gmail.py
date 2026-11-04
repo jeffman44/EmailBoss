@@ -66,6 +66,13 @@ def folder_for_labels(labels) -> str:
     return "archive"
 
 
+def _msg_ts(msg) -> float:
+    try:
+        return msg.received_at.timestamp()
+    except Exception:
+        return 0.0
+
+
 def _is_not_found(e: Exception) -> bool:
     return "-> 404" in str(e)
 
@@ -263,7 +270,7 @@ class GmailProvider(BaseProvider):
             done = 0
             while pending and done < cap:
                 gid = pending[0]
-                if (sync is not None and sync.has(self.id, gid, live_only=False)) or gid in seen:
+                if (sync is not None and sync.captured(self.account_id, gid)) or gid in seen:
                     pending.pop(0)
                     continue
                 done += 1
@@ -273,7 +280,7 @@ class GmailProvider(BaseProvider):
                     pending.pop(0)
                     if _is_not_found(e):
                         if sync is not None:
-                            sync.mark_removed(self.id, gid, "gone before fetch")
+                            sync.mark_removed(self.account_id, gid, "gone before fetch")
                     else:
                         self.fetch_failed(gid, "", e)
                     continue
@@ -342,7 +349,7 @@ class GmailProvider(BaseProvider):
                         continue
                     adds.pop(gid, None)
                     if sync is not None:
-                        sync.mark_removed(self.id, gid, "deleted")
+                        sync.mark_removed(self.account_id, gid, "deleted")
                 for key, added in (("labelsAdded", True), ("labelsRemoved", False)):
                     for ev in h.get(key) or []:
                         m = ev.get("message") or {}
@@ -352,7 +359,7 @@ class GmailProvider(BaseProvider):
                             continue
                         row = None
                         if sync is not None:
-                            row = sync.apply_labels(self.id, gid,
+                            row = sync.apply_labels(self.account_id, gid,
                                                     added=delta if added else (),
                                                     removed=() if added else delta,
                                                     folder_fn=folder_for_labels)
@@ -377,6 +384,33 @@ class GmailProvider(BaseProvider):
             # labelAdded INBOX queues it again.
             raise SkipItem(item_id)
         return msg
+
+    def backfill_page(self, cursor, limit: int = 200, body_since_ts: float | None = None):
+        """One page of the full mailbox (every label, spam and trash included),
+        newest first. Headers via ``format=metadata``; the body only inside
+        the body window. Ids the store already has are skipped."""
+        params = {"maxResults": max(1, min(int(limit or 100), PAGE_CAP)), "includeSpamTrash": "true"}
+        if cursor:
+            params["pageToken"] = cursor
+        body = self._get("/messages", params)
+        out = []
+        sync = self.sync
+        for m in body.get("messages") or []:
+            gid = m.get("id")
+            if not gid or (sync is not None and sync.has(self.account_id, gid, live_only=False)):
+                continue
+            try:
+                msg = self._fetch_message(gid, any_folder=True, fmt="metadata")
+                if msg is not None and (body_since_ts is None or _msg_ts(msg) >= body_since_ts):
+                    msg = self._fetch_message(gid, any_folder=True) or msg
+            except Exception as e:
+                if not _is_not_found(e):
+                    self.note_warning(f"backfill: message {gid} skipped ({type(e).__name__})")
+                continue
+            if msg is not None:
+                out.append(msg)
+        nxt = body.get("nextPageToken")
+        return out, nxt, not nxt
 
     def server_counts(self) -> dict:
         out = {}

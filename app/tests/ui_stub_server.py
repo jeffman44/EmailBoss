@@ -364,6 +364,27 @@ def api_mail_messages():
     return jsonify({"ok": True, "folder": request.args.get("folder"), "messages": rows, "next_cursor": None, "total": len(rows)})
 
 
+@app.route("/api/mail/search")
+def api_mail_search():
+    """The local store search (2.0): matches by subject, one hint for a bad operator."""
+    q = (request.args.get("q") or "").strip()
+    hints = [f'"{q.split(":")[0]}:" is not a search operator'] if q.startswith("frm:") else []
+    words = q.lower().replace("frm:", "")
+    rows = [{"account": "imap", "ref": m["ref"], "subject": m["subject"], "from": m["from"], "from_email": m["from_email"],
+             "to": m["to"], "date": m["date"], "snippet": "local hit", "folder": "inbox", "has_attachments": False,
+             "is_read": True, "starred": False, "body_searched": True, "historical": False, "score": 1.0}
+            for m in MAIL_MSGS.values() if words and words in m["subject"].lower()]
+    return jsonify({"ok": True, "query": q, "messages": rows, "total": len(rows), "truncated": False, "people": [],
+                    "attachments": [], "hints": hints, "operators": [],
+                    "coverage": {"sentence": "Body text searched since Oct 1, 2026.", "not_local": 0},
+                    "server_fallback": {"label": f'Search the server for "{q}"'}})
+
+
+@app.route("/api/mail/store/reindex", methods=["POST"])
+def api_mail_reindex():
+    return jsonify({"ok": True, "messages": len(MAIL_MSGS)})
+
+
 @app.route("/api/mail/client/message")
 def api_mail_message():
     m = MAIL_MSGS.get(request.args.get("ref") or "")

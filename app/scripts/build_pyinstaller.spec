@@ -110,7 +110,7 @@ hiddenimports += ["webview", "webview.platforms"]
 # webview/js/*, and the keyring / pystray entry-point metadata.
 try:
     from PyInstaller.utils.hooks import collect_all, copy_metadata
-    _collect = ["webview", "pystray", "keyring"]
+    _collect = ["webview", "pystray", "keyring", "sqlcipher3"]
     if sys.platform == "win32":
         _collect += ["pythonnet", "clr_loader", "win32ctypes"]
     for _pkg in _collect:

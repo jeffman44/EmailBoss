@@ -37,6 +37,8 @@ def _cache_files(cache: Path, folder="inbox"):
 
 
 def _thread(prov, cache, **mail):
+    # The capture path only: the store backfill job has its own tests.
+    mail.setdefault("store", {"backfill": False})
     cfg = {"paths": {"mail_cache": str(cache)}, "mail": dict(mail)}
     return ProviderThread(prov, cfg, store=None, profession={}, run_triage=False, poll_seconds=60)
 
@@ -112,7 +114,10 @@ class FakeGmail:
                 body["nextPageToken"] = str(offset + page_size)
             return 200, body
         if path == "/messages":
-            ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
+            if "q" in q:          # the capture path's dated window: inbox and sent only
+                ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
+            else:                 # no query: the whole mailbox (backfill, list views)
+                ids = list(self.msgs)
             ids.reverse()   # newest first, like the API
             page_size = int(q.get("maxResults", ["100"])[0])
             offset = int(q.get("pageToken", ["0"])[0])

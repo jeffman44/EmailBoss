@@ -23,6 +23,7 @@ desktop = ["pywebview>=5.0", "plyer>=2.1"]
 attachments = ["pdfplumber>=0.10", "openpyxl>=3.1"]
 http = ["httpx>=0.25"]
 dev = ["pytest>=7"]
+encrypt = ["sqlcipher3>=0.6.4"]
 
 [project.scripts]
 plannerboard = "plannerboard.start:main"

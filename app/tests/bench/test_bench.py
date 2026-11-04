@@ -14,6 +14,7 @@ Metrics:
 - ``reconcile_ms``       one reconcile pass over the full ledger
 - ``list_page_ms_p50``   GET /api/mail/client/messages (50 rows) through the API
 - ``open_message_ms_p50`` GET /api/mail/client/message through the API
+- ``search_ms_p50``      local store search over the synced mailbox (Phase 1)
 
 The fake server answers in-process, so network latency is excluded: these
 numbers are the app's own cost, which is what 2.0 changes.
@@ -97,7 +98,8 @@ def synced(mailbox, results):
     cache = root / "mail_cache"
     prov = GmailProvider({"mail": {"gmail": {"client_id": "cid"}}}, cache, http=server)
     prov.tokens.save({"access_token": "AT", "expires_at": 9_999_999_999})
-    t = ProviderThread(prov, {"paths": {"mail_cache": str(cache)}, "mail": {"reconcile_seconds": 10 ** 9}},
+    t = ProviderThread(prov, {"paths": {"mail_cache": str(cache)}, "mail": {"reconcile_seconds": 10 ** 9,
+                                                                  "store": {"backfill": False}}},
                        store=None, profession={}, run_triage=False, poll_seconds=60)
     cycles = []
     started = time.perf_counter()
@@ -165,3 +167,18 @@ def test_open_message(api, results):
         times.append(time.perf_counter() - t0)
         assert r.status_code == 200, r.get_data(as_text=True)[:200]
     _check(results, "open_message_ms_p50", _ms(statistics.median(times)))
+
+
+def test_search(synced, results):
+    from plannerboard.mail import index
+    prov, _cache, _t, _c = synced
+    queries = ["message", "\"Message m012345\"", "from:dana", "body m04", "has:attachment",
+               "message -m000001", "in:sent message", "m049"]
+    times = []
+    for _ in range(5):
+        for q in queries:
+            t0 = time.perf_counter()
+            index.search(prov.sync, q, limit=50)
+            times.append(time.perf_counter() - t0)
+    assert index.search(prov.sync, "\"Message m012345\"")["messages"][0]["ref"] == "m012345"
+    _check(results, "search_ms_p50", _ms(statistics.median(times)))

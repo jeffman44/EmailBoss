@@ -24,7 +24,7 @@ FOLDERS = ("inbox", "sent")
 
 def run(provider, sync: SyncDB, clock=time.time) -> dict:
     """Count, compare, store. Never raises."""
-    pid = getattr(provider, "id", "unknown")
+    pid = getattr(provider, "account_id", None) or getattr(provider, "id", "unknown")
     now = clock()
     local = sync.local_counts(pid)
     out = {"provider": pid, "checked_at": now, "folders": {}, "error": None}

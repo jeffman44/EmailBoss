@@ -1,0 +1,25 @@
+{
+  "note": "Golden queries for tests/test_store_search.py::test_search_golden_set. 'expect' ids must all be in the results; 'first' must rank first; 'absent' ids must not appear. Ids are the fixture mailbox's provider ids.",
+  "queries": [
+    {"q": "lobby", "expect": ["m01", "m02", "m03"], "first": "m03"},
+    {"q": "\"lobby retrofit\"", "expect": ["m01", "m02"], "absent": ["m03"]},
+    {"q": "from:dana", "expect": ["m01", "m02", "m05"], "absent": ["m04"]},
+    {"q": "from:northwind.example", "expect": ["m01", "m02", "m05"]},
+    {"q": "to:sam", "expect": ["m01"]},
+    {"q": "subject:invoice", "expect": ["m04", "m06"], "absent": ["m05"]},
+    {"q": "invoice -overdue", "expect": ["m04"], "absent": ["m06"]},
+    {"q": "chiller OR boiler", "expect": ["m07", "m08"]},
+    {"q": "has:attachment", "expect": ["m02", "m09"], "absent": ["m01"]},
+    {"q": "filename:submittal", "expect": ["m09"]},
+    {"q": "VFD-4471", "expect": ["m09", "m10"]},
+    {"q": "4471", "expect": ["m09", "m10"]},
+    {"q": "is:unread", "expect": ["m05"], "absent": ["m01"]},
+    {"q": "is:starred", "expect": ["m07"]},
+    {"q": "in:sent", "expect": ["m11"], "absent": ["m01"]},
+    {"q": "after:2026-10-20", "expect": ["m10", "m11"], "absent": ["m01"]},
+    {"q": "older_than:1y", "expect": ["m12"]},
+    {"q": "parking", "expect": ["m12"]},
+    {"q": "rooftop", "expect": ["m13"], "absent": ["m14"]},
+    {"q": "lob", "expect": ["m01", "m02", "m03"]}
+  ]
+}

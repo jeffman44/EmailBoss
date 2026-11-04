@@ -13,11 +13,27 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
   drafts, questions, notes, AI usage ledger, assistant log.
 - `mail_cache/`: raw mail records and attachment bytes as captured, then
   moved to `processed/` and purged after 90 days.
-- `mail_cache/sync.sqlite`: the sync ledger. For each captured message it
-  holds the provider's message id, folder, labels, read and flag state and
-  the Message-ID header; plus failed fetches waiting for a retry and the
-  last server-versus-local message counts. No subjects, addresses or body
-  text. Plaintext, with SQLite `secure_delete` on.
+- `mail_cache/mail_store.sqlite`: the local mail store that search runs on.
+  For every message in every connected account: sender, recipients,
+  subject, date, folder, labels, read and flag state, attachment names and
+  the Message-ID header. Body text (with quoted replies removed), the
+  preview snippet and searchable attachment text are kept only for mail
+  inside the body window (`mail.store.body_days`, default 90 days; 0 keeps
+  every body). Once a day the window is applied to the store, to triaged
+  records in `mail_cache/processed/` and to board backups, together. Also
+  holds failed fetches waiting for a retry and the last server-versus-local
+  message counts.
+
+### Encryption at rest (decision recorded for 2.0)
+
+The mail store is plaintext by default, with SQLite `secure_delete` on and
+the 90-day body window. Setting `PB_STORE_ENCRYPT=1` opens it through
+SQLCipher with a random 256-bit key kept in the OS keyring
+(`mail_store_key`): an existing plaintext store is converted in place, and
+an encrypted store always stays encrypted (turning the setting off does not
+decrypt it). If the key is lost the store cannot be read and search stops
+until the key is restored or the store is deleted and rebuilt from the
+server. The board database (`plannerboard.db`) is not encrypted.
 - `project_files/`: attachments and intake files copied onto projects.
 - `backups/`, `logs/`, `workflows.json`, `plannerboard.json`.
 

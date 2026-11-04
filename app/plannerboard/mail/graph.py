@@ -231,14 +231,14 @@ class GraphProvider(BaseProvider):
         if "@removed" in item:
             if iid and sync is not None:
                 reason = ((item.get("@removed") or {}).get("reason") or "deleted")
-                sync.mark_removed(self.id, iid, f"graph {reason}")
+                sync.mark_removed(self.account_id, iid, f"graph {reason}")
                 if self.retry is not None:
                     self.retry.done(iid)
             return None
         if item.get("isDraft"):
             return None
-        if iid and sync is not None and sync.has(self.id, iid):
-            sync.set_flags(self.id, iid, _graph_flags(item))
+        if iid and sync is not None and sync.captured(self.account_id, iid, live_only=True):
+            sync.set_flags(self.account_id, iid, _graph_flags(item))
             return None
         try:
             return self._to_message(item, kind)
@@ -284,6 +284,48 @@ class GraphProvider(BaseProvider):
                 return None
             raise
         return self._to_message(item, folder or "inbox")
+
+    def _folder_kinds(self) -> dict:
+        """parentFolderId -> kind for the well-known folders (cached)."""
+        if getattr(self, "_fk", None) is None:
+            fk = {}
+            for wk, kind in WELL_KNOWN.items():
+                try:
+                    f = self._call("GET", f"/me/mailFolders/{wk}?$select=id")
+                    if f.get("id"):
+                        fk[f["id"]] = kind
+                except Exception:
+                    continue
+            self._fk = fk
+        return self._fk
+
+    def backfill_page(self, cursor, limit: int = 200, body_since_ts: float | None = None):
+        """One page of every message in the mailbox, newest first. Attachments
+        are listed only for messages inside the body window."""
+        url = cursor or (f"{GRAPH}/me/messages?" + urllib.parse.urlencode({
+            "$select": SELECT + ",parentFolderId", "$top": max(1, min(int(limit or 100), 100)),
+            "$orderby": "receivedDateTime desc"}))
+        page = self._call("GET", url)
+        kinds = self._folder_kinds()
+        out = []
+        sync = self.sync
+        for item in page.get("value") or []:
+            iid = item.get("id") or ""
+            if not iid or item.get("isDraft") or (sync is not None and sync.has(self.account_id, iid, live_only=False)):
+                continue
+            ts = parse_iso(item.get("receivedDateTime") or "")
+            recent = body_since_ts is None or (ts is not None and ts.timestamp() >= body_since_ts)
+            if not recent or not item.get("hasAttachments"):
+                item.setdefault("attachments", [])
+            try:
+                msg = self._to_message(item, kinds.get(item.get("parentFolderId"), "other"))
+            except Exception as e:
+                self.note_warning(f"backfill: message {iid[:20]} skipped ({type(e).__name__})")
+                continue
+            msg.sync_has_attachments = bool(item.get("hasAttachments"))
+            out.append(msg)
+        nxt = page.get("@odata.nextLink")
+        return out, nxt, not nxt
 
     def server_counts(self) -> dict:
         out = {}

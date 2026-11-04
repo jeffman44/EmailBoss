@@ -252,12 +252,29 @@ def test_mail_view_smoke(server, browser):
     assert not page.evaluate("() => document.querySelector('.mail-row').classList.contains('unread')")
     assert page.evaluate("() => document.querySelector('.mail-folder.active .mf-count').textContent.trim()") == ""
 
-    # search filters through the API
+    # search: the local store first, with the coverage footer and the server row last
     page.fill("#mail-search", "invoice")
     page.wait_for_timeout(700)
     assert page.evaluate("() => [...document.querySelectorAll('.mail-row .mr-subj')].map(e => e.textContent)") == ["Invoice 1042"]
+    assert "Body text searched since" in page.inner_text(".ms-footer")
+    assert page.inner_text(".ms-server") == 'Search the server for "invoice"'
+    page.fill("#mail-search", "frm:invoice")
+    page.wait_for_timeout(700)
+    assert "is not a search operator" in page.inner_text(".ms-hint")
+    page.click(".ms-server")                       # the fallback: the folder's server search
+    page.wait_for_timeout(700)
+    assert page.evaluate("() => document.querySelectorAll('.ms-footer').length") == 0
     page.fill("#mail-search", "")
     page.wait_for_timeout(700)
+    page.press("#mail-search", "Escape")
+    page.wait_for_timeout(500)
+    page.keyboard.press("/")                       # "/" focuses the search box in the mail view
+    assert page.evaluate("() => document.activeElement.id") == "mail-search"
+    page.keyboard.press("Escape")
+    page.keyboard.press("Control+k")
+    assert page.evaluate("() => document.activeElement.id") == "mail-search"
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(500)
     page.click(".mail-row >> nth=0")
     page.wait_for_timeout(500)
 
@@ -546,7 +563,8 @@ def test_board_source_has_no_inline_handlers():
     assert "unsafe-inline" not in script_src and "unsafe-eval" not in script_src
     assert not re.search(r"<script(?![^>]*\bsrc=)[^>]*>", page), "inline <script> block"
     attr = re.compile(r"(?<![\w.\-])on[a-z]+=[\"']")
-    for name, text in (("board.html", page), ("board.js", js), ("mail.js", (st / "mail.js").read_text(encoding="utf-8"))):
+    for name, text in (("board.html", page), ("board.js", js), ("mail.js", (st / "mail.js").read_text(encoding="utf-8")),
+                       ("mail_search.js", (st / "mail_search.js").read_text(encoding="utf-8"))):
         bad = [m.group(0) for m in attr.finditer(text)]
         assert not bad, f"{name}: inline handler attribute left: {bad[:3]}"
     # every handler the markup names must resolve to a function
