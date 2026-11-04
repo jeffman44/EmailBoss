@@ -118,6 +118,10 @@ class ProviderThread:
                 if historical:
                     # Before the install cutoff: store and search only, never triage.
                     summary["historical"] += 1
+                    if getattr(msg, "pa_path", None) is not None:
+                        _set_aside(self.cache_dir, msg.pa_path)
+                elif getattr(msg, "skip_write", False):
+                    pass                              # already in the cache (drop folder)
                 else:
                     try:
                         write_record(self.cache_dir, msg)
@@ -348,8 +352,8 @@ def wire_runtime(rt, llm=None, autostart: bool = True) -> MailRunner:
 
 
 def _msg_ts(msg) -> float | None:
-    from .store import _ts
-    return _ts(getattr(msg, "received_at", None))
+    from .store import msg_time
+    return msg_time(msg)
 
 
 def _iso_ts(raw) -> float | None:
@@ -361,3 +365,14 @@ def _iso_ts(raw) -> float | None:
         return None
     from .store import _ts
     return _ts(dt)
+
+
+def _set_aside(cache_dir, path) -> None:
+    """A drop-folder record from before the install cutoff: move it where
+    triage does not look (processed/<today>/historical/)."""
+    try:
+        dest = Path(cache_dir) / "processed" / datetime.now().strftime("%Y-%m-%d") / "historical"
+        dest.mkdir(parents=True, exist_ok=True)
+        Path(path).replace(dest / Path(path).name)
+    except OSError:
+        pass

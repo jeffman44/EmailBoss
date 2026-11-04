@@ -67,10 +67,8 @@ def folder_for_labels(labels) -> str:
 
 
 def _msg_ts(msg) -> float:
-    try:
-        return msg.received_at.timestamp()
-    except Exception:
-        return 0.0
+    from .store import msg_time
+    return msg_time(msg) or 0.0
 
 
 def _is_not_found(e: Exception) -> bool:
@@ -236,6 +234,7 @@ class GmailProvider(BaseProvider):
             prof = self._get("/profile")
             self.user_email = prof.get("emailAddress", "")
             newest_hist = prof.get("historyId")
+            self._file_label_names()
             if last_hist:
                 try:
                     ids, hist_after = self._history_scan(last_hist)
@@ -304,6 +303,19 @@ class GmailProvider(BaseProvider):
             if loaded:
                 state.set("pending_ids", pending)
                 state.save()
+
+    def _file_label_names(self) -> None:
+        """User label id -> name map, for the label: search operator."""
+        if self.sync is None:
+            return
+        try:
+            body = self._get("/labels")
+            names = {lb["id"]: lb.get("name") or lb["id"] for lb in body.get("labels") or []
+                     if str(lb.get("id", "")).startswith("Label_")}
+            import json as _json
+            self.sync.meta_set(f"labels:{self.account_id}", _json.dumps(names))
+        except Exception:
+            pass
 
     def _list_ids(self) -> list[str]:
         """Every id in the first-sync window (no cap: the cap applies to
@@ -397,7 +409,7 @@ class GmailProvider(BaseProvider):
         sync = self.sync
         for m in body.get("messages") or []:
             gid = m.get("id")
-            if not gid or (sync is not None and sync.has(self.account_id, gid, live_only=False)):
+            if not gid or (sync is not None and sync.indexed(self.account_id, gid)):
                 continue
             try:
                 msg = self._fetch_message(gid, any_folder=True, fmt="metadata")
@@ -405,7 +417,8 @@ class GmailProvider(BaseProvider):
                     msg = self._fetch_message(gid, any_folder=True) or msg
             except Exception as e:
                 if not _is_not_found(e):
-                    self.note_warning(f"backfill: message {gid} skipped ({type(e).__name__})")
+                    self.backfill_missed.append(gid)
+                    self.note_warning(f"backfill: some messages could not be read ({type(e).__name__})")
                 continue
             if msg is not None:
                 out.append(msg)
@@ -483,6 +496,11 @@ class GmailProvider(BaseProvider):
         msg.sync_id = gid
         msg.sync_folder = folder_for_labels(labels)
         msg.sync_labels = sorted(labels)
+        if m.get("internalDate"):
+            msg.sync_received_ts = int(m["internalDate"]) / 1000.0     # the server's receive time
+        if fmt == "metadata":
+            ctype = (hmap.get("content-type") or "").lower()
+            msg.sync_has_attachments = ctype.startswith("multipart/mixed")
         return msg
 
     def _body_from_walk(self, payload: dict, gid: str, atts: list[Attachment]) -> tuple[str, str]:

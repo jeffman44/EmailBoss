@@ -51,19 +51,21 @@ window.PBMailSearch = (() => {
   }
 
   function onInput(value) {
-    const q = (value || '').trim();
+    const raw = value || '';
     clearTimeout(S.timer);
-    if (!q) { leave(); return; }
-    S.timer = setTimeout(() => run(q), 180);
+    if (!raw.trim()) { leave(); return; }
+    S.timer = setTimeout(() => run(raw), 180);
   }
 
-  async function run(q) {
+  async function run(raw) {
+    const q = String(raw || '').trim();
     S.active = true; S.q = q;
     const mine = ++S.seq;
     const host = $('mail-rows');
     if (host && !S.res) host.innerHTML = '<div class="mail-empty">Searching...</div>';
     try {
-      const res = await call('/api/mail/search?' + new URLSearchParams({ q, limit: '100' }).toString());
+      // The raw text goes up: a trailing space tells the server the last word is finished.
+      const res = await call('/api/mail/search?' + new URLSearchParams({ q: String(raw).replace(/^\s+/, ''), limit: '100' }).toString());
       if (mine !== S.seq || !S.active) return;       // a newer keystroke won
       S.res = res;
       render();

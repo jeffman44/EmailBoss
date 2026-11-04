@@ -29,6 +29,7 @@ import imaplib
 import mimetypes
 import re
 import socket
+import time
 import ssl
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
@@ -424,6 +425,39 @@ def _fetch_one(conn, uid):
     return raw, flags
 
 
+_INTERNALDATE_RE = re.compile(rb'INTERNALDATE "([^"]+)"')
+
+
+def _internaldate_ts(head: bytes) -> float | None:
+    m = _INTERNALDATE_RE.search(head or b"")
+    if not m:
+        return None
+    try:
+        import imaplib as _il
+        tt = _il.Internaldate2tuple(b'INTERNALDATE "' + m.group(1) + b'"')
+        return time.mktime(tt) if tt else None
+    except Exception:
+        return None
+
+
+def _fetch_one_dated(conn, uid, part="BODY.PEEK[]"):
+    """(raw, flags, server_receive_ts) for one UID; raises on NO / BAD."""
+    typ, data = conn.uid("FETCH", str(uid), f"(FLAGS INTERNALDATE {part})")
+    if typ != "OK":
+        raise RuntimeError(f"UID FETCH {uid} -> {typ}: {(data[0] if data else b'')!r}"[:200])
+    raw, flags, ts = None, [], None
+    for item in data or []:
+        head = item[0] if isinstance(item, tuple) else item
+        head = bytes(head) if isinstance(head, (bytes, bytearray)) else b""
+        if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)) and item[1]:
+            raw = bytes(item[1])
+        m = _FLAGS_RE.search(head)
+        if m:
+            flags = m.group(1).decode("ascii", "replace").split()
+        ts = ts or _internaldate_ts(head)
+    return raw, flags, ts
+
+
 def _search_uids(conn, last_uid, initial_days):
     """UIDs to fetch, ascending. ``UID n:*`` always returns at least one
     message, so the result is filtered on the way out."""
@@ -596,7 +630,7 @@ class _ImapCapture(BaseProvider):
             self.note_warning(f"{folder_name}: change check failed ({type(e).__name__})")
 
     def _uid_to_message(self, conn, folder_kind, uidvalidity, uid):
-        raw, flags = _fetch_one(conn, uid)
+        raw, flags, server_ts = _fetch_one_dated(conn, uid)
         if not raw:
             return None
         record = message_to_record(raw, folder_kind=folder_kind,
@@ -607,6 +641,8 @@ class _ImapCapture(BaseProvider):
         msg = Message.from_pa_record(record, folder_kind)
         msg.provider, msg.provider_ref = self.id, f"{folder_kind}:{uidvalidity}:{uid}"
         msg.sync_id, msg.sync_folder, msg.sync_flags = msg.provider_ref, folder_kind, list(flags or [])
+        if server_ts:
+            msg.sync_received_ts = server_ts
         return msg
 
     def _retire_epoch(self, folder_kind: str, uidvalidity: int | None) -> int:
@@ -766,19 +802,26 @@ class _ImapCapture(BaseProvider):
                             self.settings.get("sent_folder"): "sent"}.get(name)
             with self._client() as conn:
                 uv = self._open(conn, name, readonly=True)
-                typ, data = conn.uid("SEARCH", None, "ALL")
-                uids = sorted((int(t) for t in ((data or [b""])[0] or b"").split() if t.isdigit()), reverse=True)
+                cache_key = (name, uv)
+                cached = getattr(self, "_bf_uids", None)
+                if not cached or cached[0] != cache_key:
+                    # One UID SEARCH ALL per folder walk, not per page.
+                    typ, data = conn.uid("SEARCH", None, "ALL")
+                    allu = sorted((int(t) for t in ((data or [b""])[0] or b"").split() if t.isdigit()), reverse=True)
+                    self._bf_uids = (cache_key, allu)
+                uids = list(self._bf_uids[1])
                 if st["below"] is not None:
                     uids = [u for u in uids if u < st["below"]]
                 batch = uids[:max(1, int(limit or 100))]
                 for uid in batch:
                     sid = f"{capture_kind}:{uv}:{uid}" if capture_kind else f"x:{name}:{uv}:{uid}"
-                    if self.sync is not None and self.sync.has(self.account_id, sid, live_only=False):
+                    if self.sync is not None and self.sync.indexed(self.account_id, sid):
                         continue
                     try:
                         msg = self._backfill_one(conn, uid, uv, sid, capture_kind or kind, body_since_ts)
                     except Exception as e:  # noqa: BLE001
-                        self.note_warning(f"backfill: {name} uid {uid} skipped ({type(e).__name__})")
+                        self.backfill_missed.append(sid)
+                        self.note_warning(f"backfill: some messages could not be read ({type(e).__name__})")
                         continue
                     if msg is not None:
                         out.append(msg)
@@ -791,30 +834,28 @@ class _ImapCapture(BaseProvider):
         return out, (None if done else _json.dumps(st)), done
 
     def _backfill_one(self, conn, uid, uv, sid, kind, body_since_ts):
-        typ, data = conn.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[HEADER])")
-        if typ != "OK":
-            raise RuntimeError(f"UID FETCH {uid} -> {typ}")
-        raw, flags = None, []
-        for item in data or []:
-            if isinstance(item, tuple) and len(item) >= 2:
-                raw = bytes(item[1]) if isinstance(item[1], (bytes, bytearray)) else raw
-                m = _FLAGS_RE.search(item[0] if isinstance(item[0], bytes) else b"")
-                if m:
-                    flags = m.group(1).decode("ascii", "replace").split()
+        raw, flags, server_ts = _fetch_one_dated(conn, uid, "BODY.PEEK[HEADER]")
         if not raw:
             return None
-        rec = message_to_record(raw, folder_kind=kind if kind in ("inbox", "sent") else "inbox",
-                                uidvalidity=uv, uid=uid, flags=flags)
-        msg = Message.from_pa_record(rec, kind if kind in ("inbox", "sent") else "inbox")
-        ts = msg.received_at.timestamp() if msg.received_at else 0
+        fk = kind if kind in ("inbox", "sent") else "inbox"
+        rec = message_to_record(raw, folder_kind=fk, uidvalidity=uv, uid=uid, flags=flags)
+        msg = Message.from_pa_record(rec, fk)
+        ts = server_ts or (msg.received_at.timestamp() if msg.received_at else 0)
+        header_only = True
         if body_since_ts is None or ts >= body_since_ts:
-            full, flags2 = _fetch_one(conn, uid)
+            full, flags2, ts2 = _fetch_one_dated(conn, uid)
             if full:
-                rec = message_to_record(full, folder_kind=kind if kind in ("inbox", "sent") else "inbox",
-                                        uidvalidity=uv, uid=uid, flags=flags2 or flags)
-                msg = Message.from_pa_record(rec, kind if kind in ("inbox", "sent") else "inbox")
+                rec = message_to_record(full, folder_kind=fk, uidvalidity=uv, uid=uid, flags=flags2 or flags)
+                msg = Message.from_pa_record(rec, fk)
+                header_only = False
+                server_ts = server_ts or ts2
+        if header_only:
+            head = raw.split(b"\r\n\r\n", 1)[0]
+            msg.sync_has_attachments = bool(re.search(rb"(?im)^content-type:\s*multipart/mixed", head))
         msg.provider, msg.provider_ref = self.id, sid
         msg.sync_id, msg.sync_folder, msg.sync_flags = sid, kind, list(flags or [])
+        if server_ts:
+            msg.sync_received_ts = server_ts
         return msg
 
     def server_counts(self) -> dict:

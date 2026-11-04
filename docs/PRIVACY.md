@@ -19,8 +19,11 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
   the Message-ID header. Body text (with quoted replies removed), the
   preview snippet and searchable attachment text are kept only for mail
   inside the body window (`mail.store.body_days`, default 90 days; 0 keeps
-  every body). Once a day the window is applied to the store, to triaged
-  records in `mail_cache/processed/` and to board backups, together. Also
+  every body). Once a day the window is applied to the store (body text,
+  snippet, part numbers read from the body, attachment text; the index is
+  then compacted and the write-ahead log folded back so the text does not
+  linger in the file), to triaged records in `mail_cache/processed/` and to
+  the board's own backup snapshots, together. Also
   holds failed fetches waiting for a retry and the last server-versus-local
   message counts.
 

@@ -166,12 +166,14 @@ def test_ranking_prefers_recent_and_replied_senders(tmp_path):
 def test_purge_removes_fts_cache_backups(tmp_path):
     cache = tmp_path / "mail_cache"
     st = open_store(cache)
-    old = _msg("o1", "Quarterly zebra review", "the zebramango figures", day="2026-01-05", atts=["zebrafile.txt"])
-    old.attachments[0].content_type, old.attachments[0].content = "text/plain", b"zebrafile secret text"
+    old = _msg("o1", "Quarterly zebra review", "the zebramango figures, PO-77812345", day="2026-01-05",
+               atts=["zebrafile.txt"])
+    old.attachments[0].content_type, old.attachments[0].content = "text/plain", b"qwertyuniquetoken payroll"
     st.ingest("gmail", old, attachment_text=index.attachment_text)
     st.ingest("gmail", _msg("n1", "Fresh", "the zebramango update", day="2026-11-01"))
     assert set(_ids(index.search(st, "zebramango", now=NOW))) == {"o1", "n1"}
-    assert index.search(st, "secret", now=NOW)["attachments"]
+    assert index.search(st, "qwertyuniquetoken", now=NOW)["attachments"]
+    assert _ids(index.search(st, "77812345", now=NOW)) == ["o1"]
 
     proc_old = cache / "processed" / "2026-01-10"
     proc_new = cache / "processed" / "2026-11-02"
@@ -180,24 +182,29 @@ def test_purge_removes_fts_cache_backups(tmp_path):
         (d / "rec.json").write_text("{}")
     backups = tmp_path / "backups"
     backups.mkdir()
-    b_old, b_new = backups / "plannerboard_20260110.db", backups / "plannerboard_20261102.db"
-    for b in (b_old, b_new):
+    b_old = backups / "plannerboard_20260110_020000.db"
+    b_new = backups / "plannerboard_20261102_020000.db"
+    b_other = backups / "my_own_notes.db"                  # not ours: never touched
+    for b in (b_old, b_new, b_other):
         b.write_text("x")
-    os.utime(b_old, (NOW - 200 * 86400, NOW - 200 * 86400))
-    os.utime(b_new, (NOW - 2 * 86400, NOW - 2 * 86400))
+    for b, age in ((b_old, 200), (b_new, 2), (b_other, 400)):
+        os.utime(b, (NOW - age * 86400, NOW - age * 86400))
 
     out = lifecycle.purge(st, {"mail": {"store": {"body_days": 90}}}, cache, backups, now=NOW)
     assert out["bodies_dropped"] == 1 and out["processed_dirs"] == 1 and out["backups"] == 1
     assert _ids(index.search(st, "zebramango", now=NOW)) == ["n1"]          # FTS body gone
     assert _ids(index.search(st, "zebra review", now=NOW)) == ["o1"]        # headers stay
-    assert not index.search(st, "secret", now=NOW)["attachments"]           # attachment text gone
+    assert _ids(index.search(st, "77812345", now=NOW)) == []                # body-derived codes gone
+    assert not index.search(st, "qwertyuniquetoken", now=NOW)["attachments"]
     row = st.get("gmail", "o1")
     assert row["snippet"] == "" and row["body_state"] == "headers"
     assert not proc_old.exists() and proc_new.exists()
-    assert not b_old.exists() and b_new.exists()
-    # The text is not left in the file either (secure_delete + optimize).
-    st._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    assert b"zebramango figures" not in store_path(cache).read_bytes()
+    assert not b_old.exists() and b_new.exists() and b_other.exists()
+    # Nothing recoverable on disk: no checkpoint by the test, the purge does it.
+    sp = store_path(cache)
+    raw = sp.read_bytes() + (Path(str(sp) + "-wal").read_bytes() if Path(str(sp) + "-wal").exists() else b"")
+    for needle in (b"zebramango figures", b"qwertyuniquetoken", b"77812345"):
+        assert needle not in raw, needle
 
 
 def test_purge_account(tmp_path):

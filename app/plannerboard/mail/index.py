@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import math
 import re
-import shlex
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -148,7 +147,7 @@ class Term:
 class Query:
     raw: str
     terms: list[Term] = field(default_factory=list)
-    filters: list[tuple[str, str, bool]] = field(default_factory=list)   # (op, value, negate)
+    filters: list[list] = field(default_factory=list)   # [op, value, negate, or_group]
     hints: list[str] = field(default_factory=list)
 
     @property
@@ -156,20 +155,21 @@ class Query:
         return any(not t.negate for t in self.terms)
 
 
-def _tokens(q: str) -> list[tuple[str, bool]]:
-    """Split on whitespace, keeping quoted runs. Returns (token, was_quoted)."""
+_TOKEN_RE = re.compile(r'(-(?=\S))?([A-Za-z_]+:(?=\S))?(?:"([^"]*)"?|(\S+))')
+
+
+def _tokens(q: str) -> list[tuple[bool, str | None, str, bool]]:
+    """(negated, operator or None, text, quoted) per token. ``-"two words"``,
+    ``from:"Dana Smith"`` and ``-subject:lobby`` all keep their shape."""
     out = []
-    lex = shlex.shlex(q, posix=True)
-    lex.whitespace_split = True
-    lex.quotes = '"'
-    lex.commenters = ""
-    try:
-        toks = list(lex)
-    except ValueError:                 # unbalanced quote: fall back to plain split
-        toks = q.replace('"', " ").split()
-    raw_quoted = set(re.findall(r'"([^"]+)"', q))
-    for t in toks:
-        out.append((t, t in raw_quoted or (" " in t)))
+    for m in _TOKEN_RE.finditer(q or ""):
+        neg = bool(m.group(1))
+        op = m.group(2)[:-1].lower() if m.group(2) else None
+        quoted = m.group(3) is not None
+        text = m.group(3) if quoted else (m.group(4) or "")
+        if not text and not quoted and not op:
+            continue
+        out.append((neg, op, text, quoted))
     return out
 
 
@@ -177,37 +177,59 @@ def parse(q: str) -> Query:
     query = Query(raw=q or "")
     group = 0
     pending_or = False
-    for tok, quoted in _tokens(q or ""):
-        if tok == "OR":
+    last = None                        # the previous Term or filter list entry
+    for neg, op, text, quoted in _tokens(q or ""):
+        if text == "OR" and not quoted and not op and not neg:
             pending_or = True
             continue
-        neg = tok.startswith("-") and len(tok) > 1 and not quoted
-        body = tok[1:] if neg else tok
-        m = re.match(r"^([A-Za-z_]+):(.*)$", body) if not quoted else None
-        if m and m.group(2) != "":
-            op, val = m.group(1).lower(), m.group(2).strip().strip('"')
+        item = None
+        if op is not None and text != "":
             if op in OPERATORS:
-                problem = _check_value(op, val)
+                problem = _check_value(op, text)
                 if problem:
                     query.hints.append(problem)
-                else:
-                    query.filters.append((op, val, neg))
-                pending_or = False
-                continue
-            query.hints.append(f"\"{op}:\" is not a search operator, so \"{val}\" was searched as text. "
-                               f"Operators: {', '.join(o + ':' for o in OPERATORS)}.")
-            body = val
-            quoted = " " in val
-        term = Term(text=body, negate=neg, phrase=quoted or " " in body)
-        if pending_or and query.terms and not neg:
-            prev = query.terms[-1]
-            if prev.or_group < 0:
-                prev.or_group = group
-                group += 1
-            term.or_group = prev.or_group
-        query.terms.append(term)
+                    pending_or = False
+                    continue
+                item = [op, text, neg, -1]
+                query.filters.append(item)
+            else:
+                query.hints.append(f"\"{op}:\" is not a search operator, so \"{text}\" was searched as text. "
+                                   f"Operators: {', '.join(o + ':' for o in OPERATORS)}.")
+                op = None
+        if item is None:
+            if op is not None:          # "from:" with nothing after it
+                text = f"{op}:"
+            item = Term(text=text, negate=neg, phrase=quoted or " " in text)
+            query.terms.append(item)
+        if pending_or and last is not None and not neg and not _negated(last):
+            if type(last) is not type(item):
+                query.hints.append("OR joins two words or two operators, not a word and an operator; "
+                                   "both were required.")
+            else:
+                g = _group_of(last)
+                if g < 0:
+                    g = group
+                    group += 1
+                    _set_group(last, g)
+                _set_group(item, g)
         pending_or = False
+        last = item
     return query
+
+
+def _negated(item) -> bool:
+    return item.negate if isinstance(item, Term) else bool(item[2])
+
+
+def _group_of(item) -> int:
+    return item.or_group if isinstance(item, Term) else item[3]
+
+
+def _set_group(item, g: int) -> None:
+    if isinstance(item, Term):
+        item.or_group = g
+    else:
+        item[3] = g
 
 
 def _check_value(op: str, val: str) -> str | None:
@@ -262,7 +284,7 @@ def _is_code(text: str) -> bool:
 # ── 3. execution ─────────────────────────────────────────────────────────────
 
 def search(store, q: str, limit: int = 50, now: float | None = None, account: str | None = None,
-           project_resolver=None, coverage: dict | None = None) -> dict:
+           project_resolver=None, coverage: dict | None = None, typing: bool | None = None) -> dict:
     """Run one query against the store. ``project_resolver(op, value)``
     returns a set of Message-ID headers for project:/status:/stage: (the
     board owns that data); without one those operators answer with a hint."""
@@ -274,22 +296,33 @@ def search(store, q: str, limit: int = 50, now: float | None = None, account: st
     filters: list[str] = []
     fargs: list = []
     empty_reason = None
-    for op, val, neg in query.filters:
-        cond, cargs, hint, empty = _filter_condition(op, val, now, project_resolver)
+    fgroups: dict[int, list] = {}
+    for op, val, neg, grp in query.filters:
+        cond, cargs, hint, empty = _filter_condition(op, val, now, project_resolver, store)
         if hint:
             query.hints.append(hint)
+        if grp >= 0:
+            fgroups.setdefault(grp, []).append((cond or "0", cargs, empty, hint))
+            continue
         if empty and not neg:
             empty_reason = hint or "nothing matches"
         if cond:
             filters.append(("NOT " if neg else "") + cond)
             fargs.extend(cargs)
+    for parts in fgroups.values():
+        if all(p[2] for p in parts):
+            empty_reason = parts[0][3] or "nothing matches"
+        filters.append("(" + " OR ".join(p[0] for p in parts) + ")")
+        for p in parts:
+            fargs.extend(p[1])
     if account:
         filters.append("m.account_id = ?")
         fargs.append(account)
 
     # free text -> one FTS5 expression (AND of terms, OR groups, NOT)
     last_positive = max((i for i, t in enumerate(query.terms) if not t.negate), default=-1)
-    typing = (q or "") == (q or "").rstrip()
+    if typing is None:
+        typing = (q or "") == (q or "").rstrip()
     positives, negatives, groups = [], [], {}
     code_terms = []
     for i, t in enumerate(query.terms):
@@ -313,6 +346,11 @@ def search(store, q: str, limit: int = 50, now: float | None = None, account: st
             filters.append("m.rowid NOT IN (SELECT rowid FROM mail_fts WHERE mail_fts MATCH ?)")
             fargs.append(n)
 
+    if query.terms and not rank_expr and not negatives and not query.filters and empty_reason is None:
+        # Only punctuation: nothing a word index can look up. Say so instead
+        # of answering with the newest mail as if it matched.
+        empty_reason = "There is nothing to search for in that; type a word, a name or an operator."
+        query.hints.append(empty_reason)
     base = ["m.removed = 0"] + filters
     rows: list[dict] = []
     if empty_reason is None:
@@ -353,8 +391,9 @@ def search(store, q: str, limit: int = 50, now: float | None = None, account: st
     ranked = _rerank(store, rows, now, has_text=bool(rank_expr))
     total = len(ranked)
     messages = [_result_row(r) for r in ranked[:limit]]
-    people = _people(store, query) if query.has_text else []
-    atts = _attachments(store, query) if query.has_text else []
+    acct = account or next((v.lower() for op, v, neg, _g in query.filters if op == "account" and not neg), None)
+    people = _people(store, query) if query.has_text and not query.filters else []
+    atts = _attachments(store, query, acct) if query.has_text and empty_reason is None else []
     if not messages and not query.hints:
         query.hints.append("Nothing on this computer matches. Search the server to look further.")
     return {
@@ -374,7 +413,25 @@ def _addr_condition(column_tri: str, column_like: str, val: str) -> tuple[str, l
     return f"({column_like} LIKE ?)", [f"%{val}%"]
 
 
-def _filter_condition(op, val, now, project_resolver):
+def _label_ids(store, name: str) -> list[str]:
+    """Gmail label ids whose name matches (each provider files its id -> name
+    map in mail_meta as ``labels:<account>``)."""
+    import json as _json
+    out = []
+    if store is None:
+        return out
+    for r in store.query("SELECT value FROM mail_meta WHERE key LIKE 'labels:%'"):
+        try:
+            m = _json.loads(r["value"] or "{}")
+        except Exception:
+            continue
+        for lid, lname in m.items():
+            if str(lname).lower() == name.lower() or str(lname).lower().endswith("/" + name.lower()):
+                out.append(lid)
+    return out
+
+
+def _filter_condition(op, val, now, project_resolver, store=None):
     """-> (sql, args, hint, empty)"""
     v = val.strip()
     lv = v.lower()
@@ -423,9 +480,15 @@ def _filter_condition(op, val, now, project_resolver):
         folder = "junk" if lv == "spam" else lv
         return "m.folder = ?", [folder], None, False
     if op == "label":
-        return ("(m.labels LIKE ? OR m.folder = ?)", [f'%"{v}"%', lv], None, False)
+        conds = ["m.labels LIKE ?", "m.folder = ?", "m.provider_id LIKE ? ESCAPE '\\'"]
+        esc = v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args = [f'%"{v}"%', lv, f"x:{esc}:%"]
+        for lid in _label_ids(store, v):
+            conds.append("m.labels LIKE ?")
+            args.append(f'%"{lid}"%')
+        return "(" + " OR ".join(conds) + ")", args, None, False
     if op == "account":
-        return "m.account_id = ?", [v], None, False
+        return "m.account_id = ?", [lv], None, False
     if op in ("project", "status", "stage"):
         if project_resolver is None:
             return "0", [], f"{op}: needs the board; it is not available here.", True
@@ -491,16 +554,19 @@ def _people(store, query: Query, limit: int = 5) -> list[dict]:
             for r in rows]
 
 
-def _attachments(store, query: Query, limit: int = 10) -> list[dict]:
+def _attachments(store, query: Query, account: str | None = None, limit: int = 10) -> list[dict]:
     expr = " AND ".join(filter(None, (_fts_term(t, False) for t in query.terms if not t.negate)))
     if not expr:
         return []
+    extra, args = "", [expr]
+    if account:
+        extra, args = " AND m.account_id = ?", [expr, account]
     rows = store.query(
         "SELECT a.name, a.content_type, a.size, a.idx, m.provider_id, m.account_id, m.subject, m.received_ts"
         " FROM mail_attachments_fts f JOIN mail_attachments a ON a.rowid = f.rowid"
         " JOIN mail_messages m ON m.rowid = a.msg_rowid"
-        " WHERE mail_attachments_fts MATCH ? AND m.removed = 0 ORDER BY bm25(mail_attachments_fts) LIMIT ?",
-        [expr, limit])
+        f" WHERE mail_attachments_fts MATCH ? AND m.removed = 0{extra} ORDER BY bm25(mail_attachments_fts) LIMIT ?",
+        args + [limit])
     return [{"name": r["name"], "content_type": r["content_type"], "size": r["size"], "index": r["idx"],
              "ref": r["provider_id"], "account": r["account_id"], "subject": r["subject"]} for r in rows]
 
@@ -511,9 +577,21 @@ def coverage_for(store, now: float | None = None, body_days: int | None = None) 
     """What the local search covered, as numbers and one sentence."""
     from . import reconcile
     now = now or time.time()
-    row = store.query("SELECT COUNT(*) AS n, SUM(body_state='full') AS full_n, SUM(body_state!='full') AS hdr_n,"
+    cached = getattr(store, "_coverage_cache", None)
+    ver = store.changes() if hasattr(store, "changes") else None
+    if cached and ver is not None and cached[0] == ver and cached[1] > time.time() - 30:
+        return cached[2]
+    row = store.query("SELECT SUM(body_state!='none') AS n, SUM(body_state='full') AS full_n,"
+                      " SUM(body_state='headers') AS hdr_n, SUM(body_state='none') AS pending_n,"
                       " MIN(CASE WHEN body_state='full' THEN received_ts END) AS body_since,"
                       " MIN(received_ts) AS oldest FROM mail_messages WHERE removed=0")[0]
+    missed = 0
+    import json as _json
+    for r in store.query("SELECT value FROM mail_meta WHERE key LIKE 'backfill:%'"):
+        try:
+            missed += int((_json.loads(r["value"] or "{}")).get("missed_total") or 0)
+        except Exception:
+            continue
     not_local = 0
     unknown = []
     for acct in [a["account_id"] for a in store.accounts()] or _account_ids(store):
@@ -528,6 +606,8 @@ def coverage_for(store, now: float | None = None, body_days: int | None = None) 
     since = row["body_since"]
     parts = []
     n = int(row["n"] or 0)
+    # not_local: reconcile counts every row in the folder as local; rows that
+    # are known but not indexed are not searchable, so they count as missing.
     if not n:
         sentence = "Nothing is on this computer yet."
     else:
@@ -539,13 +619,23 @@ def coverage_for(store, now: float | None = None, body_days: int | None = None) 
         if not parts:
             parts.append("Headers searched")
         sentence = "; ".join(parts) + "."
+    pending = int(row["pending_n"] or 0)
+    if pending:
+        sentence += f" {pending:,} known but not indexed yet."
     if not_local:
         sentence += f" {not_local:,} not on this computer."
+    if missed:
+        sentence += f" {missed:,} could not be read from the server."
     if unknown:
         sentence += " Server totals not checked yet for " + ", ".join(unknown) + "."
-    return {"sentence": sentence, "messages": n, "with_body": int(row["full_n"] or 0),
-            "headers_only": int(row["hdr_n"] or 0), "body_since": since, "oldest": row["oldest"],
-            "not_local": not_local, "unchecked": unknown}
+    out = {"sentence": sentence, "messages": n, "with_body": int(row["full_n"] or 0),
+           "headers_only": int(row["hdr_n"] or 0), "not_indexed": pending, "unreadable": missed,
+           "body_since": since, "oldest": row["oldest"], "not_local": not_local, "unchecked": unknown}
+    try:
+        store._coverage_cache = (ver, time.time(), out)
+    except Exception:
+        pass
+    return out
 
 
 def _account_ids(store) -> list[str]:

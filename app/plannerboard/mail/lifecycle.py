@@ -65,6 +65,9 @@ def purge(store, cfg: dict, cache_dir, backups_dir=None, now: float | None = Non
         bdir = Path(backups_dir)
         if bdir.is_dir():
             for f in bdir.glob("*.db"):
+                # Only the board's own snapshots ("<db>_YYYYMMDD_HHMMSS.db").
+                if not re.match(r"^.+_\d{8}_\d{6}\.db$", f.name):
+                    continue
                 try:
                     if f.stat().st_mtime < cutoff:
                         f.unlink()
@@ -72,8 +75,7 @@ def purge(store, cfg: dict, cache_dir, backups_dir=None, now: float | None = Non
                 except OSError:
                     pass
     if out["bodies_dropped"]:
-        with store._conn() as c:
-            c.execute("INSERT INTO mail_fts(mail_fts) VALUES ('optimize')")
+        store.compact()
     store.meta_set("last_purge", str(now))
     return out
 
@@ -97,6 +99,7 @@ def usage(store, cache_dir, backups_dir=None) -> dict:
                        " SUM(historical) AS historical FROM mail_messages WHERE removed=0 GROUP BY account_id")
     out = {
         "store_file": str(sp), "encrypted": bool(getattr(store, "encrypted", False)),
+        "encryption_note": getattr(store, "encryption_note", "") or "",
         "bytes": {
             "store": store_bytes,
             "mail_cache_records": sum(_dir_bytes(cache / d) for d in ("inbox", "sent")),

@@ -33,7 +33,8 @@ def store_settings(cfg: dict) -> dict:
     except (TypeError, ValueError):
         body_days = DEFAULT_BODY_DAYS
     return {"body_days": max(0, body_days), "backfill": s.get("backfill", True) is not False,
-            "page": max(10, min(500, int(s.get("backfill_page") or DEFAULT_PAGE)))}
+            "page": max(1, min(500, int(s.get("backfill_page") or DEFAULT_PAGE))),
+            "seconds": max(1.0, float(s.get("backfill_seconds") or 20))}
 
 
 def body_since(cfg: dict, now: float | None = None) -> float | None:
@@ -64,9 +65,11 @@ def _save(store, account_id: str, doc: dict) -> None:
     store.meta_set(f"backfill:{account_id}", json.dumps(doc))
 
 
-def step(provider, store, cfg: dict, cutoff_ts: float | None, pages: int = 1,
-         now: float | None = None) -> dict:
-    """Run up to ``pages`` backfill pages for one provider. Never raises."""
+def step(provider, store, cfg: dict, cutoff_ts: float | None, pages: int | None = None,
+         now: float | None = None, budget_s: float | None = None) -> dict:
+    """Run backfill pages for one provider until ``pages`` pages or
+    ``budget_s`` seconds (default ``mail.store.backfill_seconds``, 20) have
+    gone by. Never raises."""
     aid = getattr(provider, "account_id", None) or provider.id
     doc = state(store, aid)
     out = {"account": aid, "stored": 0, "done": doc["done"], "error": None}
@@ -74,14 +77,29 @@ def step(provider, store, cfg: dict, cutoff_ts: float | None, pages: int = 1,
         return out
     settings = store_settings(cfg)
     since = body_since(cfg, now)
+    budget = settings["seconds"] if budget_s is None else budget_s
+    started = time.monotonic()
+    n_pages = 0
     try:
-        for _ in range(max(1, pages)):
+        while True:
+            if pages is not None and n_pages >= pages:
+                break
+            if pages is None and n_pages and time.monotonic() - started >= budget:
+                break
+            n_pages += 1
+            provider.backfill_missed = []
             msgs, cursor, done = provider.backfill_page(doc["cursor"], settings["page"], since)
+            missed = list(provider.backfill_missed or [])
+            if missed:
+                doc["missed"] = (list(doc.get("missed") or []) + missed)[-1000:]
+                doc["missed_total"] = int(doc.get("missed_total") or 0) + len(missed)
             for msg in msgs:
                 rts = _ts(msg)
                 historical = cutoff_ts is None or rts is None or rts < cutoff_ts
                 with_body = since is None or (rts is not None and rts >= since)
-                store.ingest(aid, msg, historical=historical, with_body=with_body)
+                from .index import attachment_text
+                store.ingest(aid, msg, historical=historical, with_body=with_body,
+                             attachment_text=attachment_text)
                 out["stored"] += 1
             doc["cursor"] = cursor
             doc["stored"] = int(doc.get("stored") or 0) + len(msgs)
@@ -106,5 +124,5 @@ def reset(store, account_id: str) -> None:
 
 
 def _ts(msg) -> float | None:
-    from .store import _ts as conv
-    return conv(getattr(msg, "received_at", None))
+    from .store import msg_time
+    return msg_time(msg)

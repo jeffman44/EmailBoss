@@ -216,6 +216,7 @@ class BaseProvider:
         # 2.0: every store / retry / reconcile / state row is keyed by account.
         # A 1.x-shaped account's id is the provider id.
         self.account_id = self.id
+        self.backfill_missed: list[str] = []
 
     # ── sync truth (Phase 0): ledger + retry queue in <mail_cache>/sync.sqlite ──
     @property

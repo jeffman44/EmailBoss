@@ -275,6 +275,10 @@ class MailStore:
     def _conn(self):
         return _Tx(self._db, self._lock)
 
+    def changes(self) -> int:
+        """Rows changed through this handle so far (cache key for coverage)."""
+        return int(self._db.total_changes)
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -409,6 +413,15 @@ class MailStore:
             return not live_only
         return bool(row[0])
 
+    def indexed(self, provider: str, item_id: str) -> bool:
+        """True when the row carries headers (ingested) or is gone. Ledger-only
+        rows (folded in from Phase 0, or upserted by a change event) are not
+        indexed yet: the backfill must still fetch them."""
+        with self._conn() as c:
+            row = c.execute("SELECT body_state, removed FROM mail_messages WHERE account_id=? AND provider_id=?",
+                            (provider, item_id)).fetchone()
+        return bool(row) and (bool(row[1]) or row[0] != "none")
+
     def has(self, provider: str, item_id: str, live_only: bool = True) -> bool:
         with self._conn() as c:
             row = c.execute("SELECT removed FROM mail_messages WHERE account_id=? AND provider_id=?",
@@ -505,13 +518,23 @@ class MailStore:
         real_atts = [a for a in msg.attachments if not a.is_inline]
         files = " ".join(a.name for a in real_atts)
         codes = " ".join(codes_from(f"{msg.subject} {body}") + attachment_codes(real_atts))
-        rts = _ts(msg.received_at)
+        rts = msg_time(msg)
         now = time.time()
         sender_email = (msg.sender.email or "").lower() if msg.sender else ""
+        # Attachment text is extracted before the store lock is taken (a PDF
+        # can take a while; search and capture must not wait on it).
+        att_texts: dict[int, str] = {}
+        if with_body and attachment_text is not None:
+            for i, a in enumerate(msg.attachments):
+                if not a.is_inline:
+                    try:
+                        att_texts[i] = (attachment_text(a) or "")[:200_000]
+                    except Exception:
+                        att_texts[i] = ""
         with self._conn() as c:
-            prior = c.execute("SELECT rowid, subject FROM mail_messages WHERE account_id=? AND provider_id=?",
+            prior = c.execute("SELECT rowid, body_state FROM mail_messages WHERE account_id=? AND provider_id=?",
                               (account_id, sid)).fetchone()
-            is_new_content = prior is None or not prior["subject"]
+            is_new_content = prior is None or prior["body_state"] == "none"
             c.execute(
                 "INSERT INTO mail_messages (account_id, provider_id, message_id, thread_key, folder, labels, flags,"
                 " subject, from_email, from_name, to_addrs, cc_addrs, received_ts, snippet, has_attachments,"
@@ -550,14 +573,8 @@ class MailStore:
                                 (rowid, i, a.name or "", a.content_type or "", int(a.size or len(a.content or b"")),
                                  int(bool(a.is_inline)), a.content_id or ""))
                 if not a.is_inline:
-                    text = ""
-                    if with_body and attachment_text is not None:
-                        try:
-                            text = (attachment_text(a) or "")[:200_000]
-                        except Exception:
-                            text = ""
                     c.execute("INSERT INTO mail_attachments_fts (rowid, name, text) VALUES (?,?,?)",
-                              (cur.lastrowid, a.name or "", text))
+                              (cur.lastrowid, a.name or "", att_texts.get(i, "")))
             if msg.conversation_id:
                 c.execute("INSERT INTO mail_threads (account_id, thread_key, subject, message_count, last_ts)"
                           " VALUES (?,?,?,1,?) ON CONFLICT(account_id, thread_key) DO UPDATE SET"
@@ -572,24 +589,46 @@ class MailStore:
                     _bump_person(c, sender_email, msg.sender.name if msg.sender else "", "recv_count", rts)
         return rowid
 
-    def drop_body(self, rowids: Iterable[int]) -> int:
-        """Retention: keep headers, forget body text and snippet."""
+    def drop_body(self, rowids: Iterable[int], batch: int = 500) -> int:
+        """Retention: keep headers, forget body text, snippet, body-derived
+        codes and attachment text. Short transactions, so search and capture
+        are not blocked behind a long purge."""
+        rowids = list(rowids)
         n = 0
-        with self._conn() as c:
-            for rid in rowids:
-                row = c.execute("SELECT subject, from_name, from_email FROM mail_messages WHERE rowid=?", (rid,)).fetchone()
-                if not row:
-                    continue
-                c.execute("UPDATE mail_messages SET snippet='', body_state='headers', updated_at=? WHERE rowid=?",
-                          (time.time(), rid))
-                f = c.execute("SELECT subject, sender FROM mail_fts WHERE rowid=?", (rid,)).fetchone()
-                c.execute("DELETE FROM mail_fts WHERE rowid=?", (rid,))
-                c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,'')",
-                          (rid, f[0] if f else row[0], f[1] if f else f"{row[1]} {row[2]}"))
-                for (ar,) in c.execute("SELECT rowid FROM mail_attachments WHERE msg_rowid=?", (rid,)).fetchall():
-                    c.execute("UPDATE mail_attachments_fts SET text='' WHERE rowid=?", (ar,))
-                n += 1
+        for i in range(0, len(rowids), batch):
+            with self._conn() as c:
+                for rid in rowids[i:i + batch]:
+                    row = c.execute("SELECT subject, from_name, from_email FROM mail_messages WHERE rowid=?",
+                                    (rid,)).fetchone()
+                    if not row:
+                        continue
+                    c.execute("UPDATE mail_messages SET snippet='', body_state='headers', updated_at=? WHERE rowid=?",
+                              (time.time(), rid))
+                    f = c.execute("SELECT subject, sender FROM mail_fts WHERE rowid=?", (rid,)).fetchone()
+                    c.execute("DELETE FROM mail_fts WHERE rowid=?", (rid,))
+                    c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,'')",
+                              (rid, f[0] if f else row[0], f[1] if f else f"{row[1]} {row[2]}"))
+                    t = c.execute("SELECT from_a, to_a, cc_a, files FROM mail_tri WHERE rowid=?", (rid,)).fetchone()
+                    c.execute("DELETE FROM mail_tri WHERE rowid=?", (rid,))
+                    if t:
+                        c.execute("INSERT INTO mail_tri (rowid, from_a, to_a, cc_a, files, codes) VALUES (?,?,?,?,?,'')",
+                                  (rid, t[0], t[1], t[2], t[3]))
+                    for (ar,) in c.execute("SELECT rowid FROM mail_attachments WHERE msg_rowid=?", (rid,)).fetchall():
+                        name = c.execute("SELECT name FROM mail_attachments_fts WHERE rowid=?", (ar,)).fetchone()
+                        c.execute("DELETE FROM mail_attachments_fts WHERE rowid=?", (ar,))
+                        c.execute("INSERT INTO mail_attachments_fts (rowid, name, text) VALUES (?,?,'')",
+                                  (ar, name[0] if name else ""))
+                    n += 1
         return n
+
+    def compact(self) -> None:
+        """Merge the FTS segments (old tokens leave the index pages; with
+        secure_delete the freed pages are zeroed) and fold the WAL back."""
+        with self._conn() as c:
+            for t in ("mail_fts", "mail_tri", "mail_attachments_fts"):
+                c.execute(f"INSERT INTO {t}({t}) VALUES ('optimize')")
+        with self._lock:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def delete_account(self, account_id: str) -> int:
         with self._conn() as c:
@@ -605,7 +644,8 @@ class MailStore:
             c.execute("DELETE FROM mail_retry_queue WHERE provider=?", (account_id,))
             c.execute("DELETE FROM mail_reconcile WHERE provider=?", (account_id,))
             c.execute("DELETE FROM mail_accounts WHERE account_id=?", (account_id,))
-            c.execute("DELETE FROM mail_meta WHERE key LIKE ?", (f"backfill:{account_id}%",))
+            for key in (f"backfill:{account_id}", f"labels:{account_id}"):
+                c.execute("DELETE FROM mail_meta WHERE key=?", (key,))
         return len(rids)
 
     def reindex(self) -> int:
@@ -726,6 +766,18 @@ def forget_open(cache_dir=None) -> None:
             st = _OPEN.pop(k, None)
             if st is not None:
                 st.close()
+
+
+def msg_time(msg) -> float | None:
+    """When the SERVER received the message (Gmail internalDate, Graph
+    receivedDateTime, IMAP INTERNALDATE, the drop folder's receivedDateTime),
+    falling back to the sender's Date header only when the server gave none.
+    The install-cutoff gate and the body window both use this, never the
+    sender's clock alone."""
+    t = getattr(msg, "sync_received_ts", None)
+    if isinstance(t, (int, float)) and t > 0:
+        return float(t)
+    return _ts(getattr(msg, "received_at", None))
 
 
 def recency(ts: float | None, now: float | None = None, half_life_days: float = 90.0) -> float:

@@ -311,16 +311,18 @@ class GraphProvider(BaseProvider):
         sync = self.sync
         for item in page.get("value") or []:
             iid = item.get("id") or ""
-            if not iid or item.get("isDraft") or (sync is not None and sync.has(self.account_id, iid, live_only=False)):
+            if not iid or (sync is not None and sync.indexed(self.account_id, iid)):
                 continue
             ts = parse_iso(item.get("receivedDateTime") or "")
             recent = body_since_ts is None or (ts is not None and ts.timestamp() >= body_since_ts)
             if not recent or not item.get("hasAttachments"):
                 item.setdefault("attachments", [])
+            kind = "drafts" if item.get("isDraft") else kinds.get(item.get("parentFolderId"), "other")
             try:
-                msg = self._to_message(item, kinds.get(item.get("parentFolderId"), "other"))
+                msg = self._to_message(item, kind)
             except Exception as e:
-                self.note_warning(f"backfill: message {iid[:20]} skipped ({type(e).__name__})")
+                self.backfill_missed.append(iid)
+                self.note_warning(f"backfill: some messages could not be read ({type(e).__name__})")
                 continue
             msg.sync_has_attachments = bool(item.get("hasAttachments"))
             out.append(msg)
@@ -386,6 +388,8 @@ class GraphProvider(BaseProvider):
         )
         msg.sync_id = item.get("id") or ""
         msg.sync_folder = folder
+        if parse_iso(item.get("receivedDateTime") or ""):
+            msg.sync_received_ts = parse_iso(item["receivedDateTime"]).timestamp()
         msg.sync_flags = _graph_flags(item)
         return msg
 

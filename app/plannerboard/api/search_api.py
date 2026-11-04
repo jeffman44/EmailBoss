@@ -97,13 +97,15 @@ def project_resolver(op: str, value: str):
 
 @bp.route("/api/mail/search", methods=["GET"])
 def api_search():
-    q = (request.args.get("q") or "").strip()
+    raw = request.args.get("q") or ""
+    q = raw.strip()
     st = _mail_store()
     if st is None:
         return _unavailable()
     limit = max(1, min(int_arg("limit", 50), 200))
-    res = mail_index.search(st, q, limit=limit, account=(request.args.get("account") or None),
-                            project_resolver=project_resolver)
+    # A trailing space means the last word is finished: no prefix expansion.
+    res = mail_index.search(st, q, limit=limit, account=((request.args.get("account") or "").lower() or None),
+                            project_resolver=project_resolver, typing=(raw == raw.rstrip()))
     res["ok"] = True
     return jsonify(res)
 
