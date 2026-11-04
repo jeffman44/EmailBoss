@@ -28,10 +28,11 @@ Tables (all ``mail_*``):
 
 The Phase 0 sync ledger (``sync.sqlite``) is folded in on first open.
 
-Encryption: when ``PB_STORE_ENCRYPT=1`` and the ``sqlcipher3`` module is
-importable, the file is opened through SQLCipher with a random key kept in
-the OS keyring (``mail_store_key``). Otherwise plaintext. Either way
-``secure_delete`` is on.
+Encryption is on by default: when the ``sqlcipher3`` module is importable
+(it ships in the Windows build) the file is opened through SQLCipher with a
+random key kept in the OS keyring (``mail_store_key``). ``PB_STORE_ENCRYPT=0``
+opts out. Without SQLCipher or a usable keyring the store is plaintext and
+``encryption_note`` says why. Either way ``secure_delete`` is on.
 """
 from __future__ import annotations
 
@@ -180,7 +181,8 @@ def _ts(dt) -> float | None:
 
 
 def encryption_wanted() -> bool:
-    return os.environ.get("PB_STORE_ENCRYPT") == "1"
+    """On by default (owner decision, 2026-11-04). ``PB_STORE_ENCRYPT=0`` opts out."""
+    return os.environ.get("PB_STORE_ENCRYPT", "1").strip() not in ("0", "false", "no", "off")
 
 
 def _cipher_module():
@@ -244,7 +246,13 @@ class MailStore:
         if want and mod is None:
             self.encryption_note = "encryption was requested but SQLCipher is not available; the store is plaintext"
         if want and mod is not None:
-            key = _store_key()
+            try:
+                key = _store_key()
+            except Exception as e:  # noqa: BLE001  (no usable keyring: say so, stay readable)
+                self.encryption_note = f"encryption is on but the key cannot be kept in the OS keyring ({e}); " \
+                                       "the store is plaintext"
+                self.encrypted = False
+                return sqlite3.connect(str(self.path), timeout=30, check_same_thread=False), None
             if plain:
                 self._encrypt_in_place(mod, key)
             db = mod.connect(str(self.path), timeout=30, check_same_thread=False)

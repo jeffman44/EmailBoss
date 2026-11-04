@@ -29,12 +29,15 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
 
 ### Encryption at rest (decision recorded for 2.0)
 
-The mail store is plaintext by default, with SQLite `secure_delete` on and
-the 90-day body window. Setting `PB_STORE_ENCRYPT=1` opens it through
-SQLCipher with a random 256-bit key kept in the OS keyring
-(`mail_store_key`): an existing plaintext store is converted in place, and
-an encrypted store always stays encrypted (turning the setting off does not
-decrypt it). If the key is lost the store cannot be read and search stops
+The mail store is encrypted by default (owner decision, 2026-11-04): it
+opens through SQLCipher with a random 256-bit key kept in the OS keyring
+(Windows Credential Manager, `mail_store_key`). An existing plaintext store
+is converted in place on first start. `PB_STORE_ENCRYPT=0` opts out for new
+stores; an encrypted store always stays encrypted (opting out does not
+decrypt it). If SQLCipher is missing (a source install without the
+`encrypt` extra) or the keyring cannot keep the key, the store is plaintext
+and `/api/mail/store/usage` says so in `encryption_note`. SQLite
+`secure_delete` and the 90-day body window apply either way. If the key is lost the store cannot be read and search stops
 until the key is restored or the store is deleted and rebuilt from the
 server. The board database (`plannerboard.db`) is not encrypted.
 - `project_files/`: attachments and intake files copied onto projects.

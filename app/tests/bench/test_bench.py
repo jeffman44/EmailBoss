@@ -83,6 +83,10 @@ def mailbox(tmp_path_factory):
     from plannerboard.mail import secrets
     from tests.test_sync_truth import FakeGmail
     secrets.use_memory_backend(True)
+    # Measure what ships: the store encrypts by default (conftest turns that
+    # off per test for the unit suite; the module-scoped bench store is
+    # created here, before any per-test override).
+    os.environ.pop("PB_STORE_ENCRYPT", None)
     server = FakeGmail()
     for i in range(N):
         server.deliver(f"m{i:06d}", labels=("INBOX",) if i % 5 else ("SENT",))
@@ -111,6 +115,7 @@ def synced(mailbox, results):
             break
     total = time.perf_counter() - started
     results["sync_cycles"] = len(cycles)
+    results["store_encrypted"] = bool(getattr(prov.sync, "encrypted", False))
     return prov, cache, total, cycles
 
 

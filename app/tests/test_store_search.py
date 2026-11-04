@@ -448,3 +448,20 @@ def test_store_encryption_at_rest(tmp_path, monkeypatch):
     secrets.delete_secret("mail_store_key")
     with pytest.raises(RuntimeError, match="encrypted"):
         MailStore(p)                                        # key gone: refuse, never a silent fresh store
+
+
+def test_store_encrypts_by_default(tmp_path, monkeypatch):
+    pytest.importorskip("sqlcipher3")
+    monkeypatch.delenv("PB_STORE_ENCRYPT", raising=False)
+    st = MailStore(store_path(tmp_path))
+    assert st.encrypted and not st.encryption_note
+    st.close()
+    assert not store_path(tmp_path).read_bytes().startswith(b"SQLite format 3")
+
+
+def test_default_encryption_without_a_keyring_says_so(tmp_path, monkeypatch):
+    pytest.importorskip("sqlcipher3")
+    monkeypatch.delenv("PB_STORE_ENCRYPT", raising=False)
+    monkeypatch.setattr(secrets, "set_secret", lambda *a, **k: (False, None, "no keyring backend"))
+    st = MailStore(store_path(tmp_path))
+    assert not st.encrypted and "cannot be kept in the OS keyring" in st.encryption_note

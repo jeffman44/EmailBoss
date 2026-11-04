@@ -26,6 +26,13 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # ── core ─────────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _plaintext_store_unless_asked(monkeypatch):
+    """The mail store encrypts by default; tests keep it plaintext so they do
+    not reach for the machine's real keyring. Encryption has its own tests."""
+    monkeypatch.setenv("PB_STORE_ENCRYPT", "0")
+
+
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     root = tmp_path / "data"
