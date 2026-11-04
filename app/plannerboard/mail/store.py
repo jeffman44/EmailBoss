@@ -48,7 +48,7 @@ from typing import Callable, Iterable
 
 STORE_NAME = "mail_store.sqlite"
 LEGACY_SYNC_NAME = "sync.sqlite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Forward-only, numbered. Each entry runs once, in order, inside the
 # migration step that records its number in mail_meta.schema_version.
@@ -150,6 +150,26 @@ CREATE TABLE IF NOT EXISTS mail_reconcile (
     error         TEXT NOT NULL DEFAULT '',
     checked_at    REAL NOT NULL,
     PRIMARY KEY (provider, folder)
+);
+"""),
+    (2, """
+CREATE TABLE IF NOT EXISTS mail_bodies (
+    msg_rowid   INTEGER PRIMARY KEY,
+    body        TEXT NOT NULL DEFAULT '',
+    is_html     INTEGER NOT NULL DEFAULT 0,
+    reply_to    TEXT NOT NULL DEFAULT '',
+    to_list     TEXT NOT NULL DEFAULT '[]',
+    cc_list     TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS mail_undo (
+    action_id   TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL,
+    ref         TEXT NOT NULL DEFAULT '',
+    data        TEXT NOT NULL DEFAULT '{}',
+    label       TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    undone      INTEGER NOT NULL DEFAULT 0
 );
 """),
 ]
@@ -591,6 +611,17 @@ class MailStore:
             c.execute("DELETE FROM mail_fts WHERE rowid=?", (rowid,))
             c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,?)",
                       (rowid, msg.subject or "", sender_text(msg), body))
+            if with_body:
+                # The reading pane renders from here (2.0 Phase 2): the raw body as
+                # received; the client sanitizes it into the sandboxed frame as before.
+                c.execute("INSERT INTO mail_bodies (msg_rowid, body, is_html, reply_to, to_list, cc_list)"
+                          " VALUES (?,?,?,?,?,?) ON CONFLICT(msg_rowid) DO UPDATE SET body=excluded.body,"
+                          " is_html=excluded.is_html, reply_to=excluded.reply_to, to_list=excluded.to_list,"
+                          " cc_list=excluded.cc_list",
+                          (rowid, (msg.body or "")[:400_000], int(bool(msg.is_html)),
+                           ", ".join(a.display() for a in msg.reply_to),
+                           json.dumps([{"email": a.email, "name": a.name} for a in msg.to]),
+                           json.dumps([{"email": a.email, "name": a.name} for a in msg.cc])))
             c.execute("DELETE FROM mail_tri WHERE rowid=?", (rowid,))
             c.execute("INSERT INTO mail_tri (rowid, from_a, to_a, cc_a, files, codes) VALUES (?,?,?,?,?,?)",
                       (rowid, sender_text(msg), to_s, cc_s, files, codes))
@@ -635,6 +666,7 @@ class MailStore:
                         continue
                     c.execute("UPDATE mail_messages SET snippet='', body_state='headers', updated_at=? WHERE rowid=?",
                               (time.time(), rid))
+                    c.execute("DELETE FROM mail_bodies WHERE msg_rowid=?", (rid,))
                     f = c.execute("SELECT subject, sender FROM mail_fts WHERE rowid=?", (rid,)).fetchone()
                     c.execute("DELETE FROM mail_fts WHERE rowid=?", (rid,))
                     c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,'')",
@@ -670,6 +702,8 @@ class MailStore:
                 for (ar,) in c.execute("SELECT rowid FROM mail_attachments WHERE msg_rowid=?", (rid,)).fetchall():
                     c.execute("DELETE FROM mail_attachments_fts WHERE rowid=?", (ar,))
                 c.execute("DELETE FROM mail_attachments WHERE msg_rowid=?", (rid,))
+                c.execute("DELETE FROM mail_bodies WHERE msg_rowid=?", (rid,))
+            c.execute("DELETE FROM mail_undo WHERE account_id=?", (account_id,))
             c.execute("DELETE FROM mail_messages WHERE account_id=?", (account_id,))
             c.execute("DELETE FROM mail_threads WHERE account_id=?", (account_id,))
             c.execute("DELETE FROM mail_retry_queue WHERE provider=?", (account_id,))

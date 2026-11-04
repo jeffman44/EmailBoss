@@ -72,6 +72,9 @@ class FakeGmail:
         self.history.append({"id": self.hid, "messagesDeleted": [{"message": {"id": gid}}]})
 
     def relabel(self, gid, add=(), remove=()):
+        add, remove = tuple(add), tuple(remove)
+        if not add and not remove:
+            return
         m = self.msgs[gid]
         m["labels"] = (m["labels"] | set(add)) - set(remove)
         self.hid += 1
@@ -103,6 +106,34 @@ class FakeGmail:
         if path == "/profile":
             return 200, {"emailAddress": "sam@acme.example", "historyId": str(self.hid),
                          "messagesTotal": len(self.msgs)}
+        if path == "/labels":
+            # One pass, cached per history id: the capture cycle asks every
+            # time, and the bench mailbox is 50k messages.
+            if getattr(self, "_label_cache", (None,))[0] != (self.hid, len(self.msgs)):
+                tot, unread = {}, {}
+                for m in self.msgs.values():
+                    for lid in m["labels"]:
+                        tot[lid] = tot.get(lid, 0) + 1
+                        if "UNREAD" in m["labels"]:
+                            unread[lid] = unread.get(lid, 0) + 1
+                self._label_cache = ((self.hid, len(self.msgs)), tot, unread)
+            _k, tot, unread = self._label_cache
+            return 200, {"labels": [{"id": lid, "name": lid, "type": "system",
+                                     "messagesTotal": tot.get(lid, 0), "messagesUnread": unread.get(lid, 0)}
+                                    for lid in ("INBOX", "SENT", "DRAFT", "TRASH", "SPAM")]}
+        if method == "POST" and path.startswith("/messages/") and path.count("/") == 3:
+            gid, op = path.split("/")[2], path.split("/")[3]
+            if gid not in self.msgs:
+                return 404, {"error": "not found"}
+            if op == "modify":
+                self.relabel(gid, add=tuple((data or {}).get("addLabelIds") or ()),
+                             remove=tuple((data or {}).get("removeLabelIds") or ()))
+            elif op == "trash":
+                self.relabel(gid, add=("TRASH",), remove=tuple(l for l in ("INBOX",) if l in self.msgs[gid]["labels"]))
+            elif op == "untrash":
+                self.relabel(gid, remove=("TRASH",))
+            self.writes = getattr(self, "writes", []) + [(op, gid, data)]
+            return 200, {"id": gid, "labelIds": sorted(self.msgs[gid]["labels"])}
         if path.startswith("/labels/"):
             label = path.rsplit("/", 1)[1]
             return 200, {"id": label, "messagesTotal": sum(1 for m in self.msgs.values() if label in m["labels"])}
@@ -120,8 +151,10 @@ class FakeGmail:
         if path == "/messages":
             if "q" in q:          # the capture path's dated window: inbox and sent only
                 ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
-            else:                 # no query: the whole mailbox (backfill, list views)
+            else:                 # no query: the whole mailbox (backfill), or one label (list views)
                 ids = list(self.msgs)
+            if q.get("labelIds"):
+                ids = [g for g in ids if set(q["labelIds"]) <= self.msgs[g]["labels"]]
             ids.reverse()   # newest first, like the API
             page_size = int(q.get("maxResults", ["100"])[0])
             offset = int(q.get("pageToken", ["0"])[0])
@@ -131,6 +164,8 @@ class FakeGmail:
             return 200, body
         if path.startswith("/messages/"):
             gid = path.split("/")[2]
+            if q.get("format") == ["minimal"] and gid in self.msgs:
+                return 200, {"id": gid, "labelIds": sorted(self.msgs[gid]["labels"])}
             if self.fail_fetch.get(gid, 0) > 0:
                 self.fail_fetch[gid] -= 1
                 return 500, {"error": "backend error"}

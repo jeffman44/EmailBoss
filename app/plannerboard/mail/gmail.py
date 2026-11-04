@@ -637,6 +637,26 @@ class GmailProvider(BaseProvider):
         self._post(f"/messages/{self._gid(ref)}/trash", {})
         return True
 
+    # ── store / undo hooks (mail/terminal.py) ──
+    def labels_of(self, ref: str) -> list[str]:
+        """Current server labels of one message (one small request)."""
+        return list((self._get(f"/messages/{self._gid(ref)}", {"format": "minimal"}) or {}).get("labelIds") or [])
+
+    def restore_labels(self, ref: str, labels) -> list[str]:
+        """Put a message's labels back exactly as they were (undo of a move:
+        archive drops user labels, so moving 'back to a folder' is not enough)."""
+        gid = self._gid(ref)
+        want = set(labels or ()) - {"UNREAD", "STARRED", "IMPORTANT"}
+        now = set(self.labels_of(ref))
+        if "TRASH" in now and "TRASH" not in want:
+            self._post(f"/messages/{gid}/untrash", {})
+            now = set(self.labels_of(ref))
+        cur = now - {"UNREAD", "STARRED", "IMPORTANT"}
+        add, rem = sorted(want - cur), sorted(cur - want)
+        if add or rem:
+            self._post(f"/messages/{gid}/modify", {"addLabelIds": add, "removeLabelIds": rem})
+        return self.labels_of(ref)
+
     def _profile_email(self) -> str:
         if not self.user_email:
             try:

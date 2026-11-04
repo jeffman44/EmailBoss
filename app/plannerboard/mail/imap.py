@@ -1117,6 +1117,10 @@ class _ImapClient:
     def _resolve_ref(self, ref: str) -> tuple[str, int, int]:
         """(folder, uidvalidity, uid) from a client ref or a capture-path
         provider_ref (``inbox:uv:uid`` / ``sent:uv:uid``)."""
+        if (ref or "").startswith("x:"):
+            # Backfill id for a folder other than inbox / sent: x:<folder>:<uv>:<uid>
+            head, uv, uid = ref[2:].rsplit(":", 2)
+            return head, int(uv), int(uid)
         parts = (ref or "").split(":", 2)
         if len(parts) != 3:
             raise ValueError(f"bad message ref {ref!r}")
@@ -1314,6 +1318,28 @@ class _ImapClient:
             except Exception:
                 new_ref = None
             return new_ref
+
+    # ── store / undo hooks (mail/terminal.py) ──
+    def store_id(self, ref: str | None) -> str | None:
+        """A client ref (``uv:uid:folder``) as the store's id: ``inbox:uv:uid``
+        or ``sent:uv:uid`` for the capture folders, ``x:folder:uv:uid`` otherwise."""
+        if not ref:
+            return ref
+        if ref.startswith(("inbox:", "sent:", "x:")):
+            return ref
+        try:
+            folder, uv, uid = self._resolve_ref(ref)
+        except Exception:
+            return ref
+        kind = {self.settings.get("inbox_folder"): "inbox", self.settings.get("sent_folder"): "sent"}.get(folder)
+        return f"{kind}:{uv}:{uid}" if kind else f"x:{folder}:{uv}:{uid}"
+
+    def undo_folder(self, row: dict) -> str:
+        """Where a stored message lived, as a folder this provider can move to."""
+        pid = row.get("provider_id") or ""
+        if pid.startswith("x:"):
+            return pid[2:].rsplit(":", 2)[0]
+        return row.get("folder") or "inbox"
 
     def delete_message(self, ref: str) -> bool:
         """Move to Trash. Never a permanent delete: no Trash folder (or already

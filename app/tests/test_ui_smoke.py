@@ -271,9 +271,18 @@ def test_mail_view_smoke(server, browser):
     page.keyboard.press("/")                       # "/" focuses the search box in the mail view
     assert page.evaluate("() => document.activeElement.id") == "mail-search"
     page.keyboard.press("Escape")
-    page.keyboard.press("Control+k")
-    assert page.evaluate("() => document.activeElement.id") == "mail-search"
+    page.keyboard.press("Control+k")               # Ctrl+K: the grouped command palette
+    page.wait_for_timeout(300)
+    assert page.evaluate("() => document.activeElement.id") == "eb-pal-input"
+    groups = page.evaluate("() => [...document.querySelectorAll('.eb-pal-group')].map(e => e.textContent)")
+    assert "Commands" in groups
+    page.keyboard.type("invoice")
+    page.wait_for_timeout(600)
+    groups = page.evaluate("() => [...document.querySelectorAll('.eb-pal-group')].map(e => e.textContent)")
+    assert "Messages" in groups
+    assert page.evaluate("() => [...document.querySelectorAll('.eb-pal-item.server')].length") == 1
     page.keyboard.press("Escape")
+    assert not page.evaluate("() => document.getElementById('eb-palette').classList.contains('open')")
     page.wait_for_timeout(500)
     page.click(".mail-row >> nth=0")
     page.wait_for_timeout(500)

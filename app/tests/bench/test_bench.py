@@ -185,5 +185,73 @@ def test_search(synced, results):
             t0 = time.perf_counter()
             index.search(prov.sync, q, limit=50)
             times.append(time.perf_counter() - t0)
-    assert index.search(prov.sync, "\"Message m012345\"")["messages"][0]["ref"] == "m012345"
+    if N > 12345:
+        assert index.search(prov.sync, "\"Message m012345\"")["messages"][0]["ref"] == "m012345"
     _check(results, "search_ms_p50", _ms(statistics.median(times)))
+
+
+# ── the terminal UI in a real browser (Phase 2 timing hook) ─────────────────
+
+def test_ui_timing(synced, mailbox, results, tmp_path_factory):
+    """window.__eb_timing on the 50k store: the list's first paint after the
+    MAIL view is chosen, keyboard open-message, and search as you type."""
+    pw_api = pytest.importorskip("playwright.sync_api")
+    import threading
+    from werkzeug.serving import make_server
+    from plannerboard import create_app
+    from plannerboard.config import Config
+    prov, cache, _t, _c = synced
+    server, _root = mailbox
+    root = tmp_path_factory.mktemp("bench_ui")
+    os.environ.update({"PB_DATA_ROOT": str(root), "PB_LICENSE_DEV": "1", "PB_TESTING": "1"})
+    cfg = Config({"user": {"name": "Pat Example", "email": "pat@example.com"},
+                  "profession": {"template": "general"},
+                  "paths": {"data_root": str(root), "mail_cache": str(cache)},
+                  "mail": {"provider": "gmail", "client_enabled": True, "gmail": {"client_id": "cid"},
+                           "store": {"backfill": False}}})
+    cfg.paths.ensure()
+    cfg.write()
+    cfg = Config.load(cfg.source_path)
+    app = create_app(config=cfg, testing=True)
+    thread = app.extensions["pb"].mail_runner.threads["gmail"]
+    thread.provider.http = server
+    thread.provider.tokens.save({"access_token": "AT", "expires_at": 9_999_999_999})
+    srv = make_server("127.0.0.1", 0, app, threaded=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}"
+    if os.path.isdir("/opt/pw-browsers"):
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
+    try:
+        with pw_api.sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page(viewport={"width": 1400, "height": 900})
+            page.goto(url + "/", wait_until="networkidle")
+            page.wait_for_timeout(500)
+            t_list = page.evaluate("""async () => {
+                const t0 = performance.now(); setView('mail');
+                for (let i = 0; i < 400; i++) {
+                    if (document.querySelector('.mail-virt .mail-row')) return performance.now() - t0;
+                    await new Promise(r => setTimeout(r, 25));
+                }
+                return null; }""")
+            assert t_list is not None, "the list never painted"
+            page.keyboard.press("j")
+            page.keyboard.press("o")
+            page.wait_for_selector(".mail-subject")
+            for _ in range(25):
+                page.keyboard.press("j")
+                page.wait_for_timeout(120)
+            page.keyboard.press("u")
+            for q in ("message", "Message m01234", "from:dana", "m0499", "body", "lobby"):
+                page.keyboard.press("/")
+                page.fill("#mail-search", "")
+                page.keyboard.type(q, delay=10)
+                page.wait_for_timeout(700)
+            timing = page.evaluate("() => window.__eb_timing")
+            browser.close()
+    finally:
+        srv.shutdown()
+    assert timing["open_message_ms"] and timing["search_ms"], timing
+    _check(results, "ui_first_list_ms", round(t_list, 1))
+    _check(results, "ui_open_message_ms_p50", round(statistics.median(timing["open_message_ms"]), 1))
+    _check(results, "ui_search_ms_p50", round(statistics.median(timing["search_ms"]), 1))

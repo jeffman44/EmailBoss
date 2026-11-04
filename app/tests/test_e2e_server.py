@@ -32,7 +32,7 @@ def test_full_flow_from_setup_to_assistant(data_root):
 
     # 1. first run: wizard, then setup with the full body
     page = c.get("/").data
-    assert b"Setup" in page
+    assert b"/static/setup.js" in page          # the setup wizard (script moved out of the page in 2.0)
     setup_page = c.get("/setup").data if c.get("/setup").status_code == 200 else page
     for blob in (page, setup_page):
         assert b"developer mode" not in blob.lower()

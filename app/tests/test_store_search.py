@@ -390,7 +390,7 @@ def test_phase0_ledger_is_folded_in(tmp_path):
     st = MailStore(store_path(tmp_path))
     assert not legacy.exists()
     assert st.captured("gmail", "g1") and st.get("gmail", "g2")["removed"]
-    assert st.schema_version() == 1
+    assert st.schema_version() == 2
 
 
 @pytest.mark.parametrize("version", ["1.2", "1.3"])

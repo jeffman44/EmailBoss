@@ -1,7 +1,7 @@
 {
   "note": "Upper bounds for tests/bench on the windows-latest runner. Set from the first real run (measured x 1.5, rounded up), then frozen. A null metric is recorded but not enforced.",
   "frozen": true,
-  "source_run": "41732324198 (windows-latest, Python 3.12.10, 50000 messages): cold_open_s 0.603, sync_full_s 180.41, sync_cycle_ms_p50 210.93, reconcile_ms 18.63, list_page_ms_p50 21.99, open_message_ms_p50 0.39; search_ms_p50 from run 41874064794 (Phase 1): 39.15",
+  "source_run": "41732324198 (windows-latest, Python 3.12.10, 50000 messages): cold_open_s 0.603, sync_full_s 180.41, sync_cycle_ms_p50 210.93, reconcile_ms 18.63, list_page_ms_p50 21.99, open_message_ms_p50 0.39; search_ms_p50 from run 41874064794 (Phase 1): 39.15; ui_* from the Phase 2 bench run (windows-latest, 50000 messages): ui_first_list_ms 132.1, ui_open_message_ms_p50 11.2, ui_search_ms_p50 129.6",
   "metrics": {
     "cold_open_s": 1.0,
     "sync_full_s": 275,
@@ -9,6 +9,9 @@
     "reconcile_ms": 30,
     "list_page_ms_p50": 35,
     "open_message_ms_p50": 1.0,
-    "search_ms_p50": 60
+    "search_ms_p50": 60,
+    "ui_first_list_ms": 200,
+    "ui_open_message_ms_p50": 20,
+    "ui_search_ms_p50": 200
   }
 }
