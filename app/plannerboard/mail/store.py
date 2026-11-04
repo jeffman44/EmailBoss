@@ -273,7 +273,13 @@ class MailStore:
         os.replace(tmp, self.path)
 
     def _conn(self):
-        return _Tx(self._db, self._lock)
+        return _Tx(self._db, self._lock, nested=getattr(self, "_batch_owner", None) == threading.get_ident())
+
+    def batch(self):
+        """One transaction around many writes (the capture path's ingest
+        flush): one commit instead of one per message, which is what a
+        Windows disk with real-time scanning pays for."""
+        return _Batch(self)
 
     def changes(self) -> int:
         """Rows changed through this handle so far (cache key for coverage)."""
@@ -500,7 +506,8 @@ class MailStore:
 
     # ── ingest ──
     def ingest(self, account_id: str, msg, historical: bool = False, with_body: bool = True,
-               attachment_text: Callable | None = None, captured: bool = False) -> int:
+               attachment_text: Callable | None = None, captured: bool = False,
+               att_texts: dict | None = None) -> int:
         """Store one captured message: identity, headers, snippet, body text
         for search (quoted text stripped), attachments, thread and people
         rollups. Idempotent: a second ingest of the same item updates it."""
@@ -523,8 +530,8 @@ class MailStore:
         sender_email = (msg.sender.email or "").lower() if msg.sender else ""
         # Attachment text is extracted before the store lock is taken (a PDF
         # can take a while; search and capture must not wait on it).
-        att_texts: dict[int, str] = {}
-        if with_body and attachment_text is not None:
+        att_texts = dict(att_texts or {})
+        if with_body and attachment_text is not None and not att_texts:
             for i, a in enumerate(msg.attachments):
                 if not a.is_inline:
                     try:
@@ -695,8 +702,8 @@ def _is_starred(flags, labels) -> bool:
 
 
 class _Tx:
-    def __init__(self, conn, lock):
-        self.conn, self.lock = conn, lock
+    def __init__(self, conn, lock, nested: bool = False):
+        self.conn, self.lock, self.nested = conn, lock, nested
 
     def __enter__(self):
         self.lock.acquire()
@@ -704,12 +711,34 @@ class _Tx:
 
     def __exit__(self, exc_type, *_):
         try:
-            if exc_type is None:
-                self.conn.commit()
-            else:
-                self.conn.rollback()
+            if not self.nested:
+                if exc_type is None:
+                    self.conn.commit()
+                else:
+                    self.conn.rollback()
         finally:
             self.lock.release()
+        return False
+
+
+class _Batch:
+    def __init__(self, store):
+        self.store = store
+
+    def __enter__(self):
+        self.store._lock.acquire()
+        self.store._batch_owner = threading.get_ident()
+        return self.store
+
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is None:
+                self.store._db.commit()
+            else:
+                self.store._db.rollback()
+        finally:
+            self.store._batch_owner = None
+            self.store._lock.release()
         return False
 
 

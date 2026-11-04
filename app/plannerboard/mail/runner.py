@@ -25,6 +25,8 @@ from .imap import ImapProvider
 from .gmail import GmailProvider
 from .graph import GraphProvider
 
+INGEST_BATCH = 50
+
 PROVIDER_CLASSES = {
     "pa_folder": PAFolderProvider,
     "imap": ImapProvider,
@@ -110,8 +112,15 @@ class ProviderThread:
                    "at": datetime.now().isoformat(timespec="seconds")}
         sync = getattr(self.provider, "sync", None)
         cutoff = self.cutoff_ts()
+        self._buf = []
+        this_cycle: set = set()
         try:
             for msg in self.provider.fetch_new(self.state):
+                sid = getattr(msg, "sync_id", "") or msg.provider_ref
+                if sid and sid in this_cycle:
+                    continue                  # reported twice in one cycle (buffered, not yet in the store)
+                if sid:
+                    this_cycle.add(sid)
                 summary["fetched"] += 1
                 rts = _msg_ts(msg)
                 historical = cutoff is not None and rts is not None and rts < cutoff
@@ -131,8 +140,11 @@ class ProviderThread:
                         self._requeue(msg, e)
                         continue
                 self._ledger(sync, msg, historical)
+                if len(self._buf) >= INGEST_BATCH:
+                    self._flush(sync)
         except Exception as e:
             summary["errors"].append(f"fetch: {type(e).__name__}: {e}")
+        self._flush(sync)
         summary["reconcile"] = self._maybe_reconcile(sync)
         if sync is not None and hasattr(sync, "ingest") and backfill.store_settings(self.cfg)["backfill"] \
                 and backfill.supports_backfill(self.provider):
@@ -175,16 +187,20 @@ class ProviderThread:
             return
         try:
             if hasattr(sync, "ingest"):
-                if not getattr(self, "_account_known", False):
-                    sync.ensure_account(self.account_id, self.provider.id,
-                                        getattr(self.provider, "user_email", "") or "")
-                    self._account_known = True
                 since = backfill.body_since(self.cfg)
                 rts = _msg_ts(msg)
                 with_body = since is None or rts is None or rts >= since
-                from .index import attachment_text
-                sync.ingest(self.account_id, msg, historical=historical, with_body=with_body,
-                            attachment_text=attachment_text, captured=True)
+                texts = {}
+                if with_body:
+                    from .index import attachment_text
+                    for i, a in enumerate(msg.attachments):     # outside the store lock
+                        if not a.is_inline:
+                            try:
+                                texts[i] = (attachment_text(a) or "")[:200_000]
+                            except Exception:
+                                texts[i] = ""
+                self._buf.append((msg, historical, with_body, texts))
+                return
             else:
                 sync.upsert(self.account_id, sid,
                             folder=getattr(msg, "sync_folder", "") or msg.folder,
@@ -201,6 +217,35 @@ class ProviderThread:
             if historical:
                 # Nothing else holds it (no triage record): queue a re-fetch.
                 self._requeue(msg, e)
+
+    def _flush(self, sync) -> None:
+        """Ingest the buffered messages in one store transaction."""
+        buf, self._buf = getattr(self, "_buf", []) or [], []
+        if not buf or sync is None:
+            return
+        try:
+            with sync.batch():
+                if not getattr(self, "_account_known", False):
+                    sync.ensure_account(self.account_id, self.provider.id,
+                                        getattr(self.provider, "user_email", "") or "")
+                for msg, historical, with_body, texts in buf:
+                    sync.ingest(self.account_id, msg, historical=historical, with_body=with_body,
+                                captured=True, att_texts=texts)
+                retry = getattr(self.provider, "retry", None)
+                if retry is not None:
+                    pending = retry.pending_ids()
+                    for msg, *_ in buf:
+                        sid = getattr(msg, "sync_id", "") or msg.provider_ref
+                        if sid in pending:
+                            retry.done(sid)
+            self._account_known = True
+        except Exception as e:  # noqa: BLE001
+            note = getattr(self.provider, "note_warning", None)
+            if callable(note):
+                note(f"mail store write failed ({type(e).__name__}: {str(e)[:120]})")
+            for msg, historical, *_ in buf:
+                if historical:
+                    self._requeue(msg, e)          # nothing else holds it
 
     def _requeue(self, msg, err) -> None:
         """The provider handed us the message but it could not be written:
