@@ -107,10 +107,19 @@ class FakeGmail:
             return 200, {"emailAddress": "sam@acme.example", "historyId": str(self.hid),
                          "messagesTotal": len(self.msgs)}
         if path == "/labels":
+            # One pass, cached per history id: the capture cycle asks every
+            # time, and the bench mailbox is 50k messages.
+            if getattr(self, "_label_cache", (None,))[0] != (self.hid, len(self.msgs)):
+                tot, unread = {}, {}
+                for m in self.msgs.values():
+                    for lid in m["labels"]:
+                        tot[lid] = tot.get(lid, 0) + 1
+                        if "UNREAD" in m["labels"]:
+                            unread[lid] = unread.get(lid, 0) + 1
+                self._label_cache = ((self.hid, len(self.msgs)), tot, unread)
+            _k, tot, unread = self._label_cache
             return 200, {"labels": [{"id": lid, "name": lid, "type": "system",
-                                     "messagesTotal": sum(1 for m in self.msgs.values() if lid in m["labels"]),
-                                     "messagesUnread": sum(1 for m in self.msgs.values()
-                                                           if lid in m["labels"] and "UNREAD" in m["labels"])}
+                                     "messagesTotal": tot.get(lid, 0), "messagesUnread": unread.get(lid, 0)}
                                     for lid in ("INBOX", "SENT", "DRAFT", "TRASH", "SPAM")]}
         if method == "POST" and path.startswith("/messages/") and path.count("/") == 3:
             gid, op = path.split("/")[2], path.split("/")[3]
