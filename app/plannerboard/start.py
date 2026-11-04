@@ -165,6 +165,26 @@ def backup_database(rt):
     return dest
 
 
+def purge_mail_store(rt):
+    """Daily: apply the mail body retention window (mail.store.body_days) to
+    the local store, the processed mail cache and old backups together."""
+    try:
+        from .mail import lifecycle
+        from .mail.runner import mail_cache_dir
+        from .mail.store import open_store
+        cfg = rt.config.doc
+        cache = mail_cache_dir(cfg)
+        st = open_store(cache) if (cache / "mail_store.sqlite").exists() else None
+        if st is None:
+            return None
+        out = lifecycle.purge(st, cfg, cache, rt.paths.backups)
+        rt.heartbeat("mail_purge", note=f"{out.get('bodies_dropped', 0)} bodies past the window")
+        return out
+    except Exception as e:  # noqa: BLE001
+        print(f"[purge] failed: {type(e).__name__}: {e}")
+        return None
+
+
 def start_backup_thread(rt):
     rt.register_watcher("db_backup", 24 * 60, note=f"database -> {rt.paths.backups}")
 
@@ -179,6 +199,7 @@ def start_backup_thread(rt):
                 except Exception as e:
                     rt.backup_state["last_error"] = f"{type(e).__name__}: {e}"
                     print(f"[backup] failed: {e}")
+                purge_mail_store(rt)
             time.sleep(600)
 
     threading.Thread(target=loop, daemon=True, name="db-backup").start()

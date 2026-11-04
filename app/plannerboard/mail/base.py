@@ -213,6 +213,10 @@ class BaseProvider:
         self._sync = None
         self._retry = None
         self.clock = None          # tests inject a fake clock for the retry queue
+        # 2.0: every store / retry / reconcile / state row is keyed by account.
+        # A 1.x-shaped account's id is the provider id.
+        self.account_id = self.id
+        self.backfill_missed: list[str] = []
 
     # ── sync truth (Phase 0): ledger + retry queue in <mail_cache>/sync.sqlite ──
     @property
@@ -235,7 +239,7 @@ class BaseProvider:
         if self._retry is None and self.sync is not None:
             import time as _time
             from .retry_queue import RetryQueue
-            self._retry = RetryQueue(self.sync, self.id, clock=self.clock or _time.time)
+            self._retry = RetryQueue(self.sync, self.account_id, clock=self.clock or _time.time)
         return self._retry
 
     def fetch_failed(self, item_id: str, folder: str, err: Exception | str) -> None:
@@ -264,7 +268,7 @@ class BaseProvider:
             return
         for row in self.retry.due(limit):
             iid, folder = row["item_id"], row.get("folder") or ""
-            if self.sync.has(self.id, iid):
+            if self.sync.captured(self.account_id, iid, live_only=True):
                 self.retry.done(iid)          # captured meanwhile by the normal path
                 continue
             try:
@@ -279,7 +283,7 @@ class BaseProvider:
                 continue
             if msg is None:
                 self.retry.done(iid)
-                self.sync.mark_removed(self.id, iid, "gone on retry")
+                self.sync.mark_removed(self.account_id, iid, "gone on retry")
                 continue
             # The row is cleared only after the consumer took the message (the
             # runner clears it on a successful write); a closed generator or a
@@ -293,7 +297,7 @@ class BaseProvider:
             return {}
         from . import reconcile as _rec
         try:
-            return {"retry": self.retry.stats(), "reconcile": _rec.latest(self.sync, self.id)}
+            return {"retry": self.retry.stats(), "reconcile": _rec.latest(self.sync, self.account_id)}
         except Exception as e:  # noqa: BLE001
             return {"error": f"{type(e).__name__}: {e}"}
 
@@ -334,6 +338,7 @@ class BaseProvider:
     def base_health(self) -> dict:
         return {
             "provider": self.id,
+            "account": self.account_id,
             "ok": self._last_error is None,
             "last_fetch": self._last_fetch,
             "error": self._last_error,

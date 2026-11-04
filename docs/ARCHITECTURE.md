@@ -76,7 +76,13 @@ to `127.0.0.1` unless configured otherwise.
 | `api/*.py` | one blueprint per area; `_common.py` holds the shared helpers (`rt()`, `store()`, `body()`, `error_response()`) |
 | `mail/message.py` | `Message` / `Attachment`, `to_pa_record()` / `from_pa_record()`, `validate_record()`, atomic `write_pa_record()` |
 | `mail/base.py`, `pa_folder.py`, `imap.py`, `gmail.py`, `graph.py`, `oauth.py`, `runner.py`, `secrets.py` | provider protocol, the four providers, PKCE helpers, capture threads, keyring wrapper |
-| `mail/syncdb.py`, `mail/retry_queue.py`, `mail/reconcile.py` | sync truth: the per-cache ledger of captured server ids (removals, labels, flags), the failed-fetch retry queue with backoff, and the server-count reconcile pass; all in `mail_cache/sync.sqlite` |
+| `mail/store.py` | the local mail store (`mail_cache/mail_store.sqlite`): `mail_*` tables, numbered forward-only migrations, per-account identity `(account_id, provider_id)`, ingest with FTS5 (subject/sender/body), trigram side index (addresses, filenames, part numbers), attachments, threads, people; optional SQLCipher |
+| `mail/index.py` | query language (operators, phrases, `-`, `OR`, inline hints), bm25 search with recency and reply-affinity rerank, coverage sentence |
+| `mail/sync.py` | store backfill: the whole mailbox, newest first, headers always and bodies inside the window; never triage |
+| `mail/lifecycle.py` | retention purge (store bodies, processed cache, backups together), per-account purge, disk usage |
+| `mail/accounts.py` | per-account config (`mail.accounts`), 1.x slots as legacy accounts, keyring token keys |
+| `mail/syncdb.py`, `mail/retry_queue.py`, `mail/reconcile.py` | Phase 0 sync truth, now inside the store: retry queue with backoff, server-count reconcile |
+| `api/search_api.py`, `static/mail_search.js` | `/api/mail/search` (+ `/server` fallback), `/api/mail/store/usage`, `/reindex`, `/purge`; the MAIL view's search box, `/` and Ctrl+K |
 | `mail/compose.py`, `mail/smtp.py` | outbound message assembly (quoting, threading headers, text alternative, attachments) and SMTP submission for the IMAP provider |
 | `api/mail_client_api.py`, `static/mail.js`, `static/mail.css` | the mail client: `/api/mail/client/*` (folders, list, read, attachment, flags, move, delete, compose, draft, send, stage, file) and the MAIL view that drives it |
 | `triage/*.py` | normalize, text cleanup, match, signals, attachment text extraction, classify, `pipeline.run_cycle` |
@@ -148,8 +154,8 @@ answer 402). Details: `LICENSING.md`.
   plannerboard.db (+ -wal, -shm)  the database
   workflows.json                  stage roster after first run (Settings editor writes it)
   mail_cache/inbox|sent|attachments|processed
-  mail_cache/sync.sqlite          sync ledger, retry queue, reconcile counts (no bodies)
-  mail_cache/state_<provider>.json cursors (Gmail historyId + queued ids, Graph deltaLinks, IMAP UIDs)
+  mail_cache/mail_store.sqlite    local mail store + search indexes, retry queue, reconcile counts
+  mail_cache/state_<account>.json cursors (Gmail historyId + queued ids, Graph deltaLinks, IMAP UIDs)
   project_files/<project>/attachments|emails|intake
   backups/                        daily db snapshots, workflow backups
   logs/server.log, assistant_*.jsonl

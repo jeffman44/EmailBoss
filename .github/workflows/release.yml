@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e "app[dev,tray,attachments,http]" -e license_server pytest httpx
+      - run: pip install -e "app[dev,tray,attachments,http,encrypt]" -e license_server pytest httpx
       - run: make check PY=python   # compileall, banned literals, em dashes, both pytest suites
 
   # 2.0 Phase 0: baseline benchmark on Windows against a generated 50k-message
@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -e "app[dev,attachments,http]" pytest
+          pip install -e "app[dev,attachments,http,encrypt]" pytest
       - name: Bench
         shell: pwsh
         env:
@@ -53,6 +53,35 @@ jobs:
           name: bench-${{ github.run_id }}
           path: app/bench.json
           if-no-files-found: warn
+
+  # 2.0 Phase 1: does SQLCipher install, run and freeze on Windows? The store
+  # ships encryption behind PB_STORE_ENCRYPT only if this job is green.
+  sqlcipher:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "app[dev,attachments,http,encrypt]" pytest pyinstaller
+      - name: Probe (interpreter)
+        shell: pwsh
+        run: python app\scripts\sqlcipher_probe.py
+      - name: Probe (PyInstaller one-file exe)
+        shell: pwsh
+        run: |
+          pyinstaller --onefile --name sqlcipher_probe --collect-all sqlcipher3 --distpath probe_dist --workpath probe_build app\scripts\sqlcipher_probe.py
+          .\probe_dist\sqlcipher_probe.exe
+          if ($LASTEXITCODE -ne 0) { throw "frozen probe failed" }
+      - name: Store encryption tests
+        shell: pwsh
+        run: |
+          cd app
+          python -m pytest -q tests/test_store_search.py
 
   windows:
     needs: test
@@ -74,7 +103,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -e "app[dev,tray,attachments,http,desktop]" pyinstaller build
+          pip install -e "app[dev,tray,attachments,http,desktop,encrypt]" pyinstaller build
       - name: Build bundle (release channel)
         shell: pwsh
         env:

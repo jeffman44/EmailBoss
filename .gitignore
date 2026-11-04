@@ -43,3 +43,4 @@ license_server/keys/*
 .DS_Store
 Thumbs.db
 app/bench.json
+!app/tests/fixtures/db/*.sqlite

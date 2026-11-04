@@ -39,9 +39,37 @@ class PAFolderProvider(BaseProvider):
         return ConnResult(ok=bool(h.get("folder_exists")), detail=h,
                           error=None if h.get("folder_exists") else "folder not found")
 
-    def fetch_new(self, state: ProviderState, limit: int = 200) -> Iterator[Message]:
-        self._record_fetch(0)
-        return iter(())
+    def fetch_new(self, state: ProviderState, limit: int = 2000) -> Iterator[Message]:
+        """The records are already where triage reads them. This only feeds
+        the local store (search) with records it has not seen, marked
+        ``skip_write`` so the runner does not write them again; the runner
+        moves a record received before the install cutoff out of triage's
+        way (2.0: historical mail never reaches triage)."""
+        n = 0
+        sync = self.sync
+        for kind in ("inbox", "sent"):
+            d = self.cache_dir / kind
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob("*.json")):
+                if n >= limit:
+                    break
+                try:
+                    with p.open("r", encoding="utf-8") as fh:
+                        rec = json.load(fh)
+                    msg = Message.from_pa_record(rec, kind)
+                except Exception:
+                    continue                      # health() counts unreadable files
+                sid = str(rec.get("id") or p.stem)
+                if sync is not None and sync.captured(self.account_id, sid):
+                    continue
+                msg.sync_id, msg.sync_folder = sid, kind
+                msg.provider, msg.provider_ref = self.id, sid
+                msg.skip_write = True
+                msg.pa_path = p
+                n += 1
+                yield msg
+        self._record_fetch(n)
 
     def health(self) -> dict:
         out = self.base_health()

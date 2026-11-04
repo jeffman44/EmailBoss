@@ -66,6 +66,11 @@ def folder_for_labels(labels) -> str:
     return "archive"
 
 
+def _msg_ts(msg) -> float:
+    from .store import msg_time
+    return msg_time(msg) or 0.0
+
+
 def _is_not_found(e: Exception) -> bool:
     return "-> 404" in str(e)
 
@@ -229,6 +234,7 @@ class GmailProvider(BaseProvider):
             prof = self._get("/profile")
             self.user_email = prof.get("emailAddress", "")
             newest_hist = prof.get("historyId")
+            self._file_label_names()
             if last_hist:
                 try:
                     ids, hist_after = self._history_scan(last_hist)
@@ -263,7 +269,7 @@ class GmailProvider(BaseProvider):
             done = 0
             while pending and done < cap:
                 gid = pending[0]
-                if (sync is not None and sync.has(self.id, gid, live_only=False)) or gid in seen:
+                if (sync is not None and sync.captured(self.account_id, gid)) or gid in seen:
                     pending.pop(0)
                     continue
                 done += 1
@@ -273,7 +279,7 @@ class GmailProvider(BaseProvider):
                     pending.pop(0)
                     if _is_not_found(e):
                         if sync is not None:
-                            sync.mark_removed(self.id, gid, "gone before fetch")
+                            sync.mark_removed(self.account_id, gid, "gone before fetch")
                     else:
                         self.fetch_failed(gid, "", e)
                     continue
@@ -297,6 +303,19 @@ class GmailProvider(BaseProvider):
             if loaded:
                 state.set("pending_ids", pending)
                 state.save()
+
+    def _file_label_names(self) -> None:
+        """User label id -> name map, for the label: search operator."""
+        if self.sync is None:
+            return
+        try:
+            body = self._get("/labels")
+            names = {lb["id"]: lb.get("name") or lb["id"] for lb in body.get("labels") or []
+                     if str(lb.get("id", "")).startswith("Label_")}
+            import json as _json
+            self.sync.meta_set(f"labels:{self.account_id}", _json.dumps(names))
+        except Exception:
+            pass
 
     def _list_ids(self) -> list[str]:
         """Every id in the first-sync window (no cap: the cap applies to
@@ -342,7 +361,7 @@ class GmailProvider(BaseProvider):
                         continue
                     adds.pop(gid, None)
                     if sync is not None:
-                        sync.mark_removed(self.id, gid, "deleted")
+                        sync.mark_removed(self.account_id, gid, "deleted")
                 for key, added in (("labelsAdded", True), ("labelsRemoved", False)):
                     for ev in h.get(key) or []:
                         m = ev.get("message") or {}
@@ -352,7 +371,7 @@ class GmailProvider(BaseProvider):
                             continue
                         row = None
                         if sync is not None:
-                            row = sync.apply_labels(self.id, gid,
+                            row = sync.apply_labels(self.account_id, gid,
                                                     added=delta if added else (),
                                                     removed=() if added else delta,
                                                     folder_fn=folder_for_labels)
@@ -377,6 +396,34 @@ class GmailProvider(BaseProvider):
             # labelAdded INBOX queues it again.
             raise SkipItem(item_id)
         return msg
+
+    def backfill_page(self, cursor, limit: int = 200, body_since_ts: float | None = None):
+        """One page of the full mailbox (every label, spam and trash included),
+        newest first. Headers via ``format=metadata``; the body only inside
+        the body window. Ids the store already has are skipped."""
+        params = {"maxResults": max(1, min(int(limit or 100), PAGE_CAP)), "includeSpamTrash": "true"}
+        if cursor:
+            params["pageToken"] = cursor
+        body = self._get("/messages", params)
+        out = []
+        sync = self.sync
+        for m in body.get("messages") or []:
+            gid = m.get("id")
+            if not gid or (sync is not None and sync.indexed(self.account_id, gid)):
+                continue
+            try:
+                msg = self._fetch_message(gid, any_folder=True, fmt="metadata")
+                if msg is not None and (body_since_ts is None or _msg_ts(msg) >= body_since_ts):
+                    msg = self._fetch_message(gid, any_folder=True) or msg
+            except Exception as e:
+                if not _is_not_found(e):
+                    self.backfill_missed.append(gid)
+                    self.note_warning(f"backfill: some messages could not be read ({type(e).__name__})")
+                continue
+            if msg is not None:
+                out.append(msg)
+        nxt = body.get("nextPageToken")
+        return out, nxt, not nxt
 
     def server_counts(self) -> dict:
         out = {}
@@ -449,6 +496,11 @@ class GmailProvider(BaseProvider):
         msg.sync_id = gid
         msg.sync_folder = folder_for_labels(labels)
         msg.sync_labels = sorted(labels)
+        if m.get("internalDate"):
+            msg.sync_received_ts = int(m["internalDate"]) / 1000.0     # the server's receive time
+        if fmt == "metadata":
+            ctype = (hmap.get("content-type") or "").lower()
+            msg.sync_has_attachments = ctype.startswith("multipart/mixed")
         return msg
 
     def _body_from_walk(self, payload: dict, gid: str, atts: list[Attachment]) -> tuple[str, str]:

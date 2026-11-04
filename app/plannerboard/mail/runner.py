@@ -15,13 +15,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from . import accounts as accounts_mod
 from . import reconcile
+from . import sync as backfill
 from .base import BaseProvider, ProviderState
 from .message import write_record
 from .pa_folder import PAFolderProvider
 from .imap import ImapProvider
 from .gmail import GmailProvider
 from .graph import GraphProvider
+
+INGEST_BATCH = 200
 
 PROVIDER_CLASSES = {
     "pa_folder": PAFolderProvider,
@@ -40,6 +44,10 @@ def mail_cache_dir(cfg: dict) -> Path:
     return Path(root) / "mail_cache"
 
 
+def configured_accounts(cfg: dict) -> list[dict]:
+    return accounts_mod.accounts(cfg)
+
+
 def configured_provider_ids(cfg: dict) -> list[str]:
     mail = (cfg or {}).get("mail") or {}
     ids = list(mail.get("providers") or [])
@@ -49,11 +57,23 @@ def configured_provider_ids(cfg: dict) -> list[str]:
     return [i for i in ids if i in PROVIDER_CLASSES]
 
 
-def build_provider(cfg: dict, provider_id: str):
+def build_provider(cfg: dict, provider_id: str, account: dict | None = None):
+    """A provider instance. With ``account`` (from ``accounts.accounts``) the
+    account's settings overlay ``mail.<provider>``, its OAuth token comes
+    from its own keyring key and every store row is keyed by its id."""
     cls = PROVIDER_CLASSES.get(provider_id)
     if cls is None:
         raise KeyError(f"unknown mail provider {provider_id!r}")
-    return cls(cfg, mail_cache_dir(cfg))
+    if account is None:
+        return cls(cfg, mail_cache_dir(cfg))
+    acfg = accounts_mod.account_cfg(cfg, account)
+    if provider_id in ("gmail", "graph"):
+        from .oauth import TokenCache
+        prov = cls(acfg, mail_cache_dir(cfg), token_cache=TokenCache(accounts_mod.token_key(account)))
+    else:
+        prov = cls(acfg, mail_cache_dir(cfg))
+    prov.account_id = account["id"]
+    return prov
 
 
 def provider_catalog() -> list[dict]:
@@ -77,7 +97,8 @@ class ProviderThread:
         self.run_triage = run_triage
         self.poll_seconds = max(30, int(poll_seconds or ((cfg.get("mail") or {}).get("poll_seconds") or 300)))
         self.cache_dir = mail_cache_dir(cfg)
-        self.state = ProviderState(self.cache_dir, provider.id)
+        self.account_id = getattr(provider, "account_id", None) or provider.id
+        self.state = ProviderState(self.cache_dir, self.account_id)
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.last_cycle: dict | None = None
@@ -86,24 +107,48 @@ class ProviderThread:
     def run_once(self) -> dict:
         """Fetch -> write -> triage. Never raises."""
         started = time.time()
-        summary = {"provider": self.provider.id, "fetched": 0, "written": 0,
-                   "errors": [], "triage": None,
+        summary = {"provider": self.provider.id, "account": self.account_id, "fetched": 0, "written": 0,
+                   "historical": 0, "errors": [], "triage": None,
                    "at": datetime.now().isoformat(timespec="seconds")}
         sync = getattr(self.provider, "sync", None)
+        cutoff = self.cutoff_ts()
+        self._buf = []
+        this_cycle: set = set()
         try:
             for msg in self.provider.fetch_new(self.state):
+                sid = getattr(msg, "sync_id", "") or msg.provider_ref
+                if sid and sid in this_cycle:
+                    continue                  # reported twice in one cycle (buffered, not yet in the store)
+                if sid:
+                    this_cycle.add(sid)
                 summary["fetched"] += 1
-                try:
-                    write_record(self.cache_dir, msg)
-                    summary["written"] += 1
-                except Exception as e:
-                    summary["errors"].append(f"write {msg.id[:30]}: {type(e).__name__}: {e}")
-                    self._requeue(msg, e)
-                    continue
-                self._ledger(sync, msg)
+                rts = _msg_ts(msg)
+                historical = cutoff is not None and rts is not None and rts < cutoff
+                if historical:
+                    # Before the install cutoff: store and search only, never triage.
+                    summary["historical"] += 1
+                    if getattr(msg, "pa_path", None) is not None:
+                        _set_aside(self.cache_dir, msg.pa_path)
+                elif getattr(msg, "skip_write", False):
+                    pass                              # already in the cache (drop folder)
+                else:
+                    try:
+                        write_record(self.cache_dir, msg)
+                        summary["written"] += 1
+                    except Exception as e:
+                        summary["errors"].append(f"write {msg.id[:30]}: {type(e).__name__}: {e}")
+                        self._requeue(msg, e)
+                        continue
+                self._ledger(sync, msg, historical)
+                if len(self._buf) >= INGEST_BATCH:
+                    self._flush(sync)
         except Exception as e:
             summary["errors"].append(f"fetch: {type(e).__name__}: {e}")
+        self._flush(sync)
         summary["reconcile"] = self._maybe_reconcile(sync)
+        if sync is not None and hasattr(sync, "ingest") and backfill.store_settings(self.cfg)["backfill"] \
+                and backfill.supports_backfill(self.provider):
+            summary["backfill"] = backfill.step(self.provider, sync, self.cfg, cutoff)
         if self.run_triage:
             try:
                 from ..triage.pipeline import run_cycle
@@ -121,26 +166,86 @@ class ProviderThread:
                 pass
         return summary
 
-    def _ledger(self, sync, msg) -> None:
-        """Captured: record identity and state in the sync ledger."""
+    def cutoff_ts(self) -> float | None:
+        """``app_meta.install_cutoff`` as a timestamp; None without a board
+        store (unit tests, tools), which means no gate."""
+        getter = getattr(self.store, "meta_get", None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter("install_cutoff")
+        except Exception:
+            return None
+        return _iso_ts(raw)
+
+    def _ledger(self, sync, msg, historical: bool = False) -> None:
+        """Captured: store the message (identity, headers, body, indexes)."""
         if sync is None:
             return
         sid = getattr(msg, "sync_id", "") or msg.provider_ref
         if not sid:
             return
         try:
-            sync.upsert(self.provider.id, sid,
-                        folder=getattr(msg, "sync_folder", "") or msg.folder,
-                        labels=getattr(msg, "sync_labels", None) or getattr(msg, "labels", None),
-                        flags=getattr(msg, "sync_flags", None),
-                        message_id=msg.internet_message_id)
+            if hasattr(sync, "ingest"):
+                since = backfill.body_since(self.cfg)
+                rts = _msg_ts(msg)
+                with_body = since is None or rts is None or rts >= since
+                texts = {}
+                if with_body:
+                    from .index import attachment_text
+                    for i, a in enumerate(msg.attachments):     # outside the store lock
+                        if not a.is_inline:
+                            try:
+                                texts[i] = (attachment_text(a) or "")[:200_000]
+                            except Exception:
+                                texts[i] = ""
+                self._buf.append((msg, historical, with_body, texts))
+                return
+            else:
+                sync.upsert(self.account_id, sid,
+                            folder=getattr(msg, "sync_folder", "") or msg.folder,
+                            labels=getattr(msg, "sync_labels", None) or getattr(msg, "labels", None),
+                            flags=getattr(msg, "sync_flags", None),
+                            message_id=msg.internet_message_id)
             retry = getattr(self.provider, "retry", None)
             if retry is not None:
                 retry.done(sid)
         except Exception as e:  # noqa: BLE001
             note = getattr(self.provider, "note_warning", None)
             if callable(note):
-                note(f"sync ledger write failed ({type(e).__name__})")
+                note(f"mail store write failed ({type(e).__name__}: {str(e)[:120]})")
+            if historical:
+                # Nothing else holds it (no triage record): queue a re-fetch.
+                self._requeue(msg, e)
+
+    def _flush(self, sync) -> None:
+        """Ingest the buffered messages in one store transaction."""
+        buf, self._buf = getattr(self, "_buf", []) or [], []
+        if not buf or sync is None:
+            return
+        try:
+            with sync.batch():
+                if not getattr(self, "_account_known", False):
+                    sync.ensure_account(self.account_id, self.provider.id,
+                                        getattr(self.provider, "user_email", "") or "")
+                for msg, historical, with_body, texts in buf:
+                    sync.ingest(self.account_id, msg, historical=historical, with_body=with_body,
+                                captured=True, att_texts=texts)
+                retry = getattr(self.provider, "retry", None)
+                if retry is not None:
+                    pending = retry.pending_ids()
+                    for msg, *_ in buf:
+                        sid = getattr(msg, "sync_id", "") or msg.provider_ref
+                        if sid in pending:
+                            retry.done(sid)
+            self._account_known = True
+        except Exception as e:  # noqa: BLE001
+            note = getattr(self.provider, "note_warning", None)
+            if callable(note):
+                note(f"mail store write failed ({type(e).__name__}: {str(e)[:120]})")
+            for msg, historical, *_ in buf:
+                if historical:
+                    self._requeue(msg, e)          # nothing else holds it
 
     def _requeue(self, msg, err) -> None:
         """The provider handed us the message but it could not be written:
@@ -158,7 +263,7 @@ class ProviderThread:
         interval = int(((self.cfg or {}).get("mail") or {}).get("reconcile_seconds")
                        or reconcile.DEFAULT_INTERVAL_S)
         try:
-            if not reconcile.is_due(sync, self.provider.id, interval):
+            if not reconcile.is_due(sync, self.account_id, interval):
                 return None
             return reconcile.run(self.provider, sync)
         except Exception as e:  # noqa: BLE001
@@ -179,7 +284,7 @@ class ProviderThread:
             return self.thread
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True,
-                                       name=f"mail-{self.provider.id}")
+                                       name=f"mail-{self.account_id}")
         self.thread.start()
         return self.thread
 
@@ -234,15 +339,16 @@ def start_all(cfg: dict, store, profession: dict, on_cycle=None, llm=None,
               run_triage: bool = True, autostart: bool = True) -> MailRunner:
     """Build a thread per configured provider and (by default) start them."""
     runner = MailRunner()
-    for pid in configured_provider_ids(cfg):
+    for acct in configured_accounts(cfg):
+        pid = acct["provider"]
         try:
-            prov = build_provider(cfg, pid)
+            prov = build_provider(cfg, pid, acct)
         except Exception as e:
-            print(f"[mail] provider {pid} not built: {e}")
+            print(f"[mail] account {acct['id']} ({pid}) not built: {e}")
             continue
         t = ProviderThread(prov, cfg, store, profession, on_cycle=on_cycle, llm=llm,
                            run_triage=run_triage)
-        runner.threads[pid] = t
+        runner.threads[acct["id"]] = t
         if autostart:
             t.start()
     return runner
@@ -288,3 +394,30 @@ def wire_runtime(rt, llm=None, autostart: bool = True) -> MailRunner:
         except Exception:
             pass
     return runner
+
+
+def _msg_ts(msg) -> float | None:
+    from .store import msg_time
+    return msg_time(msg)
+
+
+def _iso_ts(raw) -> float | None:
+    if not raw:
+        return None
+    from .message import parse_iso
+    dt = parse_iso(str(raw))
+    if dt is None:
+        return None
+    from .store import _ts
+    return _ts(dt)
+
+
+def _set_aside(cache_dir, path) -> None:
+    """A drop-folder record from before the install cutoff: move it where
+    triage does not look (processed/<today>/historical/)."""
+    try:
+        dest = Path(cache_dir) / "processed" / datetime.now().strftime("%Y-%m-%d") / "historical"
+        dest.mkdir(parents=True, exist_ok=True)
+        Path(path).replace(dest / Path(path).name)
+    except OSError:
+        pass

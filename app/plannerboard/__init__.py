@@ -70,6 +70,7 @@ class Runtime:
                                            date_types=_profession.date_type_ids(self.profession()))
         self.store = Store(self.paths.db_file, StoreContext(
             workflows=self.workflows, profession=self.profession, hours=self.hours, user=self.config.user))
+        self.install_cutoff = ensure_install_cutoff(self.store)
 
     # -- profession ---------------------------------------------------------
 
@@ -321,6 +322,22 @@ def _content_type_ok() -> bool:
         return any(request.path.startswith(pfx) for pfx in _MULTIPART_OK) or \
             re.match(r"^/api/projects/[^/]+/intake$", request.path) is not None
     return ct in _JSON_TYPES
+
+
+def ensure_install_cutoff(store):
+    """2.0: the moment this install started keeping a local mail store.
+    Mail received before it is store-and-search only: it never reaches
+    triage, rules, AI or "Needs a home". Written once, never moved."""
+    from datetime import datetime, timezone
+    try:
+        cur = store.meta_get("install_cutoff")
+        if not cur:
+            cur = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            store.meta_set("install_cutoff", cur)
+        return cur
+    except Exception as e:  # noqa: BLE001
+        print(f"[store] install cutoff not recorded: {type(e).__name__}: {e}")
+        return None
 
 
 def create_app(config_path=None, config=None, testing=None):

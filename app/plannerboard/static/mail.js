@@ -173,7 +173,7 @@ window.PBMail = (() => {
         <aside class="mail-folders" id="mail-folders"></aside>
         <section class="mail-list">
           <div class="mail-list-bar">
-            <input type="text" id="mail-search" placeholder="Search this folder..." autocomplete="off">
+            <input type="text" id="mail-search" placeholder="Search all mail (/ or Ctrl+K)" autocomplete="off" aria-label="Search mail">
             <button class="mail-btn" id="mail-refresh" title="Reload">&#8635;</button>
             <button class="mail-btn" id="mail-keys-btn" title="Keyboard shortcuts">?</button>
           </div>
@@ -188,8 +188,18 @@ window.PBMail = (() => {
       <div class="mail-toasts" id="mail-toasts"></div>`;
     const search = $('mail-search');
     let t = null;
-    search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => { S.query = search.value.trim(); loadList(true); }, 350); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape') { search.value = ''; S.query = ''; loadList(true); search.blur(); } });
+    // Local store search first (mail_search.js); the folder's server search is
+    // its fallback row. Without mail_search.js the box searches the server.
+    search.addEventListener('input', () => {
+      if (window.PBMailSearch) { S.query = ''; PBMailSearch.onInput(search.value); return; }
+      clearTimeout(t); t = setTimeout(() => { S.query = search.value.trim(); loadList(true); }, 350);
+    });
+    search.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      search.value = ''; search.blur();
+      if (window.PBMailSearch && PBMailSearch.active()) { PBMailSearch.leave(); return; }
+      S.query = ''; loadList(true);
+    });
     $('mail-refresh').addEventListener('click', refresh);
     $('mail-keys-btn').addEventListener('click', toggleKeys);
     $('mail-keys').addEventListener('click', (e) => { if (e.target.id === 'mail-keys') toggleKeys(false); });
@@ -206,7 +216,10 @@ window.PBMail = (() => {
     if (!S.caps) await loadCaps();
     if (S.caps && S.caps.client_enabled && S.caps.provider !== 'none' && !S.folders.length) await loadFolders();
     else if (Date.now() - S.lastList > 120000 && S.folder) loadList(false, true);
-    if (!S.timer) S.timer = setInterval(() => { if (host.style.display !== 'none' && S.folder && !composerOpen()) loadList(false, true); }, 90000);
+    if (!S.timer) S.timer = setInterval(() => {
+      const searching = window.PBMailSearch && PBMailSearch.active();
+      if (host.style.display !== 'none' && S.folder && !composerOpen() && !searching) loadList(false, true);
+    }, 90000);
   }
   function hide() { const host = $('mail-view'); if (host) host.style.display = 'none'; }
   function viewVisible() { const h = $('mail-view'); return !!(h && h.style.display !== 'none' && h.offsetParent !== null); }
@@ -959,7 +972,10 @@ window.PBMail = (() => {
     } finally { btn.disabled = false; btn.textContent = old; }
   }
 
-  return { show, hide, selectFolder, reloadFolders, openMessage, more, refresh, flag, markRead, move, del, trash, fileTo, stage,
+  // The search fallback row: the same words, asked of the server in this folder.
+  function searchServer(q) { S.query = (q || '').trim(); S.cursor = null; loadList(true); }
+
+  return { show, hide, selectFolder, reloadFolders, openMessage, more, refresh, searchServer, flag, markRead, move, del, trash, fileTo, stage,
            compose, closeCompose, toggleCc, attach, removeAtt, reply, send, saveDraft, aiDraft, toggleKeys, state: S,
            _sanitizeClient: sanitizeClient, _prepareBody: prepareBody,
            // Settings flipped a mail flag: re-read capabilities (send gate, provider) without losing the open folder.

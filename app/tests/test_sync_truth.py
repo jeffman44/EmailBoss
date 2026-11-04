@@ -37,6 +37,8 @@ def _cache_files(cache: Path, folder="inbox"):
 
 
 def _thread(prov, cache, **mail):
+    # The capture path only: the store backfill job has its own tests.
+    mail.setdefault("store", {"backfill": False})
     cfg = {"paths": {"mail_cache": str(cache)}, "mail": dict(mail)}
     return ProviderThread(prov, cfg, store=None, profession={}, run_triage=False, poll_seconds=60)
 
@@ -54,8 +56,12 @@ class FakeGmail:
         self.fail_fetch: dict[str, int] = {}   # gid -> remaining failures
 
     # server-side mutations
-    def deliver(self, gid, labels=("INBOX", "UNREAD"), subject=None):
-        self.msgs[gid] = {"labels": set(labels), "subject": subject or f"Message {gid}"}
+    def deliver(self, gid, labels=("INBOX", "UNREAD"), subject=None, internal_ms=None, date_hdr=None):
+        # internalDate is the server's receive time; by default it agrees
+        # with the Date header (Wed, 01 Oct 2026 10:00 -0600).
+        self.msgs[gid] = {"labels": set(labels), "subject": subject or f"Message {gid}",
+                          "internal": str(internal_ms or 1790870400000),
+                          "date": date_hdr or "Wed, 01 Oct 2026 10:00:00 -0600"}
         self.hid += 1
         self.history.append({"id": self.hid, "messagesAdded": [
             {"message": {"id": gid, "labelIds": sorted(labels)}}]})
@@ -80,13 +86,13 @@ class FakeGmail:
     def _full(self, gid):
         m = self.msgs[gid]
         return {"id": gid, "threadId": f"t{gid}", "labelIds": sorted(m["labels"]),
-                "internalDate": "1759330000000", "snippet": m["subject"],
+                "internalDate": m["internal"], "snippet": m["subject"],
                 "payload": {"mimeType": "text/plain",
                             "headers": [{"name": "From", "value": "Dana <dana@northwind.example>"},
                                         {"name": "To", "value": "sam@acme.example"},
                                         {"name": "Subject", "value": m["subject"]},
                                         {"name": "Message-ID", "value": f"<{gid}@mail.example>"},
-                                        {"name": "Date", "value": "Wed, 01 Oct 2026 10:00:00 -0600"}],
+                                        {"name": "Date", "value": m["date"]}],
                             "body": {"data": _b64url(f"body of {gid}".encode())}}}
 
     def __call__(self, method, url, data=None, headers=None, form=False, timeout=30, raw=False):
@@ -112,7 +118,10 @@ class FakeGmail:
                 body["nextPageToken"] = str(offset + page_size)
             return 200, body
         if path == "/messages":
-            ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
+            if "q" in q:          # the capture path's dated window: inbox and sent only
+                ids = [g for g, m in self.msgs.items() if m["labels"] & {"INBOX", "SENT"}]
+            else:                 # no query: the whole mailbox (backfill, list views)
+                ids = list(self.msgs)
             ids.reverse()   # newest first, like the API
             page_size = int(q.get("maxResults", ["100"])[0])
             offset = int(q.get("pageToken", ["0"])[0])
