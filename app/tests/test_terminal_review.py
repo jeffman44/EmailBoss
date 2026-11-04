@@ -12,7 +12,6 @@ from tests.test_terminal import _terminal_app, _api, _mem  # noqa: F401
 from plannerboard.mail import sync
 from plannerboard.mail.store import open_store
 
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
 
 
 def _refs(c, fid, kind):
