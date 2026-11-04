@@ -232,6 +232,12 @@ class MailStore:
                 pass
         self._db = db
         self._migrate()
+        # Bulk ingest writes many small FTS segments; merging them less eagerly
+        # means fewer pages rewritten (and, encrypted, re-encrypted) per
+        # message. Search cost is unchanged after 'optimize' (purge, reindex).
+        with self._conn() as c:
+            for t in ("mail_fts", "mail_tri", "mail_attachments_fts"):
+                c.execute(f"INSERT INTO {t}({t}, rank) VALUES ('automerge', 8)")
         self._fold_legacy_ledger()
 
     # ── plumbing ──

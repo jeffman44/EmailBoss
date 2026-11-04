@@ -25,7 +25,7 @@ from .imap import ImapProvider
 from .gmail import GmailProvider
 from .graph import GraphProvider
 
-INGEST_BATCH = 50
+INGEST_BATCH = 200
 
 PROVIDER_CLASSES = {
     "pa_folder": PAFolderProvider,
