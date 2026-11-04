@@ -220,6 +220,16 @@ class MailStore:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA secure_delete=ON")
+        # A larger page cache means fewer pages decrypted again on every query
+        # (SQLCipher decrypts on the way into the cache), and temp b-trees for
+        # ORDER BY / IN-lists stay in memory instead of temp files.
+        db.execute("PRAGMA cache_size=-65536")
+        db.execute("PRAGMA temp_store=MEMORY")
+        if self.encrypted:
+            try:
+                db.execute("PRAGMA cipher_memory_security=OFF")
+            except Exception:
+                pass
         self._db = db
         self._migrate()
         self._fold_legacy_ledger()
