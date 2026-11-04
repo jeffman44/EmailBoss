@@ -28,8 +28,9 @@
         <section class="mail-list">
           <div class="mail-list-bar">
             <input type="text" id="mail-search" placeholder="Search all mail (/ or Ctrl+K)" autocomplete="off" aria-label="Search mail">
-            <button class="mail-btn" id="mail-refresh" title="Reload">&#8635;</button>
-            <button class="mail-btn" id="mail-keys-btn" title="Keyboard shortcuts">?</button>
+            <button class="mail-btn" id="mail-refresh" title="Check the server for new mail">&#8635;</button>
+            <button class="mail-btn" id="mail-density" title="Row size: compact, comfortable, large">&#8801;</button>
+            <button class="mail-btn" id="mail-keys-btn" title="Keyboard shortcuts (?)">?</button>
           </div>
           <div class="mail-rows" id="mail-rows"><div class="mail-empty">Loading...</div></div>
         </section>
@@ -55,6 +56,17 @@
       S.query = ''; loadList(true);
     });
     $('mail-refresh').addEventListener('click', refresh);
+    $('mail-density').addEventListener('click', () => M.cycleDensity());
+    $('mail-rows').addEventListener('scroll', (ev) => { S._scrollTop = ev.target.scrollTop; if (M.paintRows) M.paintRows(); });
+    window.addEventListener('resize', () => { S._viewH = null; });
+    $('mail-rows').addEventListener('click', (ev) => {
+      const r = ev.target.closest('.mail-row[data-ref]');
+      if (!r) return;
+      if (ev.target.closest('.mr-check')) { M.toggleSelect(r.dataset.ref); return; }
+      S.cursorRef = r.dataset.ref;
+      openMessage(r.dataset.ref);
+    });
+    M.applyDensity();
     $('mail-keys-btn').addEventListener('click', toggleKeys);
     $('mail-keys').addEventListener('click', (e) => { if (e.target.id === 'mail-keys') toggleKeys(false); });
     if (!window.__pbMailKeys) { window.__pbMailKeys = true; document.addEventListener('keydown', onKey); }
@@ -155,11 +167,33 @@
     if (folderKind() !== 'drafts') { S.local = []; return; }
     try { S.local = (await api('/api/drafts?status=draft')).drafts || []; } catch (e) { S.local = []; }
   }
+  // 2.0: the list reads from the store on this computer. The server is asked
+  // only when the store cannot answer for this folder, for a server search
+  // (the fallback row) and when the person presses Refresh.
+  async function loadStore(reset) {
+    const f = S.folders.find(x => x.id === S.folder) || {};
+    const offset = reset ? 0 : S.rows.length;
+    const q = new URLSearchParams({ folder_id: S.folder, folder_kind: f.kind || 'other', offset: String(offset), limit: '200' });
+    const r = await api('/api/mail/store/list?' + q.toString());
+    if (!r.covered) return false;
+    S.source = 'store';
+    S.rows = reset ? (r.messages || []) : S.rows.concat(r.messages || []);
+    S.total = r.total || S.rows.length;
+    S.cursor = S.rows.length < S.total ? 'store' : null;
+    return true;
+  }
   async function loadList(reset, quiet) {
     if (!S.folder || S.loading) return;
     S.loading = true;
-    if (reset && !quiet) $('mail-rows').innerHTML = '<div class="mail-empty">Loading...</div>';
+    if (reset && !quiet) { S.rows = []; $('mail-rows').innerHTML = '<div class="mail-empty">Loading...</div>'; }
     try {
+      if (!S.query && (reset || S.source === 'store') && await loadStore(reset)) {
+        S.lastList = Date.now();
+        if (reset || quiet) await loadLocalDrafts();
+        renderRows();
+        return;
+      }
+      S.source = 'server';
       const q = new URLSearchParams({ folder: S.folder, limit: '50' });
       if (S.query) q.set('q', S.query);
       if (!reset && S.cursor) q.set('cursor', S.cursor);
@@ -176,29 +210,24 @@
     } finally { S.loading = false; }
   }
 
+  // -- the list: virtualized, fixed row height per density
+  function rowH() { return M.rowHeight(); }
   function renderRows(errText) {
     const host = $('mail-rows');
     if (!host) return;
     host.textContent = '';
-    const isSent = folderKind() === 'sent';
+    S.paintedFirst = -1; S._byRef = null; S._scrollTop = null;
     if (errText) host.appendChild(el('div', { class: 'mail-empty', text: errText }));
     if (!S.rows.length && !S.local.length && !errText) {
       host.appendChild(el('div', { class: 'mail-empty', text: S.query ? 'No matches.' : 'Nothing here.' }));
       return;
     }
-    S.rows.forEach((m) => {
-      const who = isSent ? ('To: ' + (m.to || '')) : (m.from || m.from_email || '');
-      const row = el('div', { class: `mail-row ${m.is_read ? '' : 'unread'} ${m.ref === S.openRef ? 'active' : ''}`, dataset: { ref: m.ref } }, [
-        el('div', { class: 'mr-from', text: who }),
-        el('div', { class: 'mr-date', text: fmtDate(m.date) }),
-        el('div', { class: 'mr-subj', text: m.subject || '(no subject)' }),
-        el('div', { class: 'mr-icons', text: `${m.flagged ? '\u2691 ' : ''}${m.has_attachments ? '\ud83d\udcce' : ''}` }),
-      ]);
-      if (m.preview) row.appendChild(el('div', { class: 'mr-prev', text: m.preview }));
-      row.addEventListener('click', () => openMessage(row.dataset.ref));
-      host.appendChild(row);
-    });
-    if (S.cursor) host.appendChild(el('div', { class: 'mail-more' }, [el('button', { class: 'mail-btn', text: 'Load more', on: { click: more } })]));
+    const spacer = el('div', { class: 'mail-virt', id: 'mail-virt' });
+    spacer.style.height = (S.rows.length * rowH()) + 'px';
+    host.appendChild(spacer);
+    paintRows(true);
+    if (S.cursor && S.source !== 'store') host.appendChild(el('div', { class: 'mail-more' }, [el('button', { class: 'mail-btn', text: 'Load more', on: { click: more } })]));
+    if (S.source === 'store' && S.cursor) host.appendChild(el('div', { class: 'mail-more', text: `${S.rows.length.toLocaleString()} of ${S.total.toLocaleString()}` }));
     if (S.local.length) {
       host.appendChild(el('div', { class: 'mail-group', text: 'On this computer' }));
       S.local.forEach((d) => {
@@ -215,9 +244,79 @@
         host.appendChild(row);
       });
     }
+    if (window.__eb_timing && window.__eb_timing.first_list_ms == null && S.rows.length) {
+      window.__eb_timing.first_list_ms = Math.round(performance.now());
+    }
+  }
+  // Only the rows on screen (plus a margin) exist in the DOM.
+  function paintRows(force) {
+    const host = $('mail-rows'); const spacer = $('mail-virt');
+    if (!host || !spacer) return;
+    const h = rowH();
+    const first = Math.max(0, Math.floor(host.scrollTop / h) - 10);
+    const count = Math.ceil((host.clientHeight || 800) / h) + 20;
+    if (!force && first === S.paintedFirst) { updateRowStates(); return; }
+    S.paintedFirst = first;
+    spacer.textContent = '';
+    const isSent = folderKind() === 'sent';
+    S.rows.slice(first, first + count).forEach((m, i) => {
+      const who = isSent ? ('To: ' + (m.to || '')) : (m.from || m.from_email || '');
+      const cls = rowClass(m);
+      const row = el('div', { class: cls, dataset: { ref: m.ref }, role: 'row' }, [
+        el('span', { class: 'mr-check', text: S.sel.has(m.ref) ? '\u2611' : '\u2610', title: 'Select (x)' }),
+        el('span', { class: 'mr-from', text: who }),
+        el('span', { class: 'mr-subj', text: m.subject || '(no subject)' }),
+        el('span', { class: 'mr-prev', text: m.preview ? ' \u2013 ' + m.preview : '' }),
+        el('span', { class: 'mr-icons', text: `${m.flagged ? '\u2691 ' : ''}${m.has_attachments ? '\ud83d\udcce' : ''}` }),
+        el('span', { class: 'mr-date', text: fmtDate(m.date) }),
+      ]);
+      row.style.top = ((first + i) * h) + 'px';
+      row.style.height = h + 'px';
+      spacer.appendChild(row);
+    });
+    // Near the end of what is loaded: fetch the next store page.
+    if (S.source === 'store' && S.cursor && !S.loading && first + count >= S.rows.length - 20) loadList(false, true);
+  }
+  // Cursor, selection, read and star changes touch only the rows already on
+  // screen (no rebuild, no layout read): this is what keeps j / k cheap on a
+  // page as large as the board.
+  function rowClass(m) {
+    return ['mail-row', m.is_read ? '' : 'unread', m.ref === S.openRef ? 'active' : '',
+      m.ref === S.cursorRef ? 'cursor' : '', S.sel.has(m.ref) ? 'selected' : ''].filter(Boolean).join(' ');
+  }
+  function updateRowStates() {
+    const spacer = $('mail-virt'); if (!spacer) return;
+    const byRef = S._byRef && S._byRefLen === S.rows.length ? S._byRef : null;
+    const map = byRef || new Map(S.rows.map(r => [r.ref, r]));
+    if (!byRef) { S._byRef = map; S._byRefLen = S.rows.length; }
+    spacer.querySelectorAll('.mail-row').forEach((n) => {
+      const m = map.get(n.dataset.ref); if (!m) return;
+      const cls = rowClass(m);
+      if (n.className !== cls) n.className = cls;
+      const ck = n.firstChild; const glyph = S.sel.has(m.ref) ? '\u2611' : '\u2610';
+      if (ck && ck.textContent !== glyph) ck.textContent = glyph;
+      const ic = n.querySelector('.mr-icons'); const icons = `${m.flagged ? '\u2691 ' : ''}${m.has_attachments ? '\ud83d\udcce' : ''}`;
+      if (ic && ic.textContent !== icons) ic.textContent = icons;
+    });
+  }
+  function scrollToRef(ref) {
+    const host = $('mail-rows'); const i = S.rows.findIndex(r => r.ref === ref);
+    if (!host || i < 0) return;
+    const h = rowH(); const top = i * h;
+    const view = S._viewH || (S._viewH = host.clientHeight || 600);
+    const st = S._scrollTop != null ? S._scrollTop : host.scrollTop;
+    let next = st;
+    if (top < st) next = top;
+    else if (top + h > st + view) next = top + h - view;
+    if (next !== st) { host.scrollTop = next; S._scrollTop = next; paintRows(false); }
+    else updateRowStates();
   }
   function more() { loadList(false); }
-  function refresh() { S.cursor = null; loadList(true); reloadFolders(); }
+  // Refresh = ask the server now: one capture cycle into the store, then re-read.
+  async function refresh() {
+    try { await M.post('/api/mail/run', {}); } catch (e) { /* the store still answers */ }
+    S.cursor = null; loadList(true); reloadFolders();
+  }
 
   async function openLocalDraft(id) {
     const d = S.local.find(x => x.id === id);
@@ -241,5 +340,5 @@
   // The search fallback row: the same words, asked of the server in this folder.
   function searchServer(q) { S.query = (q || '').trim(); S.cursor = null; loadList(true); }
 
-  Object.assign(M, { build, bumpUnread, deleteLocalDraft, emptyWith, folderKind, hide, kindIcon, loadCaps, loadFolders, loadList, loadLocalDrafts, more, openLocalDraft, refresh, reloadFolders, renderFolders, renderRows, searchServer, selectFolder, show });
+  Object.assign(M, { updateRowStates, paintRows, scrollToRef, loadStore, build, bumpUnread, deleteLocalDraft, emptyWith, folderKind, hide, kindIcon, loadCaps, loadFolders, loadList, loadLocalDrafts, more, openLocalDraft, refresh, reloadFolders, renderFolders, renderRows, searchServer, selectFolder, show });
 })();

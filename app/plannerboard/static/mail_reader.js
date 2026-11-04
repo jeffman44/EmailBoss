@@ -28,24 +28,32 @@
   const trustSender = (...a) => M.trustSender(...a);
 
   // -- reading pane
+  // 2.0: the reading pane reads from the store (the body is on this computer
+  // inside the body window); the server answers only for older mail.
   async function openMessage(ref) {
-    S.openRef = ref;
-    renderRows();
+    const t0 = performance.now();
+    S.openRef = ref; S.cursorRef = ref; S._openT0 = t0;
+    if (M.scrollToRef) M.scrollToRef(ref); else renderRows();
     const pane = $('mail-read');
     pane.innerHTML = '<div class="mail-read-empty">Loading...</div>';
+    const fromStore = S.source === 'store';
     try {
-      S.open = await api('/api/mail/client/message?ref=' + encodeURIComponent(ref) + '&mark_read=1');
+      S.open = fromStore
+        ? await api('/api/mail/store/message?ref=' + encodeURIComponent(ref))
+        : await api('/api/mail/client/message?ref=' + encodeURIComponent(ref) + '&mark_read=1');
     } catch (e) {
       pane.innerHTML = '';
       pane.appendChild(el('div', { class: 'mail-read-empty', text: e.message }));
       return;
     }
+    if (S.openRef !== ref) return;                    // a newer j / k won
     const row = S.rows.find(r => r.ref === ref);
-    if (row && !row.is_read) { row.is_read = true; bumpUnread(-1); renderRows(); }
+    if (row && !row.is_read) {
+      row.is_read = true; bumpUnread(-1); if (M.updateRowStates) M.updateRowStates();
+      if (fromStore) post('/api/mail/client/flags', { ref, read: true }).catch(() => {});
+    }
     S.open._loadImages = senderTrusted(S.open);
     renderOpen();
-    const active = document.querySelector('.mail-row.active');
-    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
   }
 
   // Build the sandboxed document: active content stripped, remote content held back.
@@ -136,6 +144,7 @@
     iframe.setAttribute('referrerpolicy', 'no-referrer');
     iframe.srcdoc = bodyDoc(prep);
     box.appendChild(iframe);
+    if (S._openT0 != null && S.open && S.open.ref === ref) { M.timed('open_message_ms', performance.now() - S._openT0); S._openT0 = null; }
   }
   function renderOpen() {
     const m = S.open; const pane = $('mail-read');
@@ -164,7 +173,10 @@
       </div>
       <div class="mail-img-bar" id="mail-img-bar" style="display:none"></div>
       ${files.length ? `<div class="mail-attachments" id="mail-atts"></div>` : ''}
-      <div class="mail-body" id="mail-body"></div>
+      <div class="mail-read-split">
+        <div class="mail-body" id="mail-body"></div>
+        <aside class="mail-ctx" id="mail-ctx" aria-label="Context" style="display:none"></aside>
+      </div>
       <div class="mail-note" id="mail-note"></div>`;
     const acts = {
       reply: () => reply('reply'), reply_all: () => reply('reply_all'), forward: () => reply('forward'),
@@ -180,52 +192,64 @@
       at.appendChild(link);
     });
     drawBody();
+    if (S.ctxOpen) loadContext();
+  }
+
+  // -- context pane ("]"): project, money, people, thread timeline
+  function toggleContext(force) {
+    S.ctxOpen = typeof force === 'boolean' ? force : !S.ctxOpen;
+    const box = $('mail-ctx');
+    if (!box) return;
+    if (!S.ctxOpen) { box.style.display = 'none'; return; }
+    loadContext();
+  }
+  async function loadContext() {
+    const box = $('mail-ctx'); const m = S.open;
+    if (!box || !m) return;
+    box.style.display = 'block';
+    box.textContent = 'Loading...';
+    let c;
+    try { c = await api('/api/mail/store/context?ref=' + encodeURIComponent(m.ref)); }
+    catch (e) { box.textContent = e.message; return; }
+    if (!S.open || S.open.ref !== m.ref) return;
+    box.textContent = '';
+    const sec = (title) => { const h = el('div', { class: 'ctx-sec' }, [el('h4', { text: title })]); box.appendChild(h); return h; };
+    const p = c.project;
+    const ps = sec((window.ent ? ent('project') : 'Project'));
+    ps.appendChild(el('div', { text: p ? `${p.name} (${p.status || 'no status'})` : 'Not filed yet' }));
+    if (p && (p.quote_amount != null || p.approved_amount != null)) {
+      const ms = sec('Money');
+      if (p.quote_amount != null) ms.appendChild(el('div', { text: 'Quoted: $' + Number(p.quote_amount).toLocaleString() }));
+      if (p.approved_amount != null) ms.appendChild(el('div', { text: 'Approved: $' + Number(p.approved_amount).toLocaleString() }));
+    }
+    const pe = sec('People');
+    (c.people || []).forEach((x) => pe.appendChild(el('div', { class: 'ctx-person',
+      text: `${x.name || x.email}  (you wrote ${x.sent}, they wrote ${x.received})` })));
+    if (!(c.people || []).length) pe.appendChild(el('div', { text: 'No history yet' }));
+    const tl = sec('Timeline');
+    (c.thread || []).forEach((t) => {
+      const row = el('div', { class: 'ctx-thread' + (t.ref === m.ref ? ' here' : ''), role: 'button', tabindex: '0',
+        text: `${t.date ? new Date(t.date).toLocaleDateString() : ''}  ${t.from || ''}: ${t.subject || ''}` });
+      row.addEventListener('click', () => openMessage(t.ref));
+      tl.appendChild(row);
+    });
+    if (!(c.thread || []).length) tl.appendChild(el('div', { text: 'Only this message' }));
   }
 
   function note(t) { const e = $('mail-note'); if (e) e.textContent = t || ''; }
 
-  async function flag(on) {
-    if (!S.open) return;
-    try { await post('/api/mail/client/flags', { ref: S.open.ref, flagged: on }); S.open.flagged = on;
-      const row = S.rows.find(r => r.ref === S.open.ref); if (row) row.flagged = on; renderRows(); renderOpen(); }
-    catch (e) { say(e.message); }
-  }
-  async function markRead(on) {
-    if (!S.open) return;
-    try { await post('/api/mail/client/flags', { ref: S.open.ref, read: on });
-      const row = S.rows.find(r => r.ref === S.open.ref); if (row && row.is_read !== on) { row.is_read = on; bumpUnread(on ? -1 : 1); }
-      renderRows(); say(on ? 'Marked read' : 'Marked unread'); }
-    catch (e) { say(e.message); }
-  }
+  // Actions on the open message go through the undo layer (mail_undo.js).
+  function flag(on) { if (S.open) return M.listAction('star', [S.open.ref], { on }); }
+  function markRead(on) { if (S.open) return M.listAction('read', [S.open.ref], { on }); }
   function dropOpen() {
     S.rows = S.rows.filter(r => r.ref !== S.openRef);
     S.open = null; S.openRef = null;
     renderRows(); renderOpen();
   }
   function backTarget() { const k = folderKind(); return k === 'inbox' ? 'inbox' : S.folder; }
-  // Move with an Undo toast: the move is real, Undo moves it back from its new ref.
-  async function moveWithUndo(dest, doneText) {
-    if (!S.open) return;
-    const ref = S.open.ref; const back = backTarget();
-    try {
-      const r = await post('/api/mail/client/move', { ref, folder: dest });
-      dropOpen();
-      const newRef = r.new_ref || null;
-      if (!newRef) { say(doneText); return; }
-      toastAction(doneText, 'Undo', async () => {
-        try { await post('/api/mail/client/move', { ref: newRef, folder: back }); say('Put back'); loadList(true, true); reloadFolders(); }
-        catch (e) { say(e.message); }
-      }, 10000);
-    } catch (e) { say(e.message); }
-  }
-  function move(folder) { return moveWithUndo(folder, folder === 'archive' ? 'Archived' : 'Moved'); }
-  async function trash() {
-    if (!S.open) return;
-    const c = (S.caps && S.caps.capabilities) || {};
-    if (c.move) return moveWithUndo('trash', 'Moved to Trash');
-    try { await post('/api/mail/client/delete', { ref: S.open.ref }); say('Moved to Trash'); dropOpen(); }
-    catch (e) { say(e.message); }
-  }
+  function moveWithUndo(dest) { if (S.open) return M.listAction(dest === 'archive' ? 'archive' : dest === 'trash' ? 'trash' : 'move', [S.open.ref], { folder: dest }); }
+  function move(folder) { return moveWithUndo(folder); }
+  function trash() { return moveWithUndo('trash'); }
   const del = trash;
   async function fileTo() {
     const sel = $('mail-file-proj'); const pid = sel && sel.value;
@@ -243,5 +267,5 @@
     catch (e) { say(e.message); }
   }
 
-  Object.assign(M, { backTarget, bodyDoc, del, drawBody, dropOpen, fileTo, flag, inlineImages, markRead, move, moveWithUndo, note, openMessage, prepareBody, renderOpen, stage, trash });
+  Object.assign(M, { toggleContext, loadContext, backTarget, bodyDoc, del, drawBody, dropOpen, fileTo, flag, inlineImages, markRead, move, moveWithUndo, note, openMessage, prepareBody, renderOpen, stage, trash });
 })();

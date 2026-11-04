@@ -9,6 +9,9 @@
     "reconcile_ms": 30,
     "list_page_ms_p50": 35,
     "open_message_ms_p50": 1.0,
-    "search_ms_p50": 60
+    "search_ms_p50": 60,
+    "ui_first_list_ms": null,
+    "ui_open_message_ms_p50": null,
+    "ui_search_ms_p50": null
   }
 }

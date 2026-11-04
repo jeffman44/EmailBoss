@@ -162,6 +162,27 @@ def _guard(cap: str | None = None):
     return prov, None
 
 
+def _mail_store_for(prov):
+    """The local store this provider writes, or None (no cache dir, unreadable)."""
+    try:
+        from ..mail.store import open_store
+        cache = getattr(prov, "cache_dir", None) or mail_runner.mail_cache_dir(_cfg())
+        return open_store(cache)
+    except Exception:
+        return None
+
+
+def _store_after(prov, fn, *args, **kw):
+    """Apply a write to the store; a store problem never fails the write."""
+    st = _mail_store_for(prov)
+    if st is None:
+        return None
+    try:
+        return fn(st, getattr(prov, "account_id", prov.id), *args, **kw)
+    except Exception:
+        return None
+
+
 def _fail(e: Exception):
     """Plain-language error; the technical text rides along as ``detail``."""
     if isinstance(e, MailRefused):
@@ -372,9 +393,21 @@ def api_flags():
     ref = data.get("ref") or ""
     if not ref:
         return error_response(400, "Pick a message first.")
+    from ..mail import terminal
     try:
+        prior = None
+        st = _mail_store_for(prov)
+        row = st.get(getattr(prov, "account_id", prov.id), ref) if st is not None else None
+        if row is not None:
+            prior = {"read": bool(row.get("is_read")), "flagged": bool(row.get("is_starred"))}
         ok = prov.set_flags(ref, read=data.get("read"), flagged=data.get("flagged"))
-        return jsonify({"ok": bool(ok), "ref": ref})
+        _store_after(prov, terminal.apply_flags, ref, read=data.get("read"), flagged=data.get("flagged"))
+        out = {"ok": bool(ok), "ref": ref}
+        if data.get("undoable") and prior is not None:
+            inverse = {k: prior[k] for k in ("read", "flagged") if data.get(k) is not None}
+            out["action_id"] = _store_after(prov, terminal.record, "flags", ref, inverse,
+                                            data.get("label") or "Change flags")
+        return jsonify(out)
     except Exception as e:
         return _fail(e)
 
@@ -389,9 +422,18 @@ def api_move():
     ref, folder = data.get("ref") or "", data.get("folder") or ""
     if not ref or not folder:
         return error_response(400, "Pick a message and a folder first.")
+    from ..mail import terminal
     try:
+        st = _mail_store_for(prov)
+        row = st.get(getattr(prov, "account_id", prov.id), ref) if st is not None else None
         new_ref = prov.move_message(ref, folder)
-        return jsonify({"ok": True, "ref": ref, "new_ref": new_ref, "folder": folder})
+        _store_after(prov, terminal.apply_move, ref, folder, new_ref)
+        out = {"ok": True, "ref": ref, "new_ref": new_ref, "folder": folder}
+        if data.get("undoable"):
+            out["action_id"] = _store_after(prov, terminal.record, "move", ref, {
+                "new_ref": new_ref or ref, "from_folder": data.get("from") or (row or {}).get("folder") or "inbox",
+                "from_kind": (row or {}).get("folder") or "inbox"}, data.get("label") or f"Move to {folder}")
+        return jsonify(out)
     except Exception as e:
         return _fail(e)
 
@@ -405,8 +447,11 @@ def api_delete():
     ref = body().get("ref") or ""
     if not ref:
         return error_response(400, "Pick a message first.")
+    from ..mail import terminal
     try:
-        return jsonify({"ok": bool(prov.delete_message(ref)), "ref": ref})
+        ok = bool(prov.delete_message(ref))
+        _store_after(prov, terminal.apply_move, ref, "trash", None)
+        return jsonify({"ok": ok, "ref": ref})
     except Exception as e:
         return _fail(e)
 

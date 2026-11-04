@@ -72,6 +72,9 @@ class FakeGmail:
         self.history.append({"id": self.hid, "messagesDeleted": [{"message": {"id": gid}}]})
 
     def relabel(self, gid, add=(), remove=()):
+        add, remove = tuple(add), tuple(remove)
+        if not add and not remove:
+            return
         m = self.msgs[gid]
         m["labels"] = (m["labels"] | set(add)) - set(remove)
         self.hid += 1
@@ -103,6 +106,25 @@ class FakeGmail:
         if path == "/profile":
             return 200, {"emailAddress": "sam@acme.example", "historyId": str(self.hid),
                          "messagesTotal": len(self.msgs)}
+        if path == "/labels":
+            return 200, {"labels": [{"id": lid, "name": lid, "type": "system",
+                                     "messagesTotal": sum(1 for m in self.msgs.values() if lid in m["labels"]),
+                                     "messagesUnread": sum(1 for m in self.msgs.values()
+                                                           if lid in m["labels"] and "UNREAD" in m["labels"])}
+                                    for lid in ("INBOX", "SENT", "DRAFT", "TRASH", "SPAM")]}
+        if method == "POST" and path.startswith("/messages/") and path.count("/") == 3:
+            gid, op = path.split("/")[2], path.split("/")[3]
+            if gid not in self.msgs:
+                return 404, {"error": "not found"}
+            if op == "modify":
+                self.relabel(gid, add=tuple((data or {}).get("addLabelIds") or ()),
+                             remove=tuple((data or {}).get("removeLabelIds") or ()))
+            elif op == "trash":
+                self.relabel(gid, add=("TRASH",), remove=tuple(l for l in ("INBOX",) if l in self.msgs[gid]["labels"]))
+            elif op == "untrash":
+                self.relabel(gid, remove=("TRASH",))
+            self.writes = getattr(self, "writes", []) + [(op, gid, data)]
+            return 200, {"id": gid, "labelIds": sorted(self.msgs[gid]["labels"])}
         if path.startswith("/labels/"):
             label = path.rsplit("/", 1)[1]
             return 200, {"id": label, "messagesTotal": sum(1 for m in self.msgs.values() if label in m["labels"])}
@@ -131,6 +153,8 @@ class FakeGmail:
             return 200, body
         if path.startswith("/messages/"):
             gid = path.split("/")[2]
+            if q.get("format") == ["minimal"] and gid in self.msgs:
+                return 200, {"id": gid, "labelIds": sorted(self.msgs[gid]["labels"])}
             if self.fail_fetch.get(gid, 0) > 0:
                 self.fail_fetch[gid] -= 1
                 return 500, {"error": "backend error"}

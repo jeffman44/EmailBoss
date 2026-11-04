@@ -1117,6 +1117,10 @@ class _ImapClient:
     def _resolve_ref(self, ref: str) -> tuple[str, int, int]:
         """(folder, uidvalidity, uid) from a client ref or a capture-path
         provider_ref (``inbox:uv:uid`` / ``sent:uv:uid``)."""
+        if (ref or "").startswith("x:"):
+            # Backfill id for a folder other than inbox / sent: x:<folder>:<uv>:<uid>
+            head, uv, uid = ref[2:].rsplit(":", 2)
+            return head, int(uv), int(uid)
         parts = (ref or "").split(":", 2)
         if len(parts) != 3:
             raise ValueError(f"bad message ref {ref!r}")

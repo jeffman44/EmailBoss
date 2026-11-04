@@ -186,3 +186,46 @@
 .ms-server { padding: 10px 12px; cursor: pointer; font-weight: 600; border-top: 1px solid rgba(127,127,127,.25); }
 .ms-footer { display: flex; align-items: center; gap: 8px; justify-content: space-between; padding: 8px 12px; font-size: 12px; opacity: .85; border-top: 1px solid rgba(127,127,127,.25); }
 .ms-cov { flex: 1; }
+
+/* 2.0 terminal: virtualized list with fixed row heights per density */
+#mail-view { --mail-row-h: 44px; }
+.mail-rows { position: relative; overflow-y: auto; }
+.mail-virt { position: relative; width: 100%; }
+.mail-virt .mail-row { position: absolute; left: 0; right: 0; box-sizing: border-box; display: flex; align-items: center;
+  gap: 8px; padding: 0 10px; overflow: hidden; white-space: nowrap; border-bottom: 1px solid rgba(127,127,127,.15); cursor: pointer; }
+.mail-virt .mail-row .mr-from { flex: 0 0 22%; overflow: hidden; text-overflow: ellipsis; }
+.mail-virt .mail-row .mr-subj { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.mail-virt .mail-row .mr-prev { flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; opacity: .65; }
+.mail-virt .mail-row .mr-icons, .mail-virt .mail-row .mr-date { flex: 0 0 auto; font-size: 12px; opacity: .8; }
+.mail-virt .mail-row .mr-check { flex: 0 0 auto; opacity: .55; }
+.mail-virt .mail-row.unread .mr-from, .mail-virt .mail-row.unread .mr-subj { font-weight: 700; }
+.mail-virt .mail-row.cursor { box-shadow: inset 3px 0 0 #7f77dd; }
+.mail-virt .mail-row.selected { background: rgba(127,119,221,.14); }
+.mail-virt .mail-row.selected .mr-check { opacity: 1; }
+#mail-view[data-density="compact"] .mail-virt .mail-row { font-size: 13px; }
+body.large-text .mail-virt .mail-row { font-size: 16px; }
+/* reading pane + context pane */
+.mail-read-split { display: flex; gap: 0; min-height: 0; flex: 1; }
+.mail-read-split .mail-body { flex: 1 1 auto; min-width: 0; }
+.mail-ctx { flex: 0 0 260px; padding: 10px 12px; border-left: 1px solid rgba(127,127,127,.25); overflow-y: auto; font-size: 13px; }
+.mail-ctx h4 { margin: 10px 0 4px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; opacity: .7; }
+.ctx-thread { padding: 3px 0; cursor: pointer; }
+.ctx-thread.here { font-weight: 700; }
+@media (max-width: 1100px) { .mail-ctx { flex-basis: 200px; } }
+
+/* command palette (Ctrl+K) */
+.eb-palette { position: fixed; inset: 0; display: none; align-items: flex-start; justify-content: center; padding-top: 12vh;
+  background: rgba(0,0,0,.35); z-index: 9000; }
+.eb-palette.open { display: flex; }
+.eb-pal-card { width: min(640px, 92vw); background: var(--bg0, #1b1b1f); color: var(--t0, #eee); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.45); overflow: hidden; }
+#eb-pal-input { width: 100%; box-sizing: border-box; padding: 14px 16px; font-size: 16px; border: 0;
+  border-bottom: 1px solid rgba(127,127,127,.3); background: transparent; color: inherit; outline: none; }
+.eb-pal-list { max-height: 60vh; overflow-y: auto; padding: 4px 0; }
+.eb-pal-group { padding: 8px 16px 2px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; opacity: .6; }
+.eb-pal-item { display: flex; justify-content: space-between; gap: 12px; padding: 7px 16px; cursor: pointer; }
+.eb-pal-item.active { background: rgba(127,119,221,.22); }
+.eb-pal-item.disabled { cursor: default; opacity: .7; }
+.eb-pal-item.server { font-weight: 600; border-top: 1px solid rgba(127,127,127,.2); }
+.eb-pal-hint { opacity: .55; font-size: 12px; white-space: nowrap; }
+.eb-pal-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

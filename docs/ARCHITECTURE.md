@@ -82,6 +82,8 @@ to `127.0.0.1` unless configured otherwise.
 | `mail/lifecycle.py` | retention purge (store bodies, processed cache, backups together), per-account purge, disk usage |
 | `mail/accounts.py` | per-account config (`mail.accounts`), 1.x slots as legacy accounts, keyring token keys |
 | `mail/syncdb.py`, `mail/retry_queue.py`, `mail/reconcile.py` | Phase 0 sync truth, now inside the store: retry queue with backoff, server-count reconcile |
+| `mail/terminal.py`, `api/mail_terminal_api.py` | the MAIL view's store-backed list and reading pane (`/api/mail/store/list`, `/message`), the context pane (`/context`), store updates after every write and the undo log (`/api/mail/undo/<action_id>`) |
+| `static/mail_core.js`, `mail_list.js`, `mail_reader.js`, `mail_keys.js`, `mail_undo.js`, `mail_compose.js`, `mail.js`, `mail_palette.js` | the MAIL view split by concern (shared state on `window.EBMailCore`; `mail.js` keeps the `PBMail` facade): virtualized list with fixed row heights, reader and context pane, Gmail-style keys with focus guards, undo stack, composer, Ctrl+K palette; `window.__eb_timing` for the bench |
 | `api/search_api.py`, `static/mail_search.js` | `/api/mail/search` (+ `/server` fallback), `/api/mail/store/usage`, `/reindex`, `/purge`; the MAIL view's search box, `/` and Ctrl+K |
 | `mail/compose.py`, `mail/smtp.py` | outbound message assembly (quoting, threading headers, text alternative, attachments) and SMTP submission for the IMAP provider |
 | `api/mail_client_api.py`, `static/mail.js`, `static/mail.css` | the mail client: `/api/mail/client/*` (folders, list, read, attachment, flags, move, delete, compose, draft, send, stage, file) and the MAIL view that drives it |

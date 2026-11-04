@@ -6,7 +6,8 @@
  * and was not searched, and always a last row that hands the same words to
  * the mail server (the 1.x folder search, now the fallback).
  *
- * Keys: "/" and Ctrl+K focus the box while the mail view is showing.
+ * Keys: "/" focuses the box while the mail view is showing (Ctrl+K opens
+ * the grouped command palette, mail_palette.js).
  * Escape clears it and returns to the folder list.
  *
  * No inline handlers (CSP script-src 'self'): every listener is attached here.
@@ -61,6 +62,7 @@ window.PBMailSearch = (() => {
     const q = String(raw || '').trim();
     S.active = true; S.q = q;
     const mine = ++S.seq;
+    const t0 = performance.now();
     const host = $('mail-rows');
     if (host && !S.res) host.innerHTML = '<div class="mail-empty">Searching...</div>';
     try {
@@ -69,6 +71,7 @@ window.PBMailSearch = (() => {
       if (mine !== S.seq || !S.active) return;       // a newer keystroke won
       S.res = res;
       render();
+      if (window.EBMailCore && EBMailCore.timed) EBMailCore.timed('search_ms', performance.now() - t0);
     } catch (e) {
       if (mine !== S.seq) return;
       S.res = null;
@@ -175,8 +178,8 @@ window.PBMailSearch = (() => {
     if (!box) return;
     const t = e.target;
     const typing = t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable);
-    const ctrlK = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K');
-    if (ctrlK || (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey)) {
+    // Ctrl+K is the command palette (mail_palette.js); "/" is this box.
+    if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       e.stopPropagation();
       box.focus();

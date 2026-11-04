@@ -6,6 +6,8 @@
     built: false, caps: null, folders: [], folder: null, rows: [], cursor: null, query: '',
     open: null, openRef: null, loading: false, timer: null, lastList: 0,
     local: [], pending: [],
+    // 2.0 terminal: store-backed list, keyboard cursor, selection, density
+    source: 'store', total: 0, cursorRef: null, sel: new Set(), paintedFirst: -1, ctxOpen: false,
   };
   const UNDO_SEND_MS = 10000;
   const AUTOSAVE_MS = 20000;
@@ -184,5 +186,35 @@
 
   function viewVisible() { const h = $('mail-view'); return !!(h && h.style.display !== 'none' && h.offsetParent !== null); }
 
-  Object.assign(M, { $, AUTOSAVE_MS, BAD_CSS, C, DROP_TAGS, IMG_KEY, IMG_PROXY, MAX_PROXY_BYTES, MAX_PROXY_IMAGES, OK_TAGS, PLACEHOLDER, PTR_KEY, S, UNDO_SEND_MS, api, cleanUrl, del_, el, esc, escA, fetchProxied, fmtDate, fmtSize, htmlToText, isRemote, looksHtml, normRemote, openSettingsTab, post, projectOptions, proxyImages, put, restoreRemote, sanitizeClient, sanitizeNode, say, senderKey, senderTrusted, textToHtml, toastAction, trustSender, viewVisible });
+  // -- density (compact 32 px, comfortable 44 px; large text adds 8 px)
+  const DENSITY_KEY = 'eb-mail-density';
+  const DENSITIES = { compact: 32, comfortable: 44 };
+  function density() { try { return localStorage.getItem(DENSITY_KEY) || 'comfortable'; } catch (e) { return 'comfortable'; } }
+  function largeText() { return document.body && document.body.classList.contains('large-text'); }
+  function rowHeight() { return (DENSITIES[density()] || 44) + (largeText() ? 8 : 0); }
+  function applyDensity() {
+    const host = document.getElementById('mail-view');
+    if (host) { host.dataset.density = density(); host.style.setProperty('--mail-row-h', rowHeight() + 'px'); }
+  }
+  function cycleDensity() {
+    const next = density() === 'compact' ? 'comfortable' : 'compact';
+    try { localStorage.setItem(DENSITY_KEY, next); } catch (e) { /* this session only */ }
+    applyDensity();
+    if (M.renderRows) M.renderRows();
+    say(next === 'compact' ? 'Compact rows' : 'Comfortable rows');
+  }
+  function toggleSelect(ref) {
+    if (!ref) return;
+    if (S.sel.has(ref)) S.sel.delete(ref); else S.sel.add(ref);
+    if (M.updateRowStates) M.updateRowStates();
+  }
+
+  // -- timing hook: the bench reads window.__eb_timing on the Windows runner
+  window.__eb_timing = window.__eb_timing || { first_list_ms: null, open_message_ms: [], search_ms: [] };
+  function timed(kind, ms) {
+    const t = window.__eb_timing;
+    if (Array.isArray(t[kind])) { t[kind].push(Math.round(ms * 10) / 10); if (t[kind].length > 200) t[kind].shift(); }
+  }
+
+  Object.assign(M, { density, rowHeight, applyDensity, cycleDensity, toggleSelect, timed, $, AUTOSAVE_MS, BAD_CSS, C, DROP_TAGS, IMG_KEY, IMG_PROXY, MAX_PROXY_BYTES, MAX_PROXY_IMAGES, OK_TAGS, PLACEHOLDER, PTR_KEY, S, UNDO_SEND_MS, api, cleanUrl, del_, el, esc, escA, fetchProxied, fmtDate, fmtSize, htmlToText, isRemote, looksHtml, normRemote, openSettingsTab, post, projectOptions, proxyImages, put, restoreRemote, sanitizeClient, sanitizeNode, say, senderKey, senderTrusted, textToHtml, toastAction, trustSender, viewVisible });
 })();

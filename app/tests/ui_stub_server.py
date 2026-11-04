@@ -413,14 +413,49 @@ def api_mail_compose():
 
 @app.route("/api/mail/client/flags", methods=["POST"])
 def api_mail_flags():
-    MAIL_STATE["flags"].append(request.get_json(force=True))
-    return jsonify({"ok": True})
+    b = request.get_json(force=True) or {}
+    MAIL_STATE["flags"].append({k: v for k, v in b.items() if k not in ("undoable", "label")})
+    return jsonify({"ok": True, "action_id": f"act{len(MAIL_STATE['flags'])}f" if b.get("undoable") else None})
 
 
 @app.route("/api/mail/client/move", methods=["POST"])
 @app.route("/api/mail/client/delete", methods=["POST"])
 def api_mail_move():
-    MAIL_STATE["moved"].append((request.path, request.get_json(force=True)))
+    b = request.get_json(force=True) or {}
+    MAIL_STATE["moved"].append((request.path, {k: v for k, v in b.items() if k in ("ref", "folder")}))
+    return jsonify({"ok": True, "action_id": f"act{len(MAIL_STATE['moved'])}m" if b.get("undoable") else None})
+
+
+@app.route("/api/mail/undo/<action_id>", methods=["POST"])
+def api_mail_undo(action_id):
+    MAIL_STATE.setdefault("undone", []).append(action_id)
+    return jsonify({"ok": True, "label": "undone"})
+
+
+# 2.0 store routes: the stub says "not in the store" for lists (so the client
+# falls back to the server list above) and mirrors the server for a message.
+@app.route("/api/mail/store/list")
+def api_mail_store_list():
+    return jsonify({"ok": True, "covered": False})
+
+
+@app.route("/api/mail/store/message")
+def api_mail_store_message():
+    return api_mail_message()
+
+
+@app.route("/api/mail/store/context")
+def api_mail_store_context():
+    m = MAIL_MSGS.get(request.args.get("ref") or "") or {}
+    return jsonify({"ok": True, "project": {"id": "proj_001", "name": "Lobby retrofit", "status": "action_required",
+                                            "quote_amount": 12000, "approved_amount": None, "follow_up_date": None},
+                    "people": [{"email": m.get("from_email", ""), "name": m.get("from", ""), "sent": 2, "received": 5}],
+                    "thread": [{"ref": m.get("ref", ""), "subject": m.get("subject", ""), "from": m.get("from", ""),
+                                "date": m.get("date"), "folder": "inbox"}]})
+
+
+@app.route("/api/mail/run", methods=["POST"])
+def api_mail_run():
     return jsonify({"ok": True})
 
 
