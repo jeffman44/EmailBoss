@@ -187,5 +187,8 @@ window.PBPalette = (() => {
     }
   }, true);
 
-  return { open, close, state: P };
+  // Other modules add their commands here (thread and rule commands, Phase 3).
+  function addCommands(list) { (list || []).forEach(c => COMMANDS.push(c)); }
+
+  return { open, close, state: P, addCommands, mailThen };
 })();

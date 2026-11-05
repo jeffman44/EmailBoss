@@ -12,6 +12,7 @@ Run directly:  python tests/ui_stub_server.py [port]
 """
 
 import json
+import time
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -452,6 +453,26 @@ def api_mail_store_context():
                     "people": [{"email": m.get("from_email", ""), "name": m.get("from", ""), "sent": 2, "received": 5}],
                     "thread": [{"ref": m.get("ref", ""), "subject": m.get("subject", ""), "from": m.get("from", ""),
                                 "date": m.get("date"), "folder": "inbox"}]})
+
+
+# 2.0 Phase 3: rules and thread actions.
+@app.route("/api/mail/rules/runs")
+def api_mail_rule_runs():
+    return jsonify({"ok": True, "runs": [], "now": time.time()})
+
+
+@app.route("/api/mail/rules")
+def api_mail_rules():
+    return jsonify({"ok": True, "rules": [], "conditions": ["from", "to", "subject", "body", "has_attachment", "list_id",
+                                                            "project"],
+                    "actions": ["file_to_project", "label", "star", "snooze", "skip_inbox", "notify", "archive"],
+                    "mailbox_actions": ["archive", "skip_inbox", "star"], "dry_run_days": 30})
+
+
+@app.route("/api/mail/thread/<op>", methods=["POST"])
+def api_mail_thread_op(op):
+    MAIL_STATE.setdefault("thread_ops", []).append((op, request.get_json(force=True)))
+    return jsonify({"ok": True, "action_id": f"thr{len(MAIL_STATE['thread_ops'])}", "label": op})
 
 
 @app.route("/api/mail/run", methods=["POST"])

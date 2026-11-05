@@ -91,7 +91,7 @@ def api_undo(action_id):
     if st is None:
         return error_response(409, "Undo needs the mail store on this computer.")
     try:
-        return jsonify(terminal.undo(st, prov, getattr(prov, "account_id", prov.id), action_id))
+        return jsonify(terminal.undo(st, prov, getattr(prov, "account_id", prov.id), action_id, board=board_store()))
     except LookupError as e:
         return error_response(404, str(e))
     except Exception as e:  # noqa: BLE001

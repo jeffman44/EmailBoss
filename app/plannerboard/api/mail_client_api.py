@@ -462,9 +462,20 @@ def api_delete():
         return error_response(400, "Pick a message first.")
     from ..mail import terminal
     try:
+        sref = _sid(prov, ref)
+        # Undoable where the provider can put the labels back exactly (Gmail:
+        # trash is a label). Elsewhere the client moves to Trash instead,
+        # which is undoable through the move route.
+        undoable = bool(body().get("undoable")) and callable(getattr(prov, "restore_labels", None))
+        undo_data = _store_after(prov, terminal.undo_data, sref, prov) if undoable else None
         ok = bool(prov.delete_message(ref))
-        _store_after(prov, terminal.apply_move, _sid(prov, ref), "trash", None, prov)
-        return jsonify({"ok": ok, "ref": ref})
+        _store_after(prov, terminal.apply_move, sref, "trash", None, prov)
+        out = {"ok": ok, "ref": ref}
+        if undo_data:
+            undo_data["new_ref"] = sref
+            out["action_id"] = _store_after(prov, terminal.record, "move", sref, undo_data,
+                                            body().get("label") or "Moved to Trash")
+        return jsonify(out)
     except Exception as e:
         return _fail(e)
 

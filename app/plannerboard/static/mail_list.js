@@ -266,6 +266,13 @@
     }
   }
   // Only the rows on screen (plus a margin) exist in the DOM.
+  function rowTags(m) {
+    const t = [];
+    if (m.pinned) t.push('\ud83d\udccc');
+    if (m.waiting_until) t.push('\u23f3');
+    (m.labels_local || []).slice(0, 2).forEach(l => t.push(l));
+    return t.join(' ');
+  }
   function paintRows(force) {
     const host = $('mail-rows'); const spacer = $('mail-virt');
     if (!host || !spacer) return;
@@ -282,6 +289,7 @@
       const row = el('div', { class: cls, dataset: { ref: m.ref }, role: 'row' }, [
         el('span', { class: 'mr-check', text: S.sel.has(m.ref) ? '\u2611' : '\u2610', title: 'Select (x)' }),
         el('span', { class: 'mr-from', text: who }),
+        el('span', { class: 'mr-tags', text: rowTags(m) }),
         el('span', { class: 'mr-subj', text: m.subject || '(no subject)' }),
         el('span', { class: 'mr-prev', text: m.preview ? ' \u2013 ' + m.preview : '' }),
         el('span', { class: 'mr-icons', text: `${m.flagged ? '\u2691 ' : ''}${m.has_attachments ? '\ud83d\udcce' : ''}` }),

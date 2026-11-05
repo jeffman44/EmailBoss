@@ -229,3 +229,21 @@ body.large-text .mail-virt .mail-row { font-size: 16px; }
 .eb-pal-item.server { font-weight: 600; border-top: 1px solid rgba(127,127,127,.2); }
 .eb-pal-hint { opacity: .55; font-size: 12px; white-space: nowrap; }
 .eb-pal-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 2.0 Phase 3: thread badges, pickers, rules editor */
+.mail-virt .mail-row .mr-tags { flex: 0 0 auto; font-size: 11px; color: var(--t3); white-space: nowrap; }
+.mail-virt .mail-row .mr-tags:empty { display: none; }
+.ebx-modal { position: fixed; inset: 0; z-index: 60; display: none; align-items: flex-start; justify-content: center; background: rgba(0,0,0,.35); padding-top: 10vh; }
+.ebx-modal.open { display: flex; }
+.ebx-card { background: var(--bg1, #1b1d22); color: var(--t0); border: 1px solid var(--b1, #333); border-radius: 10px; padding: 16px 18px; min-width: 320px; max-width: min(760px, 94vw); max-height: 78vh; overflow: auto; box-shadow: 0 12px 40px rgba(0,0,0,.4); }
+.ebx-card h3 { margin: 0 0 10px; font-size: 15px; }
+.eb-pick { display: flex; flex-direction: column; gap: 6px; }
+.eb-pick button { text-align: left; }
+.eb-pick kbd { display: inline-block; min-width: 1.4em; margin-right: 8px; text-align: center; opacity: .75; }
+.rules-row { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--b1, #333); }
+.rules-row .rn { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rules-line { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+.rules-line input[type=text], .rules-line input[type=number] { flex: 1 1 auto; min-width: 0; }
+.rules-note { font-size: 12px; color: var(--t3); margin: 6px 0; }
+.rules-dry { margin: 8px 0; padding: 8px; border-radius: 6px; background: var(--bg2, rgba(255,255,255,.04)); font-size: 12px; }
+.rules-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }

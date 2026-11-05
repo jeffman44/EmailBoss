@@ -15,7 +15,8 @@
     ['e', 'Archive'], ['#', 'Move to Trash'], ['s', 'Star / unstar'], ['x', 'Select'], ['* then a', 'Select all'],
     ['r', 'Reply'], ['a', 'Reply all'], ['f', 'Forward'], ['c', 'New message'],
     ['/', 'Search'], ['Ctrl+K', 'Command palette'], [']', 'Context pane (project, people, timeline)'],
-    ['Ctrl+Z', 'Undo the last action'], ['g then i', 'Go to Inbox'], ['g then t', 'Go to Today'],
+    ['z', 'Snooze the thread'], ['w', 'Waiting on a reply (nudge me)'], ['m', 'Mute / unmute the thread'],
+    ['Ctrl+Z', 'Undo the last action, including rule runs'], ['g then i', 'Go to Inbox'], ['g then t', 'Go to Today'],
     ['g then b', 'Go to the board'], ['g then p', 'Go to the project list'],
     ['Esc', 'Close this window, composer or selection'], ['?', 'Show this list'],
   ];
@@ -122,6 +123,7 @@
       case 'f': if (openMsg() && canWrite) M.reply('forward'); break;
       case 'c': if (canWrite) M.compose(); break;
       case ']': if (openMsg() && M.toggleContext) M.toggleContext(); break;
+      case 'z': case 'w': case 'm': if (M.threadKey) M.threadKey(e.key, targets()[0]); break;
       case 'g': case '*':
         pending = e.key; clearTimeout(pendingTimer); pendingTimer = setTimeout(() => { pending = null; }, 1500);
         break;

@@ -246,6 +246,37 @@ class ProviderThread:
             for msg, historical, *_ in buf:
                 if historical:
                     self._requeue(msg, e)          # nothing else holds it
+            return
+        self._after_ingest(sync, [m for m, historical, *_ in buf if not historical])
+
+    def _after_ingest(self, sync, msgs) -> None:
+        """Post-cutoff mail just stored: link threads to the projects their
+        mail is filed under, clear waiting-on where a reply came in, then run
+        the rules. Historical mail never gets here (rules never see backfill).
+        A failure here is noted and never stops capture."""
+        if not msgs or not hasattr(sync, "query"):
+            return
+        from . import rules, threading as thr
+        try:
+            thr.link_correspondence(sync, self.store, self.account_id, None)
+            thr.link_correspondence(sync, self.store, self.account_id,
+                                    [m.internet_message_id for m in msgs if m.internet_message_id])
+            sids = [getattr(m, "sync_id", "") or m.provider_ref for m in msgs]
+            rows = []
+            for i in range(0, len(sids), 400):
+                chunk = sids[i:i + 400]
+                rows += sync.query("SELECT provider_id, thread_key, folder, from_email, received_ts FROM mail_messages"
+                                   f" WHERE account_id=? AND provider_id IN ({','.join('?' * len(chunk))})",
+                                   [self.account_id] + chunk)
+            me = getattr(self.provider, "user_email", "") or ""
+            thr.replies_arrived(sync, self.store, self.account_id, rows, me=me)
+            runs = rules.run_on_ingest(sync, self.store, self.provider, self.account_id, sids, me=me)
+            if runs:
+                self.last_rule_runs = runs
+        except Exception as e:  # noqa: BLE001
+            note = getattr(self.provider, "note_warning", None)
+            if callable(note):
+                note(f"rules / threads after capture failed ({type(e).__name__}: {str(e)[:120]})")
 
     def _requeue(self, msg, err) -> None:
         """The provider handed us the message but it could not be written:

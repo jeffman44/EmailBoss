@@ -46,7 +46,7 @@
       try {
         if (isMove) {
           const dest = kind === 'archive' ? 'archive' : kind === 'trash' ? 'trash' : opts.folder;
-          if (kind === 'trash' && !c.move) { await M.post('/api/mail/client/delete', { ref }); done.push(ref); continue; }
+          if (kind === 'trash' && !c.move) { const r = await M.post('/api/mail/client/delete', { ref, undoable: true, label }); if (r.action_id) entry.ids.push(r.action_id); done.push(ref); continue; }
           const r = await M.post('/api/mail/client/move', { ref, folder: dest, undoable: true, label });
           if (r.action_id) entry.ids.push(r.action_id);
         } else {
@@ -117,5 +117,17 @@
     undo();
   });
 
-  Object.assign(M, { listAction, undo, undoStack: STACK });
+  // An action recorded elsewhere (a thread action, a rule run) joins the same
+  // stack, so Ctrl+Z and the toast's Undo cover it too.
+  function pushUndo(label, ids, toast) {
+    ids = (ids || []).filter(Boolean);
+    if (!ids.length) return null;
+    const entry = { label, ids, pending: false };
+    STACK.push(entry);
+    if (STACK.length > MAX) STACK.shift();
+    if (toast !== false) entry.toast = M.toastAction(label, 'Undo', () => undo(entry), 10000);
+    return entry;
+  }
+
+  Object.assign(M, { listAction, undo, pushUndo, undoStack: STACK });
 })();

@@ -56,12 +56,15 @@ class FakeGmail:
         self.fail_fetch: dict[str, int] = {}   # gid -> remaining failures
 
     # server-side mutations
-    def deliver(self, gid, labels=("INBOX", "UNREAD"), subject=None, internal_ms=None, date_hdr=None):
+    def deliver(self, gid, labels=("INBOX", "UNREAD"), subject=None, internal_ms=None, date_hdr=None,
+                sender=None, headers=None, body=None):
         # internalDate is the server's receive time; by default it agrees
         # with the Date header (Wed, 01 Oct 2026 10:00 -0600).
         self.msgs[gid] = {"labels": set(labels), "subject": subject or f"Message {gid}",
                           "internal": str(internal_ms or 1790870400000),
-                          "date": date_hdr or "Wed, 01 Oct 2026 10:00:00 -0600"}
+                          "date": date_hdr or "Wed, 01 Oct 2026 10:00:00 -0600",
+                          "from": sender or "Dana <dana@northwind.example>", "extra": list(headers or []),
+                          "body": body}
         self.hid += 1
         self.history.append({"id": self.hid, "messagesAdded": [
             {"message": {"id": gid, "labelIds": sorted(labels)}}]})
@@ -91,12 +94,13 @@ class FakeGmail:
         return {"id": gid, "threadId": f"t{gid}", "labelIds": sorted(m["labels"]),
                 "internalDate": m["internal"], "snippet": m["subject"],
                 "payload": {"mimeType": "text/plain",
-                            "headers": [{"name": "From", "value": "Dana <dana@northwind.example>"},
+                            "headers": [{"name": "From", "value": m.get("from") or "Dana <dana@northwind.example>"},
                                         {"name": "To", "value": "sam@acme.example"},
                                         {"name": "Subject", "value": m["subject"]},
                                         {"name": "Message-ID", "value": f"<{gid}@mail.example>"},
-                                        {"name": "Date", "value": m["date"]}],
-                            "body": {"data": _b64url(f"body of {gid}".encode())}}}
+                                        {"name": "Date", "value": m["date"]}]
+                            + [{"name": k, "value": v} for k, v in m.get("extra") or []],
+                            "body": {"data": _b64url((m.get("body") or f"body of {gid}").encode())}}}
 
     def __call__(self, method, url, data=None, headers=None, form=False, timeout=30, raw=False):
         parsed = urllib.parse.urlparse(url)

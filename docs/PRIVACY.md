@@ -23,7 +23,13 @@ Everything in the data root (`$PB_DATA_ROOT` or `~/EmailBoss`):
   so the reading pane opens without asking the server; it is purged with the
   rest of the body. The store keeps the last 500 list actions (archive, move,
   star, read) with what is needed to undo them: message ids and folders, no
-  text. Once a day the window is applied to the store (body text,
+  text. It also keeps your mail rules (the words they match on), a record of
+  each rule run (which message, what the rule did), manual thread splits and
+  merges, and thread state you set (pin, mute, snooze, waiting-on, the
+  project a thread is filed to). The `List-Id` and `List-Unsubscribe` headers
+  are kept so a rule can match a mailing list and so Unsubscribe can open the
+  sender's page; Email Boss never visits that page or sends the unsubscribe
+  mail for you. Once a day the window is applied to the store (body text,
   snippet, part numbers read from the body, attachment text; the index is
   then compacted and the write-ahead log folded back so the text does not
   linger in the file), to triaged records in `mail_cache/processed/` and to

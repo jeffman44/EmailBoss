@@ -65,13 +65,23 @@ def list_rows(store, account_id: str, folder: dict, offset: int = 0, limit: int 
     if f is None or not covered(store, account_id, folder):
         return None
     cond, args = f
+    # The inbox hides muted threads and snoozed ones until the snooze ends;
+    # pinned threads sit on top. Other folders show everything as filed.
+    if (folder.get("kind") or "").lower() == "inbox":
+        cond += " AND COALESCE(t.muted, 0) = 0 AND COALESCE(t.snooze_until, 0) <= ?"
+        args = args + [time.time()]
+    join = (" FROM mail_messages m LEFT JOIN mail_threads t ON t.account_id = m.account_id"
+            " AND t.thread_key = m.thread_key")
     limit = max(1, min(int(limit or 100), ROW_LIMIT))
     rows = store.query(
         "SELECT m.rowid, m.provider_id, m.subject, m.from_email, m.from_name, m.to_addrs, m.received_ts,"
-        " m.snippet, m.has_attachments, m.is_read, m.is_starred, m.folder, m.thread_key, m.message_id, m.body_state"
-        f" FROM mail_messages m WHERE m.account_id = ? AND m.removed = 0 AND {cond}"
-        " ORDER BY m.received_ts DESC LIMIT ? OFFSET ?", [account_id] + args + [limit, max(0, int(offset or 0))])
-    total = store.query(f"SELECT COUNT(*) AS n FROM mail_messages m WHERE m.account_id = ? AND m.removed = 0 AND {cond}",
+        " m.snippet, m.has_attachments, m.is_read, m.is_starred, m.folder, m.thread_key, m.message_id, m.body_state,"
+        " m.local_labels, m.list_unsub, COALESCE(t.pinned, 0) AS pinned, COALESCE(t.muted, 0) AS muted,"
+        " t.snooze_until, t.waiting_until, COALESCE(t.project_id, '') AS project_id"
+        f"{join} WHERE m.account_id = ? AND m.removed = 0 AND {cond}"
+        " ORDER BY COALESCE(t.pinned, 0) DESC, m.received_ts DESC LIMIT ? OFFSET ?",
+        [account_id] + args + [limit, max(0, int(offset or 0))])
+    total = store.query(f"SELECT COUNT(*) AS n{join} WHERE m.account_id = ? AND m.removed = 0 AND {cond}",
                         [account_id] + args)[0]["n"]
     out = []
     for r in rows:
@@ -83,6 +93,10 @@ def list_rows(store, account_id: str, folder: dict, offset: int = 0, limit: int 
             "has_attachments": bool(r["has_attachments"]), "folder": r["folder"],
             "conversation_id": r["thread_key"], "internet_message_id": r["message_id"],
             "body_local": r["body_state"] == "full",
+            "labels_local": json.loads(r["local_labels"] or "[]"), "pinned": bool(r["pinned"]),
+            "muted": bool(r["muted"]), "snoozed_until": _iso(r["snooze_until"]),
+            "waiting_until": _iso(r["waiting_until"]), "project_id": r["project_id"] or None,
+            "can_unsubscribe": bool(r["list_unsub"]),
         })
     return {"messages": out, "total": int(total), "offset": int(offset or 0), "source": "store"}
 
@@ -214,7 +228,7 @@ def record(store, account_id: str, kind: str, ref: str, data: dict, label: str) 
     return aid
 
 
-def undo(store, provider, account_id: str, action_id: str) -> dict:
+def undo(store, provider, account_id: str, action_id: str, board=None) -> dict:
     rows = store.query("SELECT * FROM mail_undo WHERE action_id = ? AND account_id = ?", [action_id, account_id])
     if not rows:
         raise LookupError("That action can no longer be undone.")
@@ -238,6 +252,19 @@ def undo(store, provider, account_id: str, action_id: str) -> dict:
             nr = provider.move_message(at, back)
             sid = apply_move(store, account_id, at, data.get("from_kind") or back, nr, provider)
             out = {"ref": sid or nr or at}
+    elif a["kind"] == "thread":
+        from . import threading as thr
+        thr.set_state(store, account_id, data.get("thread_key") or "", **(data.get("prior") or {}))
+        if data.get("task") and board is not None and data.get("project_id"):
+            board.delete_subtask(data["project_id"], data["task"])
+        out = {"ref": a["ref"]}
+    elif a["kind"] == "override":
+        from . import threading as thr
+        thr.undo_overrides(store, account_id, data)
+        out = {"ref": a["ref"]}
+    elif a["kind"] == "rule_run":
+        from . import rules
+        out = rules.undo_run(store, provider, board, account_id, int(data.get("run_id") or 0))
     else:
         raise LookupError(f"Email Boss cannot undo a {a['kind']} action.")
     with store._conn() as c:
