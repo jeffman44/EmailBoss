@@ -178,6 +178,9 @@ ALTER TABLE mail_messages ADD COLUMN refs TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_messages ADD COLUMN list_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_messages ADD COLUMN list_unsub TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_messages ADD COLUMN local_labels TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE mail_messages ADD COLUMN conv_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS mail_messages_acct_msgid ON mail_messages (account_id, message_id);
 ALTER TABLE mail_threads ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE mail_threads ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;
@@ -209,6 +212,7 @@ CREATE TABLE IF NOT EXISTS mail_rule_runs (
     account_id  TEXT NOT NULL,
     provider_id TEXT NOT NULL,
     msg_rowid   INTEGER,
+    message_id  TEXT NOT NULL DEFAULT '',
     ran_at      REAL NOT NULL,
     done        TEXT NOT NULL DEFAULT '[]',
     action_id   TEXT NOT NULL DEFAULT '',
@@ -216,6 +220,7 @@ CREATE TABLE IF NOT EXISTS mail_rule_runs (
     UNIQUE (rule_id, account_id, provider_id)
 );
 CREATE INDEX IF NOT EXISTS mail_rule_runs_ran ON mail_rule_runs (ran_at);
+CREATE INDEX IF NOT EXISTS mail_rule_runs_msgid ON mail_rule_runs (rule_id, account_id, message_id);
 CREATE INDEX IF NOT EXISTS mail_threads_project ON mail_threads (project_id);
 """),
 ]
@@ -657,8 +662,9 @@ class MailStore:
                  "full" if with_body else "headers", int(bool(historical)), int(bool(captured)), now, now))
             rowid = c.execute("SELECT rowid FROM mail_messages WHERE account_id=? AND provider_id=?",
                               (account_id, sid)).fetchone()[0]
-            c.execute("UPDATE mail_messages SET in_reply_to=?, refs=?, list_id=?, list_unsub=? WHERE rowid=?",
-                      (hdr["in_reply_to"], hdr["refs"], hdr["list_id"], hdr["list_unsub"], rowid))
+            c.execute("UPDATE mail_messages SET in_reply_to=?, refs=?, list_id=?, list_unsub=?, conv_key=?, auto_reply=?"
+                      " WHERE rowid=?", (hdr["in_reply_to"], hdr["refs"], hdr["list_id"], hdr["list_unsub"],
+                                         msg.conversation_id or "", int(hdr["auto_reply"]), rowid))
             c.execute("DELETE FROM mail_fts WHERE rowid=?", (rowid,))
             c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,?)",
                       (rowid, msg.subject or "", sender_text(msg), body))

@@ -22,16 +22,25 @@
     return ref || S.cursorRef || S.openRef || (S.open && S.open.ref) || null;
   }
 
-  async function threadOp(op, ref, extra) {
-    ref = targetRef(ref);
-    if (!ref) { M.say('Pick a message first'); return null; }
-    let r;
-    try { r = await M.post('/api/mail/thread/' + op, Object.assign({ ref }, extra || {})); }
-    catch (e) { M.say(e.message); return null; }
-    if (r.action_id) M.pushUndo(r.label || 'Done', [r.action_id]);
-    else if (r.label) M.say(r.label);
+  // refs: one ref or a list (x-selected rows). One undo entry covers them all.
+  async function threadOp(op, refs, extra) {
+    refs = (Array.isArray(refs) ? refs : [targetRef(refs)]).filter(Boolean);
+    if (!refs.length) { M.say('Pick a message first'); return null; }
+    const ids = []; let last = null; const seen = new Set();
+    for (const ref of refs) {
+      const row = (M.viewRows ? M.viewRows() : S.rows).find(x => x.ref === ref) || {};
+      if (row.conversation_id && seen.has(row.conversation_id) && op !== 'merge') continue;   // one per thread
+      if (row.conversation_id) seen.add(row.conversation_id);
+      try { last = await M.post('/api/mail/thread/' + op, Object.assign({ ref }, extra || {})); if (last.action_id) ids.push(last.action_id); }
+      catch (e) { M.say(e.message); }
+    }
+    if (ids.length) M.pushUndo(ids.length > 1 ? `${(last && last.label || op).split(' \u201c')[0]} (${ids.length} threads)` : (last.label || 'Done'), ids);
     if (M.loadList) await M.loadList(true, true);
-    return r;
+    return last;
+  }
+  function targetsNow(ref) {
+    if (ref && !S.sel.size) return [ref];
+    return S.sel.size ? [...S.sel] : [targetRef(ref)].filter(Boolean);
   }
 
   function closePicker() {
@@ -70,8 +79,8 @@
   }
 
   function snooze(ref) {
-    ref = targetRef(ref);
-    if (!ref) return M.say('Pick a message first');
+    ref = targetsNow(ref);
+    if (!ref.length) return M.say('Pick a message first');
     pick('Snooze until', [
       { label: 'Later today (3 hours)', run: () => threadOp('snooze', ref, { hours: 3 }) },
       { label: 'Tomorrow morning', run: () => threadOp('snooze', ref, { until: at(8, 1) }) },
@@ -80,8 +89,8 @@
     ]);
   }
   function waiting(ref) {
-    ref = targetRef(ref);
-    if (!ref) return M.say('Pick a message first');
+    ref = targetsNow(ref);
+    if (!ref.length) return M.say('Pick a message first');
     pick('Remind me if no reply by', [
       { label: 'In 2 days', run: () => threadOp('waiting', ref, { days: 2 }) },
       { label: 'In 3 days', run: () => threadOp('waiting', ref, { days: 3 }) },
@@ -92,7 +101,7 @@
   function threadKey(k, ref) {
     if (k === 'z') snooze(ref);
     else if (k === 'w') waiting(ref);
-    else if (k === 'm') threadOp('mute', ref);
+    else if (k === 'm') threadOp('mute', targetsNow(ref));
   }
 
   async function mergeSelected() {
@@ -134,11 +143,16 @@
     if (!r || !r.ok) return;
     const fresh = (r.runs || []).filter(x => !x.undone && x.action_id).reverse();
     if (r.runs && r.runs.length) lastRunSeen = Math.max(lastRunSeen, ...r.runs.map(x => x.ran_at));
-    fresh.forEach((run) => {
-      const did = (run.done || []).filter(d => !d.skipped && !d.error && !d.noop).map(d => d.type.replace(/_/g, ' '));
-      M.pushUndo(`Rule “${run.rule}”: ${did.join(', ') || 'matched'}`, [run.action_id], fresh.length <= 3);
-    });
-    if (fresh.length > 3) M.toastAction(`${fresh.length} rule runs. Ctrl+Z undoes them one at a time.`, '', null, 8000);
+    if (!fresh.length) return;
+    // One entry per arrival, always with its toast: Ctrl+Z then undoes what
+    // the toast just said, never a run you were not shown.
+    const names = [...new Set(fresh.map(x => x.rule))];
+    const did = [...new Set(fresh.flatMap(x => (x.done || []).filter(d => !d.skipped && !d.error && !d.noop)
+      .map(d => d.type.replace(/_/g, ' '))))];
+    const label = fresh.length === 1 ? `Rule \u201c${names[0]}\u201d: ${did.join(', ') || 'matched'}`
+      : `${fresh.length} messages handled by ${names.length === 1 ? '\u201c' + names[0] + '\u201d' : names.length + ' rules'}`;
+    M.pushUndo(label, fresh.map(x => x.action_id));
+    if (M.loadList) M.loadList(false, true);
   }
   setInterval(pollRuns, 20000);
 
@@ -174,7 +188,7 @@
     meta.rules.forEach((r) => {
       card.appendChild(el('div', { class: 'rules-row' }, [
         el('label', {}, [el('input', { type: 'checkbox', ...(r.enabled ? { checked: 'checked' } : {}), 'aria-label': 'On',
-          on: { change: (e) => saveRule(Object.assign({}, r, { enabled: e.target.checked }), r.id, !!r.dry_run_ack, true) } })]),
+          on: { change: (e) => saveRule(Object.assign({}, r, { enabled: e.target.checked }), r.id, null, true) } })]),
         el('span', { class: 'rn', text: r.name }),
         el('button', { class: 'mail-btn', text: 'Edit', on: { click: () => editRule(r) } }),
         el('button', { class: 'mail-btn danger', text: 'Delete', on: { click: () => deleteRule(r) } }),
@@ -240,6 +254,11 @@
     const ackRow = el('label', { class: 'rules-note' }, [ack, ' This rule changes my mailbox. I checked the dry run.']);
     ackRow.style.display = 'none';
     card.appendChild(dry); card.appendChild(ackRow);
+    let token = null;
+    const stale = () => { token = null; ack.checked = false; ackRow.style.display = 'none'; dry.textContent = 'Changed. Run the dry run again.'; };
+    card.addEventListener('input', (e) => { if (e.target !== name && e.target !== ack) stale(); });
+    card.addEventListener('change', (e) => { if (e.target !== name && e.target !== ack) stale(); });
+    card.addEventListener('click', (e) => { if (e.target.tagName === 'BUTTON' && /^(\+ |\u00d7)/.test(e.target.textContent)) stale(); });
     const read = () => ({ name: name.value, enabled: rule ? rule.enabled : true,
       conditions: [...conds.children].map(x => x._read()), actions: [...acts.children].map(x => x._read()) });
     const runDry = async () => {
@@ -248,20 +267,21 @@
         dry.textContent = `Would match ${d.matches} message${d.matches === 1 ? '' : 's'} in the last ${d.days} days.`
           + (d.examples.length ? ' For example: ' + d.examples.map(x => `“${x.subject}”`).join(', ') + '.' : '');
         ackRow.style.display = d.changes_mailbox ? '' : 'none';
-        if (!d.changes_mailbox) ack.checked = false;
+        ack.checked = false;
+        token = d.ack_token;
       } catch (e) { dry.textContent = e.message; }
     };
     card.appendChild(el('div', { class: 'rules-actions' }, [
       el('button', { class: 'mail-btn', text: 'Cancel', on: { click: openRules } }),
       el('button', { class: 'mail-btn', text: 'Dry run', on: { click: runDry } }),
-      el('button', { class: 'mail-btn primary', text: 'Save', on: { click: () => saveRule(read(), rule && rule.id, ack.checked) } }),
+      el('button', { class: 'mail-btn primary', text: 'Save', on: { click: () => saveRule(read(), rule && rule.id, ack.checked ? token : null) } }),
     ]));
     name.focus();
   }
 
   async function saveRule(rule, id, acked, quiet) {
     try {
-      const payload = { rule, dry_run_ack: !!acked };
+      const payload = { rule, dry_run_ack: acked || null };
       if (id) await M.put('/api/mail/rules/' + id, payload); else await M.post('/api/mail/rules', payload);
       if (!quiet) M.say('Rule saved');
       openRules();
@@ -278,9 +298,9 @@
     PBPalette.addCommands([
       { label: 'Snooze thread', hint: 'z', run: () => go(() => snooze()) },
       { label: 'Waiting on a reply (nudge me)', hint: 'w', run: () => go(() => waiting()) },
-      { label: 'Mute / unmute thread', hint: 'm', run: () => go(() => threadOp('mute')) },
-      { label: 'Pin / unpin thread', run: () => go(() => threadOp('pin')) },
-      { label: 'Split this message into its own thread', run: () => go(() => threadOp('split')) },
+      { label: 'Mute / unmute thread', hint: 'm', run: () => go(() => threadOp('mute', targetsNow())) },
+      { label: 'Pin / unpin thread', run: () => go(() => threadOp('pin', targetsNow())) },
+      { label: 'Split this message into its own thread', run: () => go(() => threadOp('split', [targetRef()])) },
       { label: 'Merge selected messages into this thread', run: () => go(mergeSelected) },
       { label: 'Unsubscribe from this mailing list', run: () => go(() => unsubscribe()) },
       { label: 'Rules', run: () => go(openRules) },

@@ -149,6 +149,15 @@ class ProviderThread:
         if sync is not None and hasattr(sync, "ingest") and backfill.store_settings(self.cfg)["backfill"] \
                 and backfill.supports_backfill(self.provider):
             summary["backfill"] = backfill.step(self.provider, sync, self.cfg, cutoff)
+        # The backfill stores history without the capture path: once it has
+        # the whole mailbox, link its threads to their projects (once).
+        try:
+            if sync is not None and hasattr(sync, "query") and self.store is not None \
+                    and backfill.state(sync, self.account_id).get("done"):
+                from . import threading as thr
+                thr.link_correspondence(sync, self.store, self.account_id, None, flag="corr_link_backfill")
+        except Exception:  # noqa: BLE001
+            pass
         if self.run_triage:
             try:
                 from ..triage.pipeline import run_cycle
@@ -247,25 +256,31 @@ class ProviderThread:
                 if historical:
                     self._requeue(msg, e)          # nothing else holds it
             return
-        self._after_ingest(sync, [m for m, historical, *_ in buf if not historical])
+        self._after_ingest(sync, [m for m, historical, *_ in buf if not historical],
+                           [m for m, historical, *_ in buf if historical])
 
-    def _after_ingest(self, sync, msgs) -> None:
+    def _after_ingest(self, sync, msgs, historical=()) -> None:
         """Post-cutoff mail just stored: link threads to the projects their
         mail is filed under, clear waiting-on where a reply came in, then run
         the rules. Historical mail never gets here (rules never see backfill).
         A failure here is noted and never stops capture."""
-        if not msgs or not hasattr(sync, "query"):
+        if not (msgs or historical) or not hasattr(sync, "query"):
             return
         from . import rules, threading as thr
         try:
             thr.link_correspondence(sync, self.store, self.account_id, None)
+            # History is linked too (it is filed mail, not homeless mail);
+            # rules and waiting-on below only ever see post-cutoff mail.
             thr.link_correspondence(sync, self.store, self.account_id,
-                                    [m.internet_message_id for m in msgs if m.internet_message_id])
+                                    [m.internet_message_id for m in list(msgs) + list(historical)
+                                     if m.internet_message_id])
+            if not msgs:
+                return
             sids = [getattr(m, "sync_id", "") or m.provider_ref for m in msgs]
             rows = []
             for i in range(0, len(sids), 400):
                 chunk = sids[i:i + 400]
-                rows += sync.query("SELECT provider_id, thread_key, folder, from_email, received_ts FROM mail_messages"
+                rows += sync.query("SELECT provider_id, thread_key, folder, from_email, received_ts, auto_reply FROM mail_messages"
                                    f" WHERE account_id=? AND provider_id IN ({','.join('?' * len(chunk))})",
                                    [self.account_id] + chunk)
             me = getattr(self.provider, "user_email", "") or ""

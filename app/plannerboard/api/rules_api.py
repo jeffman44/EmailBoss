@@ -53,7 +53,7 @@ def _save(rule_id=None):
         return err
     data = body({}) or {}
     try:
-        r = rules.save_rule(st, data.get("rule") or {}, rule_id=rule_id, dry_run_ack=bool(data.get("dry_run_ack")))
+        r = rules.save_rule(st, data.get("rule") or {}, rule_id=rule_id, dry_run_ack=data.get("dry_run_ack"))
     except rules.RuleError as e:
         return error_response(400, str(e))
     except LookupError as e:
@@ -131,6 +131,56 @@ def _unsub_options(raw: str) -> dict:
     return {"web": web, "mailto": mail}
 
 
+def _waiting(st, acct, key, ref, row, data, board, subj):
+    """Waiting-on: the wait lives on the thread; on a thread filed to a
+    project it is also a follow-up subtask (Today's "Nudge today"). The
+    subtask never reactivates a closed project, a new time moves the same
+    subtask, and "stop waiting" completes it. Returns (prior thread state,
+    label, extra) with ``task_undo`` describing how to put the subtask back."""
+    state = thr.get_state(st, acct, key)
+    task = state.get("waiting_task") or ""
+    pid = state.get("project_id") or ""
+    task_undo = None
+    if data.get("off"):
+        prior = thr.set_state(st, acct, key, waiting_until=None, waiting_since=None, waiting_task="")
+        if task and pid and board is not None:
+            board.complete_subtask(pid, task, completed_by="user_directed")
+            task_undo = {"op": "reopen", "project_id": pid, "task": task}
+        return prior, f"Stop waiting on \u201c{subj}\u201d", {"task_undo": task_undo}
+    until = _until(data, default_hours=72)
+    day = datetime.fromtimestamp(until).strftime("%Y-%m-%d")
+    fields = {"waiting_until": until, "waiting_since": time.time()}
+    if not pid:
+        pid = (terminal.context(st, acct, ref, board=board).get("project") or {}).get("id") or ""
+        if pid:
+            fields["project_id"] = pid          # so the reply that clears the wait finds the nudge
+    if pid and board is not None:
+        cur = None
+        if task:
+            cur = board.conn.execute("SELECT follow_up_date, status FROM subtasks WHERE id=? AND project_id=?",
+                                     (task, pid)).fetchone()
+        if cur is not None and cur["status"] == "pending":
+            board.update_subtask_fields(pid, task, follow_up_date=day)
+            task_undo = {"op": "date", "project_id": pid, "task": task, "date": cur["follow_up_date"]}
+        else:
+            task = board.add_subtask(pid, thr.nudge_text(row.get("subject")), date_type="follow_up",
+                                     follow_up_date=day, source="mail", allow_if_completed=True,
+                                     reactivate=False) or ""
+            if not task:                        # the same nudge is already pending: move it
+                hit = board.conn.execute("SELECT id, follow_up_date FROM subtasks WHERE project_id=? AND text=?"
+                                         " AND status='pending'", (pid, thr.nudge_text(row.get("subject")))).fetchone()
+                if hit:
+                    task = hit["id"]
+                    board.update_subtask_fields(pid, task, follow_up_date=day)
+                    task_undo = {"op": "date", "project_id": pid, "task": task, "date": hit["follow_up_date"]}
+            else:
+                task_undo = {"op": "delete", "project_id": pid, "task": task}
+        fields["waiting_task"] = task
+    prior = thr.set_state(st, acct, key, **fields)
+    return prior, f"Wait for a reply on \u201c{subj}\u201d", {"until": until, "project_id": pid or None,
+                                                               "task": task, "task_undo": task_undo}
+
+
 @bp.route("/api/mail/thread/<op>", methods=["POST"])
 def api_thread_op(op):
     prov, st, acct, err = _ctx()
@@ -187,26 +237,12 @@ def api_thread_op(op):
                 label = f"Snooze “{subj}”"
                 extra["until"] = until
         elif op == "waiting":
-            state = thr.get_state(st, acct, key)
-            if data.get("off"):
-                prior = thr.set_state(st, acct, key, waiting_until=None, waiting_since=None, waiting_task="")
-                label = f"Stop waiting on “{subj}”"
-            else:
-                until = _until(data, default_hours=72)
-                pid = state.get("project_id") or (terminal.context(st, acct, ref, board=board).get("project") or {}).get("id")
-                task = ""
-                if pid and board is not None:
-                    day = datetime.fromtimestamp(until).strftime("%Y-%m-%d")
-                    task = board.add_subtask(pid, thr.nudge_text(row.get("subject")), date_type="follow_up",
-                                             follow_up_date=day, source="mail", allow_if_completed=True) or ""
-                prior = thr.set_state(st, acct, key, waiting_until=until, waiting_since=time.time(), waiting_task=task)
-                label = f"Wait for a reply on “{subj}”"
-                extra.update(until=until, project_id=pid, task=task)
+            prior, label, extra = _waiting(st, acct, key, ref, row, data, board, subj)
         else:
             return error_response(404, f"Unknown thread action: {op}.")
         undo = {"thread_key": key, "prior": prior}
-        if extra.get("task"):
-            undo.update(task=extra["task"], project_id=extra.get("project_id"))
+        if extra.get("task_undo"):
+            undo["task_undo"] = extra.pop("task_undo")
         aid = terminal.record(st, acct, "thread", ref, undo, label)
         return jsonify({"ok": True, "thread_key": key, "action_id": aid, "label": label,
                         "state": thr.get_state(st, acct, key), **extra})

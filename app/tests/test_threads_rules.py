@@ -46,8 +46,10 @@ def _proj_snapshot(rt, pid):
 
 
 def _rule(c, h, conditions, actions, ack=True):
-    r = c.post("/api/mail/rules", json={"rule": {"name": "Vendor mail", "conditions": conditions,
-                                                 "actions": actions}, "dry_run_ack": ack}, headers=h)
+    """Save a rule the way the editor does: dry run, then confirm with its token."""
+    rule = {"name": "Vendor mail", "conditions": conditions, "actions": actions}
+    token = c.post("/api/mail/rules/dry-run", json={"rule": rule}, headers=h).get_json().get("ack_token") if ack else None
+    r = c.post("/api/mail/rules", json={"rule": rule, "dry_run_ack": token}, headers=h)
     return r.status_code, r.get_json()
 
 
@@ -304,8 +306,9 @@ def test_thread_keys_and_rule_run_undo_in_the_browser(live):
         assert thr.get_state(st, "gmail", key)["waiting_until"]
 
         # A rule run in the background lands on the same undo stack.
-        rules.save_rule(st, {"name": "Gate codes", "conditions": [{"field": "subject", "value": "Gate"}],
-                             "actions": [{"type": "archive"}]}, dry_run_ack=True)
+        gate = {"name": "Gate codes", "conditions": [{"field": "subject", "value": "Gate"}],
+                "actions": [{"type": "archive"}]}
+        rules.save_rule(st, gate, dry_run_ack=rules.dry_run(st, "gmail", gate)["ack_token"])
         server.deliver("g9", subject="Gate code changed", internal_ms=NOW_MS() + 5000)
         rt.mail_runner.threads["gmail"].run_once()
         assert st.get("gmail", "g9")["folder"] == "archive"

@@ -76,6 +76,14 @@ def validate(rule: dict) -> dict:
     return {"name": name or "Rule", "conditions": conds, "actions": acts, "enabled": bool(rule.get("enabled", True))}
 
 
+def content_hash(rule: dict) -> str:
+    """What the dry-run confirmation is bound to: the exact conditions and
+    actions. Name and on / off are not part of it."""
+    import hashlib
+    v = {"conditions": rule["conditions"], "actions": rule["actions"]}
+    return hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()[:32]
+
+
 def changes_mailbox(rule: dict) -> bool:
     return any(a["type"] in MAILBOX_ACTIONS for a in rule.get("actions") or [])
 
@@ -95,15 +103,27 @@ def get_rule(store, rule_id: int) -> dict | None:
     return _out(rows[0]) if rows else None
 
 
-def save_rule(store, rule: dict, rule_id: int | None = None, dry_run_ack: bool = False) -> dict:
-    """Create or update. A rule that changes the mailbox is refused unless the
-    caller passes ``dry_run_ack`` (the user saw the dry run). Editing a rule
-    never moves its ``created_at``: mail before it still never matches."""
+def save_rule(store, rule: dict, rule_id: int | None = None, dry_run_ack=None) -> dict:
+    """Create or update. A rule that changes the mailbox is refused unless
+    ``dry_run_ack`` is the token the dry run returned for exactly these
+    conditions and actions (the user saw "would match N" for this rule and
+    confirmed). Turning an unchanged, confirmed rule off and on keeps its
+    confirmation. Editing a rule never moves its ``created_at``: mail before
+    it still never matches."""
     v = validate(rule)
-    if changes_mailbox(v) and not dry_run_ack:
-        raise RuleError("This rule changes your mailbox. Run the dry run and confirm it first.")
+    h = content_hash(v)
+    ack = None
+    if changes_mailbox(v):
+        kept = None
+        if rule_id is not None:
+            old = store.query("SELECT dry_run_ack, conditions, actions FROM mail_rules WHERE id=?", [int(rule_id)])
+            if old and old[0]["dry_run_ack"] and content_hash({"conditions": json.loads(old[0]["conditions"]),
+                                                                "actions": json.loads(old[0]["actions"])}) == h:
+                kept = old[0]["dry_run_ack"]
+        if dry_run_ack != h and not kept:
+            raise RuleError("This rule changes your mailbox. Run the dry run for it and confirm first.")
+        ack = kept or time.time()
     now = time.time()
-    ack = now if changes_mailbox(v) else None
     with store._conn() as c:
         if rule_id is None:
             cur = c.execute("INSERT INTO mail_rules (name, enabled, conditions, actions, dry_run_ack, created_at,"
@@ -167,18 +187,21 @@ _ROW_SQL = ("SELECT m.*, b.body, b.is_html, COALESCE(t.project_id, '') AS thread
 
 
 def dry_run(store, account_id: str, rule: dict, days: int = DRY_RUN_DAYS, sample: int = 5) -> dict:
-    """How many stored messages from the last ``days`` the rule would match
-    (a preview only: the rule itself never runs on them)."""
+    """How many stored messages from the last ``days`` the rule would match,
+    across every account (rules apply to all of them). A preview only: the
+    rule itself never runs on them. ``ack_token`` is what save_rule needs to
+    accept a mailbox-changing rule with exactly these conditions and actions."""
     v = validate(rule)
     since = time.time() - days * 86400
     n, examples = 0, []
-    for r in store.query(_ROW_SQL + " WHERE m.account_id=? AND m.removed=0 AND m.folder != 'sent'"
-                         " AND m.received_ts >= ? ORDER BY m.received_ts DESC", [account_id, since]):
+    for r in store.query(_ROW_SQL + " WHERE m.removed=0 AND m.folder != 'sent'"
+                         " AND m.received_ts >= ? ORDER BY m.received_ts DESC", [since]):
         if matches(v, r):
             n += 1
             if len(examples) < sample:
                 examples.append({"subject": r["subject"], "from": r["from_name"] or r["from_email"]})
-    return {"matches": n, "days": days, "examples": examples, "changes_mailbox": changes_mailbox(v)}
+    return {"matches": n, "days": days, "examples": examples, "changes_mailbox": changes_mailbox(v),
+            "ack_token": content_hash(v)}
 
 
 # ── running ──────────────────────────────────────────────────────────────────
@@ -209,20 +232,31 @@ def run_on_ingest(store, board, provider, account_id: str, provider_ids, me: str
                 continue
             if not matches(rule, row):
                 continue
-            run = _run(store, board, provider, account_id, rule, row)
+            try:
+                run = _run(store, board, provider, account_id, rule, row)
+            except Exception:  # noqa: BLE001 - one bad message never stops the rest of the batch
+                continue
             if run:
                 runs.append(run)
-                row = store.query(_ROW_SQL + " WHERE m.account_id=? AND m.provider_id=?",
-                                  [account_id, run["ref"]])[0] if run.get("ref") else row
+                again = store.query(_ROW_SQL + " WHERE m.account_id=? AND m.provider_id=?", [account_id, run["ref"]])
+                if again:
+                    row = again[0]
     return runs
 
 
 def _run(store, board, provider, account_id, rule, row) -> dict | None:
     from . import terminal, threading as thr
     ref = row["provider_id"]
+    mid = row.get("message_id") or ""
     with store._conn() as c:
-        cur = c.execute("INSERT OR IGNORE INTO mail_rule_runs (rule_id, account_id, provider_id, msg_rowid, ran_at)"
-                        " VALUES (?,?,?,?,?)", (rule["id"], account_id, ref, row["rowid"], time.time()))
+        # Once per message: by Message-ID when it has one, so a message that
+        # comes back under a new provider id (an IMAP UIDVALIDITY reset, a
+        # re-sync) does not run the rule again.
+        if mid and c.execute("SELECT 1 FROM mail_rule_runs WHERE rule_id=? AND account_id=? AND message_id=?",
+                             (rule["id"], account_id, mid)).fetchone():
+            return None
+        cur = c.execute("INSERT OR IGNORE INTO mail_rule_runs (rule_id, account_id, provider_id, msg_rowid, message_id,"
+                        " ran_at) VALUES (?,?,?,?,?,?)", (rule["id"], account_id, ref, row["rowid"], mid, time.time()))
         if not cur.rowcount:
             return None                            # this rule already ran on this message
         run_id = cur.lastrowid
@@ -267,7 +301,10 @@ def _run(store, board, provider, account_id, rule, row) -> dict | None:
                     provider.set_flags(ref, read=True)
                     terminal.apply_flags(store, account_id, ref, read=True)
                 data = terminal.undo_data(store, account_id, ref, provider) or {}
-                new_ref = provider.move_message(ref, "archive")
+                # A rule never expunges: on an IMAP server without MOVE the
+                # archive is refused rather than done as COPY plus EXPUNGE.
+                mover = getattr(provider, "move_without_expunge", None) or provider.move_message
+                new_ref = mover(ref, "archive")
                 sid = terminal.apply_move(store, account_id, ref, "archive", new_ref, provider)
                 data["new_ref"] = sid or new_ref or ref
                 if not callable(getattr(provider, "restore_labels", None)):
