@@ -71,6 +71,8 @@ class Runtime:
         self.store = Store(self.paths.db_file, StoreContext(
             workflows=self.workflows, profession=self.profession, hours=self.hours, user=self.config.user))
         self.install_cutoff = ensure_install_cutoff(self.store)
+        from . import ooo as _ooo
+        _ooo.apply(self)
 
     # -- profession ---------------------------------------------------------
 
@@ -99,6 +101,8 @@ class Runtime:
             self.workflows.date_types = set(_profession.date_type_ids(self.profession()))
             self.store.ctx.hours = self.hours
             self.store.ctx.user = self.config.user
+            from . import ooo as _ooo
+            _ooo.apply(self)
 
     def rewire(self):
         """Rebuild the AI and mail layers on the current config (after setup
