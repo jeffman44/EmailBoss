@@ -37,17 +37,28 @@ def _header(msg, name: str) -> str:
     return ""
 
 
+_WANT = {"in-reply-to", "references", "list-id", "list-unsubscribe", "auto-submitted", "precedence",
+         "x-autoreply", "x-autorespond"}
+
+
 def thread_headers(msg) -> dict:
-    """The linkage, list and auto-reply headers the store keeps (bounded)."""
-    auto = _header(msg, "Auto-Submitted").strip().lower()
-    prec = _header(msg, "Precedence").strip().lower()
+    """The linkage, list and auto-reply headers the store keeps (bounded).
+    One pass over the header list (this runs for every stored message)."""
+    h = {}
+    for x in getattr(msg, "headers", None) or ():
+        if isinstance(x, dict):
+            n = str(x.get("name", "")).lower()
+            if n in _WANT and n not in h:
+                h[n] = str(x.get("value") or "")
+    auto = h.get("auto-submitted", "").strip().lower()
+    prec = h.get("precedence", "").strip().lower()
     return {
-        "in_reply_to": " ".join(_ID_RE.findall(_header(msg, "In-Reply-To")))[:1000],
-        "refs": " ".join(_ID_RE.findall(_header(msg, "References"))[-50:])[:8000],
-        "list_id": _header(msg, "List-Id").strip()[:500],
-        "list_unsub": _header(msg, "List-Unsubscribe").strip()[:2000],
+        "in_reply_to": " ".join(_ID_RE.findall(h.get("in-reply-to", "")))[:1000],
+        "refs": " ".join(_ID_RE.findall(h.get("references", ""))[-50:])[:8000],
+        "list_id": h.get("list-id", "").strip()[:500],
+        "list_unsub": h.get("list-unsubscribe", "").strip()[:2000],
         "auto_reply": bool((auto and auto != "no") or prec in ("auto_reply", "bulk", "junk")
-                           or _header(msg, "X-Autoreply") or _header(msg, "X-Autorespond")),
+                           or h.get("x-autoreply") or h.get("x-autorespond")),
     }
 
 
@@ -98,7 +109,7 @@ def _key(c, account_id: str, sid: str, child: dict) -> str:
     if parents:
         found = {}
         for r in c.execute("SELECT message_id, thread_key, subject, from_email, to_addrs, cc_addrs FROM mail_messages"
-                           " INDEXED BY mail_messages_acct_msgid"
+                           " INDEXED BY mail_messages_msgid"
                            f" WHERE account_id=? AND message_id IN ({','.join('?' * len(parents))})"
                            " AND provider_id != ? AND thread_key != ''", [account_id] + parents + [sid]):
             found.setdefault(r["message_id"], r)
@@ -328,7 +339,7 @@ def link_correspondence(store, board, account_id: str, message_ids=None, flag: s
     for i in range(0, len(pairs), 500):         # short transactions: capture and search keep going
         with store._conn() as c:
             for mid, pid in pairs[i:i + 500]:
-                for (tk,) in c.execute("SELECT DISTINCT thread_key FROM mail_messages INDEXED BY mail_messages_acct_msgid"
+                for (tk,) in c.execute("SELECT DISTINCT thread_key FROM mail_messages INDEXED BY mail_messages_msgid"
                                        " WHERE account_id=? AND message_id=? AND thread_key != ''",
                                        (account_id, mid)).fetchall():
                     c.execute("INSERT INTO mail_threads (account_id, thread_key) VALUES (?,?)"

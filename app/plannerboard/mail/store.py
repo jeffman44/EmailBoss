@@ -180,7 +180,6 @@ ALTER TABLE mail_messages ADD COLUMN list_unsub TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_messages ADD COLUMN local_labels TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE mail_messages ADD COLUMN conv_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0;
-CREATE INDEX IF NOT EXISTS mail_messages_acct_msgid ON mail_messages (account_id, message_id);
 ALTER TABLE mail_threads ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE mail_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE mail_threads ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;
@@ -222,6 +221,9 @@ CREATE TABLE IF NOT EXISTS mail_rule_runs (
 CREATE INDEX IF NOT EXISTS mail_rule_runs_ran ON mail_rule_runs (ran_at);
 CREATE INDEX IF NOT EXISTS mail_rule_runs_msgid ON mail_rule_runs (rule_id, account_id, message_id);
 CREATE INDEX IF NOT EXISTS mail_threads_project ON mail_threads (project_id);
+CREATE INDEX IF NOT EXISTS mail_threads_waiting ON mail_threads (account_id) WHERE waiting_since IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mail_threads_state ON mail_threads (account_id) WHERE pinned = 1 OR muted = 1
+    OR snooze_until IS NOT NULL OR waiting_until IS NOT NULL OR project_id != '';
 """),
 ]
 
@@ -643,8 +645,9 @@ class MailStore:
             c.execute(
                 "INSERT INTO mail_messages (account_id, provider_id, message_id, thread_key, folder, labels, flags,"
                 " subject, from_email, from_name, to_addrs, cc_addrs, received_ts, snippet, has_attachments,"
-                " is_read, is_starred, body_state, historical, captured, first_seen, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " is_read, is_starred, body_state, historical, captured, first_seen, updated_at,"
+                " in_reply_to, refs, list_id, list_unsub, conv_key, auto_reply)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(account_id, provider_id) DO UPDATE SET message_id=excluded.message_id,"
                 " thread_key=excluded.thread_key, folder=excluded.folder, labels=excluded.labels,"
                 " flags=excluded.flags, subject=excluded.subject, from_email=excluded.from_email,"
@@ -654,17 +657,18 @@ class MailStore:
                 " is_starred=excluded.is_starred, body_state=excluded.body_state,"
                 " historical=MIN(historical, excluded.historical), captured=MAX(captured, excluded.captured),"
                 " removed=0, removed_reason='',"
-                " updated_at=excluded.updated_at",
+                " updated_at=excluded.updated_at, in_reply_to=excluded.in_reply_to, refs=excluded.refs,"
+                " list_id=excluded.list_id, list_unsub=excluded.list_unsub, conv_key=excluded.conv_key,"
+                " auto_reply=excluded.auto_reply",
                 (account_id, sid, msg.internet_message_id or "", tkey, folder,
                  json.dumps(sorted(set(labels))), json.dumps(sorted(set(flags))), msg.subject or "",
                  sender_email, (msg.sender.name if msg.sender else "") or "", to_s, cc_s, rts, snippet,
                  int(bool(real_atts) or bool(getattr(msg, "sync_has_attachments", False))), int(_is_read(flags, labels)), int(_is_starred(flags, labels)),
-                 "full" if with_body else "headers", int(bool(historical)), int(bool(captured)), now, now))
+                 "full" if with_body else "headers", int(bool(historical)), int(bool(captured)), now, now,
+                 hdr["in_reply_to"], hdr["refs"], hdr["list_id"], hdr["list_unsub"], msg.conversation_id or "",
+                 int(hdr["auto_reply"])))
             rowid = c.execute("SELECT rowid FROM mail_messages WHERE account_id=? AND provider_id=?",
                               (account_id, sid)).fetchone()[0]
-            c.execute("UPDATE mail_messages SET in_reply_to=?, refs=?, list_id=?, list_unsub=?, conv_key=?, auto_reply=?"
-                      " WHERE rowid=?", (hdr["in_reply_to"], hdr["refs"], hdr["list_id"], hdr["list_unsub"],
-                                         msg.conversation_id or "", int(hdr["auto_reply"]), rowid))
             c.execute("DELETE FROM mail_fts WHERE rowid=?", (rowid,))
             c.execute("INSERT INTO mail_fts (rowid, subject, sender, body) VALUES (?,?,?,?)",
                       (rowid, msg.subject or "", sender_text(msg), body))
