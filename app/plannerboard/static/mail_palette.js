@@ -187,5 +187,18 @@ window.PBPalette = (() => {
     }
   }, true);
 
-  return { open, close, state: P };
+  // Other modules add their commands here (thread and rule commands, Phase 3).
+  function addCommands(list) { (list || []).forEach(c => COMMANDS.push(c)); }
+
+  return { open, close, state: P, addCommands, mailThen };
+})();
+
+// Thread actions and rules (2.0 Phase 3) load from here so board.html does
+// not grow (it is a 1.x file).
+(() => {
+  if (document.querySelector('script[data-eb="mail_rules"]')) return;
+  const s = document.createElement('script');
+  s.src = '/static/mail_rules.js';
+  s.dataset.eb = 'mail_rules';
+  document.head.appendChild(s);
 })();

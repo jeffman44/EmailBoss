@@ -1282,7 +1282,11 @@ class _ImapClient:
                 ok = ok and typ == "OK"
             return ok
 
-    def move_message(self, ref: str, folder_id: str) -> str | None:
+    def move_without_expunge(self, ref: str, folder_id: str) -> str | None:
+        """For automatic moves (rules): MOVE only, never COPY + EXPUNGE."""
+        return self.move_message(ref, folder_id, _no_expunge=True)
+
+    def move_message(self, ref: str, folder_id: str, _no_expunge: bool = False) -> str | None:
         folder, uv_exp, uid = self._resolve_ref(ref)
         dest = folder_id
         if dest in FOLDER_KINDS_SET:
@@ -1300,6 +1304,8 @@ class _ImapClient:
                 if typ != "OK":
                     raise RuntimeError(f"MOVE failed: {(data[0] if data else b'').decode('utf-8', 'replace')}")
             else:
+                if _no_expunge:
+                    raise MailRefused("This mail server cannot move a message without an expunge, so a rule leaves it in place.")
                 # COPY + \\Deleted + EXPUNGE is only safe as UID EXPUNGE of this one
                 # message; a bare EXPUNGE would also remove anything else flagged.
                 if "UIDPLUS" not in caps:

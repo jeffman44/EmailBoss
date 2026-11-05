@@ -659,7 +659,10 @@ class Store:
              follow_up_date, date_type, sla_type, sla_created, sla_hours, category or "",
              int(priority or 0), self._json_col(kwargs.get("metadata") or {})))
         self._conn.commit()
-        self._reactivate_if_closed(pid, trigger=text)
+        # A mail-view nudge (waiting-on) is a reminder, not new work: it never
+        # revives a closed project (2.0 Phase 3).
+        if kwargs.get("reactivate", True):
+            self._reactivate_if_closed(pid, trigger=text)
         return st_id
 
     def _reactivate_if_closed(self, pid, trigger=""):

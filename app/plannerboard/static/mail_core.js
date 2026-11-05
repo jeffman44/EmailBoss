@@ -220,7 +220,7 @@
   // the board's key sheet, the palette): mail keys stay out of its way.
   function overlayOpen() {
     return !!document.querySelector('#set-overlay.open, #dec-overlay.open, #ai-overlay.open, #csv-overlay.open,'
-      + ' #kbd-overlay.open, #eb-palette.open, .eb-modal.open');
+      + ' #kbd-overlay.open, #eb-palette.open, .eb-modal.open, .ebx-modal.open');
   }
 
   // -- timing hook: the bench reads window.__eb_timing on the Windows runner

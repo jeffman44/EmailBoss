@@ -48,7 +48,7 @@ from typing import Callable, Iterable
 
 STORE_NAME = "mail_store.sqlite"
 LEGACY_SYNC_NAME = "sync.sqlite"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Forward-only, numbered. Each entry runs once, in order, inside the
 # migration step that records its number in mail_meta.schema_version.
@@ -171,6 +171,59 @@ CREATE TABLE IF NOT EXISTS mail_undo (
     created_at  REAL NOT NULL,
     undone      INTEGER NOT NULL DEFAULT 0
 );
+"""),
+    (3, """
+ALTER TABLE mail_messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN refs TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN list_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN list_unsub TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN local_labels TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE mail_messages ADD COLUMN conv_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE mail_threads ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE mail_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE mail_threads ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE mail_threads ADD COLUMN snooze_until REAL;
+ALTER TABLE mail_threads ADD COLUMN waiting_until REAL;
+ALTER TABLE mail_threads ADD COLUMN waiting_since REAL;
+ALTER TABLE mail_threads ADD COLUMN waiting_task TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS mail_thread_overrides (
+    account_id  TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    thread_key  TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'split',
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (account_id, provider_id)
+);
+CREATE TABLE IF NOT EXISTS mail_rules (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    conditions  TEXT NOT NULL DEFAULT '[]',
+    actions     TEXT NOT NULL DEFAULT '[]',
+    dry_run_ack REAL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mail_rule_runs (
+    id          INTEGER PRIMARY KEY,
+    rule_id     INTEGER NOT NULL,
+    account_id  TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    msg_rowid   INTEGER,
+    message_id  TEXT NOT NULL DEFAULT '',
+    ran_at      REAL NOT NULL,
+    done        TEXT NOT NULL DEFAULT '[]',
+    action_id   TEXT NOT NULL DEFAULT '',
+    undone      INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (rule_id, account_id, provider_id)
+);
+CREATE INDEX IF NOT EXISTS mail_rule_runs_ran ON mail_rule_runs (ran_at);
+CREATE INDEX IF NOT EXISTS mail_rule_runs_msgid ON mail_rule_runs (rule_id, account_id, message_id);
+CREATE INDEX IF NOT EXISTS mail_threads_project ON mail_threads (project_id);
+CREATE INDEX IF NOT EXISTS mail_threads_waiting ON mail_threads (account_id) WHERE waiting_since IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mail_threads_state ON mail_threads (account_id) WHERE pinned = 1 OR muted = 1
+    OR snooze_until IS NOT NULL OR waiting_until IS NOT NULL OR project_id != '';
 """),
 ]
 
@@ -582,15 +635,19 @@ class MailStore:
                         att_texts[i] = (attachment_text(a) or "")[:200_000]
                     except Exception:
                         att_texts[i] = ""
+        from . import threading as _thr
+        hdr = _thr.thread_headers(msg)
         with self._conn() as c:
-            prior = c.execute("SELECT rowid, body_state FROM mail_messages WHERE account_id=? AND provider_id=?",
+            tkey = _thr.resolve_key(c, account_id, sid, msg, hdr)
+            prior = c.execute("SELECT rowid, body_state, thread_key FROM mail_messages WHERE account_id=? AND provider_id=?",
                               (account_id, sid)).fetchone()
             is_new_content = prior is None or prior["body_state"] == "none"
             c.execute(
                 "INSERT INTO mail_messages (account_id, provider_id, message_id, thread_key, folder, labels, flags,"
                 " subject, from_email, from_name, to_addrs, cc_addrs, received_ts, snippet, has_attachments,"
-                " is_read, is_starred, body_state, historical, captured, first_seen, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " is_read, is_starred, body_state, historical, captured, first_seen, updated_at,"
+                " in_reply_to, refs, list_id, list_unsub, conv_key, auto_reply)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(account_id, provider_id) DO UPDATE SET message_id=excluded.message_id,"
                 " thread_key=excluded.thread_key, folder=excluded.folder, labels=excluded.labels,"
                 " flags=excluded.flags, subject=excluded.subject, from_email=excluded.from_email,"
@@ -600,12 +657,16 @@ class MailStore:
                 " is_starred=excluded.is_starred, body_state=excluded.body_state,"
                 " historical=MIN(historical, excluded.historical), captured=MAX(captured, excluded.captured),"
                 " removed=0, removed_reason='',"
-                " updated_at=excluded.updated_at",
-                (account_id, sid, msg.internet_message_id or "", msg.conversation_id or "", folder,
+                " updated_at=excluded.updated_at, in_reply_to=excluded.in_reply_to, refs=excluded.refs,"
+                " list_id=excluded.list_id, list_unsub=excluded.list_unsub, conv_key=excluded.conv_key,"
+                " auto_reply=excluded.auto_reply",
+                (account_id, sid, msg.internet_message_id or "", tkey, folder,
                  json.dumps(sorted(set(labels))), json.dumps(sorted(set(flags))), msg.subject or "",
                  sender_email, (msg.sender.name if msg.sender else "") or "", to_s, cc_s, rts, snippet,
                  int(bool(real_atts) or bool(getattr(msg, "sync_has_attachments", False))), int(_is_read(flags, labels)), int(_is_starred(flags, labels)),
-                 "full" if with_body else "headers", int(bool(historical)), int(bool(captured)), now, now))
+                 "full" if with_body else "headers", int(bool(historical)), int(bool(captured)), now, now,
+                 hdr["in_reply_to"], hdr["refs"], hdr["list_id"], hdr["list_unsub"], msg.conversation_id or "",
+                 int(hdr["auto_reply"])))
             rowid = c.execute("SELECT rowid FROM mail_messages WHERE account_id=? AND provider_id=?",
                               (account_id, sid)).fetchone()[0]
             c.execute("DELETE FROM mail_fts WHERE rowid=?", (rowid,))
@@ -637,12 +698,15 @@ class MailStore:
                 if not a.is_inline:
                     c.execute("INSERT INTO mail_attachments_fts (rowid, name, text) VALUES (?,?,?)",
                               (cur.lastrowid, a.name or "", att_texts.get(i, "")))
-            if msg.conversation_id:
+            if tkey:
+                moved = prior is not None and prior["thread_key"] and prior["thread_key"] != tkey
                 c.execute("INSERT INTO mail_threads (account_id, thread_key, subject, message_count, last_ts)"
                           " VALUES (?,?,?,1,?) ON CONFLICT(account_id, thread_key) DO UPDATE SET"
                           " message_count=message_count + ?, last_ts=MAX(COALESCE(last_ts,0), COALESCE(excluded.last_ts,0)),"
                           " subject=CASE WHEN subject='' THEN excluded.subject ELSE subject END",
-                          (account_id, msg.conversation_id, msg.subject or "", rts, 1 if is_new_content else 0))
+                          (account_id, tkey, msg.subject or "", rts, 1 if (is_new_content or moved) else 0))
+                if moved:
+                    _thr.recount(c, account_id, [prior["thread_key"]])
             if is_new_content:
                 if folder == "sent":
                     for a in list(msg.to) + list(msg.cc):
