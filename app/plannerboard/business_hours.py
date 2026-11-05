@@ -8,6 +8,11 @@ fixed UTC-6 offset replaced by zoneinfo and the 7am-5pm window replaced by
     {"tz": "America/Denver", "start": 8, "end": 17, "days": [0,1,2,3,4]}
 
 `days` are Python weekday numbers (0 = Monday).
+
+Out-of-office days (``ooo``, a set of YYYY-MM-DD) count like weekends on every
+clock here, so non-deadline work does not age while the user is out
+(plannerboard/ooo.py keeps them). Deadlines are dates and are not aged by
+these clocks.
 """
 
 from datetime import date, datetime, timedelta, timezone
@@ -69,7 +74,7 @@ def _zone(name):
 
 
 class BusinessHours:
-    def __init__(self, tz="UTC", start=8, end=17, days=(0, 1, 2, 3, 4)):
+    def __init__(self, tz="UTC", start=8, end=17, days=(0, 1, 2, 3, 4), ooo=()):
         # "" means "use the configured / OS timezone" (the config timezone is
         # merged in by from_profession); UTC only when nothing resolves.
         self.tz_name = tz or system_timezone_name()
@@ -81,6 +86,10 @@ class BusinessHours:
         self.days = tuple(sorted(set(int(d) for d in (days or (0, 1, 2, 3, 4)))))
         if not self.days:
             self.days = (0, 1, 2, 3, 4)
+        self.ooo = frozenset(ooo or ())
+
+    def set_ooo(self, days):
+        self.ooo = frozenset(days or ())
 
     @classmethod
     def from_profession(cls, prof):
@@ -131,7 +140,12 @@ class BusinessHours:
         return d.replace(tzinfo=None) if d else None
 
     def is_business_day(self, d):
-        return d.weekday() in self.days
+        if d.weekday() not in self.days:
+            return False
+        if self.ooo:
+            day = d.date() if isinstance(d, datetime) else d
+            return day.isoformat() not in self.ooo
+        return True
 
     # -- arithmetic ---------------------------------------------------------------
 

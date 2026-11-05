@@ -182,3 +182,10 @@ Cut: scheduled send (violated "nothing sends"); office conversion and OCR; split
 - `mail_rules.js` is loaded by `mail_palette.js`, so `board.html` is byte for byte its Phase 2 self.
 - The inbox query reads thread state once (a handful of rows) and keeps the main query on the date index; ordering through the join had doubled the page time at 50k rows.
 - The review's scratch tests are kept as regressions in `tests/test_threads_rules_review.py`.
+
+### Owner addition (2026-11-05): no aging while out of office
+
+- Non-deadline work does not age while the user is out. Out-of-office ranges (both ends inclusive) live in the board's `app_meta` (`ooo_ranges`, `plannerboard/ooo.py`, `/api/ooo`); their days count like weekends in `BusinessHours` (response SLA, clock-driven tasks, new follow-up dates) and in the page (`PROF.business_hours.ooo`: `isBizDay`, and the follow-up overdue curve through `bizDaysBetween(..., skipOoo)`). The deadline curve does not skip them.
+- `board.js` changes are same-line edits (it stays at 10,191 lines); `ooo` is never stored as a profession override.
+- 2.0 sets ranges through the API. The calendar work feeds them from Out of Office events when it lands; the owner asked for this ahead of that phase.
+

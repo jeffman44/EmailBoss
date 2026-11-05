@@ -188,9 +188,9 @@ function bizHours() {
   const days = Array.isArray(b.days) && b.days.length ? b.days : [0, 1, 2, 3, 4];
   // Template days are Monday=0 .. Sunday=6 (python weekday()); JS getDay is Sunday=0.
   const jsDays = new Set(days.map(d => (d + 1) % 7));
-  return { start, end: Math.max(start + 1, end), jsDays, tz: b.tz || '' };
+  return { start, end: Math.max(start + 1, end), jsDays, tz: b.tz || '', ooo: Array.isArray(b.ooo) ? b.ooo : [] };   // ooo: out-of-office days (/api/ooo) age like weekends
 }
-function isBizDay(d) { return bizHours().jsDays.has(d.getDay()); }
+function isBizDay(d) { const b = bizHours(); return b.jsDays.has(d.getDay()) && !(b.ooo.length && b.ooo.includes(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'))); }
 function bizHoursText() {
   const b = bizHours();
   const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1098,7 +1098,7 @@ function fractionalDaysUntil(ds) {
 // (The SLA path already used business hours; everything else was on the wall
 // clock, so a card could gain ~330 urgency points over a weekend nobody worked.)
 // Signed fractional business days between two Dates; weekends count as 0.
-function bizDaysBetween(a, b) {
+function bizDaysBetween(a, b, skipOoo) {   // skipOoo: out-of-office days count 0 (aging curves; never the deadline curve)
   let sign = 1;
   if (b < a) { const t = a; a = b; b = t; sign = -1; }
   let total = 0, cursor = new Date(a), guard = 0;
@@ -1107,17 +1107,17 @@ function bizDaysBetween(a, b) {
     nextMidnight.setHours(24, 0, 0, 0);
     const segEnd = nextMidnight < b ? nextMidnight : b;
     const dow = cursor.getDay();
-    if (dow !== 0 && dow !== 6) total += (segEnd - cursor) / 86400000;
+    if (dow !== 0 && dow !== 6 && !(skipOoo && !isBizDay(cursor))) total += (segEnd - cursor) / 86400000;
     cursor = new Date(segEnd.getTime());
   }
   return sign * total;
 }
 // Business days from NOW until a date's midnight. Negative = past (overdue).
-function bizFractionalDaysUntil(ds) {
+function bizFractionalDaysUntil(ds, skipOoo) {
   if (!ds) return null;
   const d = parseLocalDate(ds);
   if (!d) return null;
-  return bizDaysBetween(new Date(), d);
+  return bizDaysBetween(new Date(), d, !!skipOoo);
 }
 function fmtTs(ts) {
   if (!ts) return 'Never';
@@ -2581,7 +2581,7 @@ function getSubtaskScore(subtask, p) {
   } else {
     // ── NORMAL: continuous ramp from due date, on BUSINESS days ──
     // T-0.25d: 0 → T-0: 30 (linear approach) → overdue: 30 + quadratic on days/4
-    const du = bizFractionalDaysUntil(fuDate);
+    const du = bizFractionalDaysUntil(fuDate, true);   // out-of-office days do not count
     if (du === null) { base = 0; }
     else {
       const daysPast = -du;

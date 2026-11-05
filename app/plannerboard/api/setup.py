@@ -94,8 +94,11 @@ def api_setup_presets():
 @bp.route("/api/profession", methods=["GET"])
 def api_profession():
     """The EFFECTIVE profession (template deep-merged with overrides) plus
-    `user` and `features`."""
-    return jsonify(rt().profession())
+    `user` and `features`. ``business_hours.ooo`` carries the out-of-office
+    days the page's aging clocks skip."""
+    prof = dict(rt().profession())
+    prof["business_hours"] = dict(prof.get("business_hours") or {}, ooo=sorted(rt().hours.ooo))
+    return jsonify(prof)
 
 
 _ID_RE = __import__("re").compile(r"^[a-z0-9_]{1,40}$")
@@ -142,6 +145,9 @@ def api_put_profession():
         return error_response(400, "body must be an object")
     template = data.get("template")
     overrides = data.get("overrides") if "overrides" in data else {k: v for k, v in data.items() if k != "template"}
+    if isinstance(overrides, dict) and isinstance(overrides.get("business_hours"), dict):
+        # ``ooo`` is served from /api/ooo, never stored as a profession override.
+        overrides["business_hours"] = {k: v for k, v in overrides["business_hours"].items() if k != "ooo"}
     if template:
         if template not in _profession.template_ids():
             return error_response(400, f"unknown profession template '{template}'")
